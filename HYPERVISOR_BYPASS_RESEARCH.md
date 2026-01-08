@@ -1,0 +1,486 @@
+# PS5 Hypervisor Bypass Research
+
+## Executive Summary
+
+This document analyzes the current state of PS5 security research, comparing the Byepervisor implementation (FW 1.xx-2.50) with kstuff, and explores potential exploitation paths via mast1c0re and PSP game saves.
+
+---
+
+## 1. Understanding the Security Layers
+
+### PS5 Security Architecture (Ring Model)
+
+```
+Ring -3: AMD PSP (Platform Security Processor)
+         └─ Secure boot, key management, crypto operations
+
+Ring -2: SMM (System Management Mode)
+         └─ BIOS-level operations, power management
+
+Ring -1: Hypervisor
+         └─ VM isolation, memory virtualization, SMAP/XOM enforcement
+
+Ring 0:  FreeBSD Kernel (Guest OS)
+         └─ Process management, syscalls, drivers
+
+Ring 3:  Userland
+         └─ Games, apps, web browser
+```
+
+### What Each Layer Controls
+
+| Layer | Controls | Current Exploit Status |
+|-------|----------|----------------------|
+| PSP | Hardware keys, secure boot chain, SoC init | **No public exploits** |
+| Hypervisor | NPT (Nested Page Tables), XOM, SMAP, GMET | **Exploited up to FW 2.xx** (Byepervisor) |
+| Kernel | Process isolation, memory protection, syscalls | **Exploited up to FW 10.40** |
+| Userland | App sandboxing, JIT permissions | **Multiple entry points** |
+
+---
+
+## 2. Byepervisor vs Kstuff: Detailed Comparison
+
+### Byepervisor (FW 1.xx - 2.50)
+
+**What It Is:** A true hypervisor exploit that achieves code execution in Ring -1
+
+**How It Works:**
+1. Exploits shared jump tables between hypervisor and guest kernel
+2. Hijacks `VMMCALL_HV_SET_CPUID_PS4` hypercall entry
+3. Runs ROP chain in hypervisor context
+4. Disables Nested Paging (NPT) and Guest Mode Execute Trap (GMET)
+5. Allows disabling eXecute Only Memory (XOM) in kernel PTEs
+
+**Capabilities:**
+```
+✓ Full hypervisor code execution
+✓ Disable hardware-enforced XOM (code pages become readable)
+✓ Disable GMET (execute arbitrary code without traps)
+✓ Modify NPT (full control over physical memory virtualization)
+✓ Bypass SMAP at hardware level
+✓ Potential bootloader modification
+✓ True "jailbreak" - hardware-level security disabled
+```
+
+**Current Implementation in etaHEN (Source Code/bootstrapper/Byepervisor/):**
+```cpp
+// From main.cpp - The Byepervisor flow
+bool Byepervisor() {
+    // 1. Set shellcore auth (privilege escalation)
+    kernel_set_ucred_authid(getpid(), 0x4800000000000007);
+
+    // 2. Clear XOTEXT bit - make kernel text RW
+    for (uint64_t addr = ktext(0); addr < KERNEL_ADDRESS_DATA_BASE; addr += 0x1000) {
+        CLEAR_PDE_BIT(pte, XOTEXT);  // Remove execute-only
+        SET_PDE_BIT(pte, RW);         // Enable write
+    }
+
+    // 3. Copy HEN binary to kernel code cave
+    kernel_copyin(&KELF[i], kdlsym(KERNEL_SYM_CODE_CAVE) + i, 0x1000);
+
+    // 4. Install kexec syscall (replaces syscall 0x11)
+    install_kexec();
+
+    // 5. Execute HEN in kernel context
+    kexec(kdlsym(KERNEL_SYM_CODE_CAVE));
+}
+```
+
+### Kstuff (Current - All Supported FW)
+
+**What It Is:** A kernel-level FSELF/FPKG handler that runs as a signed module
+
+**How It Works:**
+1. Loaded as binary blob after kernel exploit
+2. Hooks specific syscalls for FSELF authentication
+3. Provides fake auth info for unsigned executables
+4. Bypasses DRM/license checks for FPKGs
+
+**Capabilities:**
+```
+✓ Load unsigned ELF files (FSELF)
+✓ Install fake packages (FPKG)
+✓ Bypass license/RIF validation
+✓ Run homebrew applications
+
+✗ Cannot read kernel code (XOM still enforced on FW 3.xx+)
+✗ Cannot modify hypervisor state
+✗ Limited to software-level bypasses
+✗ SMAP still enforced at hypervisor level
+```
+
+**Pause/Resume Mechanism (daemon/source/msg.cpp):**
+```cpp
+void pause_resume_kstuff(bool pause) {
+    // Modifies syscall argument count to enable/disable
+    // 0xffff = paused, 0xdeb7 = active
+    kernel_copyin(&value, sysentvec + syscall_offset, 2);
+}
+```
+
+### Comparison Table
+
+| Feature | Byepervisor (≤2.50) | Kstuff (3.xx+) |
+|---------|---------------------|----------------|
+| **Execution Level** | Ring -1 (Hypervisor) | Ring 0 (Kernel) |
+| **XOM Bypass** | Hardware disable | Software hooks |
+| **SMAP Bypass** | Full | Kernel primitives only |
+| **Code Reading** | Full kernel dump | Cannot read code |
+| **Persistent** | Survives some reboots | Session-based |
+| **FPKG Support** | Yes | Yes |
+| **FSELF Support** | Yes | Yes |
+| **Kernel Dumping** | Full | Data only |
+| **HV Modification** | Yes | No |
+
+---
+
+## 3. What a Full Hypervisor Bypass Enables
+
+### Currently Possible (Byepervisor FW ≤2.50)
+
+1. **Kernel Code Dumping**
+   - Read decrypted kernel text
+   - Analyze system calls, find new vulns
+   - Reverse engineer Sony's security checks
+
+2. **True Code Execution**
+   - Run any code without signature checks
+   - No need for ROP chains after initial exploit
+   - Direct function calls in kernel
+
+3. **Hardware Feature Access**
+   - Modify CPU virtualization settings
+   - Access performance counters
+   - Potential GPU compute unlocking
+
+4. **Secure Memory Access**
+   - Read/write protected memory regions
+   - Access inter-VM communication buffers
+   - Potential sflash/NOR access
+
+### What Would Be Possible (FW 3.xx+ HV Exploit)
+
+If Flatz's unreleased FW 4.51 hypervisor exploit (or similar) becomes available:
+
+1. **Unified Jailbreak Experience**
+   - Same capabilities as FW ≤2.50
+   - Full kernel dump capability
+   - Hardware-level security bypass
+
+2. **Better CFI Bypass**
+   - Disable Control Flow Integrity at HV level
+   - More reliable code execution
+   - Simplified payloads
+
+3. **Cross-Firmware Consistency**
+   - Single exploit methodology
+   - Easier homebrew development
+   - More reliable game backups
+
+---
+
+## 4. Mast1c0re Exploitation Path
+
+### What Is Mast1c0re?
+
+Mast1c0re exploits the PS2 emulator on PS4/PS5 to achieve native code execution WITHOUT needing a kernel exploit.
+
+**Key Properties:**
+- JIT (Just-In-Time) compilation privilege
+- Essentially unpatchable (physical game ownership)
+- Persistent entry point
+- Works on latest firmware
+
+### Technical Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MAST1C0RE CHAIN                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. PS2 Game with Exploitable Save                          │
+│     └─> Stack buffer overflow in emulator                   │
+│                                                             │
+│  2. Escape PS2 Sandbox                                      │
+│     └─> Control PS2 emulator process (JIT context)          │
+│                                                             │
+│  3. JIT Code Generation                                     │
+│     └─> Write native PS5 code via JIT compiler              │
+│                                                             │
+│  4. Native Code Execution                                   │
+│     └─> Full userland code execution (Ring 3)               │
+│                                                             │
+│  5. Chain with Kernel Exploit                               │
+│     └─> IPV6/UMTX/Lapse for Ring 0                          │
+│                                                             │
+│  6. Chain with Hypervisor Exploit (if available)            │
+│     └─> Byepervisor techniques for Ring -1                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Advantages for Hypervisor Research
+
+1. **Persistent Entry Point**
+   - Not patched by firmware updates
+   - Always available with physical game
+   - Doesn't require WebKit exploit
+
+2. **JIT Privileges**
+   - Can generate native code
+   - Bypasses userland code signing
+   - Better than ROP-only exploitation
+
+3. **Research Platform**
+   - Stable environment for testing
+   - Reproducible exploitation
+   - Debug kernel without WebKit instability
+
+### Implementation Approach
+
+```
+Required Components:
+├── Exploitable PS2 Game (Okage: Shadow King, others)
+├── Corrupted Save File (USB or cloud)
+├── Stage 1: PS2 ROP chain
+├── Stage 2: JIT payload generator
+├── Stage 3: Native shellcode
+└── Stage 4: Kernel exploit loader
+```
+
+---
+
+## 5. PSP Game Save Exploitation Path
+
+### Concept
+
+Similar to mast1c0re, but targeting PS4's PSP emulator (for PSP Classics).
+
+### Current Status
+
+**Less Explored Than PS2:**
+- PSP emulator is different architecture
+- Fewer known exploitable games
+- Different save format
+
+**Potential Advantages:**
+- Alternative entry point
+- May have different security assumptions
+- PSP games have known save exploits
+
+### Research Approach
+
+```
+Investigation Steps:
+1. Identify PSP Classics on PS Store
+2. Research known PSP save exploits (PSP homebrew scene)
+3. Test if exploits work in PS4/PS5 emulator
+4. Analyze emulator sandboxing
+5. Develop escape techniques
+```
+
+### Known PSP Save Exploits (Historical)
+
+| Game | Exploit Type | Firmware |
+|------|--------------|----------|
+| TIFF Exploit | Image parser overflow | PSP 2.00 |
+| Lumines | Save game overflow | PSP 2.60 |
+| GTA:LCS | Save game overflow | PSP 2.00 |
+| Patapon 2 | Demo save exploit | PSP 6.20 |
+
+**Note:** These may not directly translate to PS4/PS5 emulator exploitation.
+
+---
+
+## 6. Recommended Research Priorities
+
+### High Priority (Actionable Now)
+
+1. **Mast1c0re Integration**
+   ```
+   - Set up PS2 exploit chain
+   - Test on current FW
+   - Chain with existing kernel exploits
+   - Document as alternative entry point
+   ```
+
+2. **Kernel Exploit Documentation**
+   ```
+   - Document IPV6/UMTX exploit flow
+   - Map to etaHEN implementation
+   - Identify adaptation points for new FW
+   ```
+
+3. **Byepervisor Analysis**
+   ```
+   - Deep dive into HV jump table hijack
+   - Understand FW 3.xx changes that broke it
+   - Identify potential similar vectors
+   ```
+
+### Medium Priority (Research Required)
+
+4. **FW 3.xx+ Hypervisor Analysis**
+   ```
+   - Monitor Flatz/community releases
+   - Analyze HV changes in FW 3.00
+   - Document new security measures
+   ```
+
+5. **PSP Emulator Investigation**
+   ```
+   - Identify available PSP Classics
+   - Test known exploits
+   - Analyze emulator sandbox
+   ```
+
+### Long-term (Advanced Research)
+
+6. **PSP Secure Processor**
+   ```
+   - Understand AMD PSP architecture
+   - Monitor academic research
+   - Hardware glitching research
+   ```
+
+---
+
+## 7. Technical Deep Dive: Memory Mirroring Attack
+
+The current etaHEN Byepervisor uses a clever paging attack to access kernel memory:
+
+### mirror.cpp Analysis
+
+```cpp
+void *mirror_page(uint64_t kernel_va) {
+    // 1. Extract kernel physical address
+    kernel_pa = pmap_kextract(kernel_va);
+
+    // 2. Allocate user-space page
+    user_mirror = mmap(0, 0x4000, PROT_READ | PROT_WRITE,
+                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+    // 3. Prefault to ensure PTE exists
+    *(uint64_t *)(user_mirror) = 0x40404040;
+
+    // 4. Remap user page to kernel physical address
+    orig_pa = remap_page(pmap, (uint64_t)user_mirror, kernel_pa);
+
+    // Result: user_mirror now points to kernel memory!
+}
+```
+
+### paging.cpp: Page Table Manipulation
+
+```cpp
+uint64_t remap_page(uint64_t pmap, uint64_t va, uint64_t new_pa) {
+    // Find the Page Table Entry for user VA
+    pte_addr = find_pte(pmap, va, &pte);
+
+    // Replace physical address in PTE
+    SET_PDE_ADDR(pte, new_pa);
+
+    // Write modified PTE back
+    kernel_copyin(&pte, pte_addr, sizeof(pte));
+
+    // User VA now maps to kernel PA!
+}
+```
+
+### Why This Works (FW ≤2.50)
+
+1. **No NPT Enforcement**: Hypervisor doesn't validate guest page tables
+2. **Shared Address Space**: Kernel and user share same pmap structure
+3. **Direct Physical Access**: DMAP provides linear physical memory map
+
+### Why This Fails (FW 3.xx+)
+
+1. **NPT Active**: Hypervisor validates all memory accesses
+2. **GMET Enabled**: Guest modifications trigger hypervisor traps
+3. **Hardened SMAP**: User pages can't map kernel physical memory
+
+---
+
+## 8. Potential New Attack Vectors
+
+### A. Hypercall Interface Analysis
+
+FW 3.xx moved hypervisor out of kernel, but hypercalls still exist:
+
+```
+Research Areas:
+├── VMMCALL instruction usage
+├── Hypercall argument validation
+├── Cross-VM communication
+└── HV service routines
+```
+
+### B. Hardware Feature Abuse
+
+```
+Potential Targets:
+├── AMD SEV (Secure Encrypted Virtualization)
+├── SME (Secure Memory Encryption)
+├── Performance counters
+└── Debug registers (if accessible)
+```
+
+### C. Race Conditions
+
+```
+Timing Windows:
+├── HV ↔ Guest context switches
+├── Interrupt handling
+├── Page table updates
+└── JIT compilation windows
+```
+
+---
+
+## 9. Resources & References
+
+### Official Byepervisor
+- GitHub: https://github.com/PS5Dev/Byepervisor
+- Presented at hardwear.io NL 2024
+
+### Mast1c0re
+- CTurt's writeup: https://cturt.github.io/mast1c0re.html
+- Part 1: PS2 emulator escape
+- Part 2: (Unreleased) Further exploitation
+
+### Recent Kernel Exploits
+- Lapse (FW ≤10.40): TheFloW, disclosed 2025-04-18
+- IPV6 Kernel Exploit: Cryptogenic
+- UMTX Exploit: FreeBSD-based
+
+### PS5 Security Research
+- PS5 Dev Wiki: https://www.psdevwiki.com/ps5/
+- Wololo news: https://wololo.net/
+
+---
+
+## 10. Conclusion
+
+### Current State
+
+| Firmware | Kernel Exploit | HV Exploit | Full JB |
+|----------|---------------|------------|---------|
+| 1.xx-2.50 | Yes | Yes (Byepervisor) | **Yes** |
+| 3.xx-4.51 | Yes | Private (Flatz) | Partial |
+| 5.xx-10.40 | Yes | No | Partial |
+| 10.60+ | Unknown | No | No |
+
+### Recommended Path Forward
+
+1. **Immediate**: Set up mast1c0re as stable entry point
+2. **Short-term**: Document current Byepervisor for educational purposes
+3. **Medium-term**: Monitor community for FW 3.xx+ HV exploit releases
+4. **Long-term**: Investigate new HV attack surfaces
+
+### Key Insight
+
+The difference between "kernel jailbreak" (kstuff) and "true jailbreak" (Byepervisor) is significant:
+- **Kstuff**: Software workarounds, limited capabilities
+- **Byepervisor**: Hardware-level control, full system access
+
+For FW 3.xx+, the community is effectively "kernel jailbroken" but not "hypervisor jailbroken" - which limits advanced capabilities like kernel dumping and hardware feature access.
