@@ -401,7 +401,190 @@ uint64_t remap_page(uint64_t pmap, uint64_t va, uint64_t new_pa) {
 
 ---
 
-## 8. Potential New Attack Vectors
+## 8. APIC Suspend/Resume Attack Vector (Flatz Technique)
+
+### Overview
+
+This technique, shared directly by Flatz, exploits the timing window during suspend/resume
+cycles to execute code BEFORE the hypervisor restarts. This is potentially applicable to
+FW 3.xx+ where other HV exploits are patched.
+
+### Technical Details
+
+**The Vulnerability:**
+```
+struct apic_ops is located in the kernel .data segment (RW permissions)
+With KRW (kernel read/write), you can overwrite function pointers inside it
+```
+
+**Target Structure (from FreeBSD):**
+```c
+// Note: This was removed from FreeBSD mainline in 2022 (commit e0516c7553da)
+// but PS5's FreeBSD fork likely still has it
+struct apic_ops {
+    void (*xapic_mode)(void);           // <-- Target for overwrite
+    int  (*is_x2apic)(void);
+    void (*create)(u_int, int);
+    void (*init)(vm_paddr_t);
+    void (*setup)(int);
+    void (*dump)(const char *);
+    void (*disable)(void);
+    void (*eoi)(void);
+    int  (*id)(void);
+    // ... vector, timer, PMC, CMC, IPI functions
+};
+```
+
+### Attack Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 APIC SUSPEND/RESUME ATTACK                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  PHASE 1: SETUP (Before Suspend)                                 │
+│  ─────────────────────────────────                              │
+│  1. Gain kernel R/W via IPV6/UMTX/Lapse exploit                  │
+│  2. Locate apic_ops structure in kernel .data                    │
+│  3. Prepare ROP chain payload                                    │
+│  4. Overwrite xapic_mode function pointer → ROP gadget           │
+│  5. Bypass CFI (required - this is the challenge)                │
+│  6. Trigger system suspend (rest mode)                           │
+│                                                                  │
+│  PHASE 2: EXECUTION (During Resume)                              │
+│  ──────────────────────────────────                              │
+│  7. System resumes from rest mode                                │
+│  8. Kernel initializes BEFORE hypervisor restarts                │
+│  9. Kernel calls apic_ops->xapic_mode()                          │
+│  10. Our ROP chain executes in pre-HV context                    │
+│  11. Apply kernel patches (XOM disable, code patches)            │
+│  12. Hypervisor starts but protections already bypassed          │
+│                                                                  │
+│  PHASE 3: POST-EXPLOIT                                           │
+│  ─────────────────────────                                       │
+│  13. Re-run exploit payload after resume                         │
+│  14. Full kernel access with HV protections disabled             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Works
+
+The critical insight is the **timing window**:
+
+```
+Normal Boot Sequence:
+  PSP Init → Bootloader → Hypervisor → Kernel
+                              ↑
+                     HV enforces XOM/NPT
+
+Resume Sequence:
+  PSP Resume → Kernel Resume → Hypervisor Resume
+                    ↑
+        CODE EXECUTES HERE (no HV protection yet!)
+```
+
+During resume, the kernel reinitializes hardware (including APIC) before the
+hypervisor is fully operational. This creates a window where:
+
+1. Kernel code runs without HV oversight
+2. Page table modifications aren't validated by NPT
+3. XOM enforcement isn't active yet
+
+### CFI Bypass Challenge
+
+The main obstacle is Control Flow Integrity (CFI):
+
+```
+CFI Check Flow:
+  call [function_ptr]
+    → CFI validates target is legitimate function
+    → If invalid, triggers kernel panic via cfi_check_fail()
+```
+
+**Potential CFI Bypass Approaches:**
+
+1. **Find CFI-Compatible Gadget**
+   ```
+   Look for existing kernel functions that:
+   - Are valid CFI targets
+   - Perform useful operations (stack pivot, etc.)
+   - Can chain to ROP payload
+   ```
+
+2. **Corrupt CFI Metadata**
+   ```
+   If CFI tables are in writable memory, modify them
+   to mark our target as valid
+   ```
+
+3. **Use Legitimate Function as Trampoline**
+   ```
+   Point to real function that eventually calls
+   user-controlled pointer without CFI check
+   ```
+
+4. **Race CFI Initialization**
+   ```
+   During resume, CFI might not be fully initialized
+   when APIC code runs - needs testing
+   ```
+
+### Current Status
+
+Per Flatz:
+> "By the way, it's not the method that has been patched in 5.00.
+> Actually I'm not even sure if has been patched at all, needs testing"
+
+**This means:**
+- Potentially works on FW 3.xx - 4.51+
+- May even work on newer firmware
+- Requires testing and CFI bypass development
+
+### Integration with etaHEN
+
+The current Byepervisor already uses suspend/resume! See `main.cpp`:
+
+```cpp
+// Check if this is a resume state
+if (kernel_read4(kdlsym(KERNEL_SYM_DATA_CAVE)) != 0x1337) {
+    // First run - set flag and trigger suspend
+    kernel_write4(kdlsym(KERNEL_SYM_DATA_CAVE), 0x1337);
+    flash_notification("[etaHEN] Entering rest mode...");
+    sceSystemStateMgrEnterStandby();
+    return false;
+}
+// Second run (after resume) - exploit continues
+```
+
+The APIC technique could be integrated as an alternative code path for FW 3.xx+.
+
+### Research Tasks
+
+```
+High Priority:
+├── Locate apic_ops in PS5 kernel (FW 3.xx+)
+├── Verify structure still exists (not removed like FreeBSD mainline)
+├── Map function pointer offsets
+├── Identify CFI bypass candidates
+└── Test timing window during resume
+
+Medium Priority:
+├── Develop ROP chain for pre-HV context
+├── Test on multiple firmware versions
+├── Document any firmware-specific differences
+└── Create proof-of-concept payload
+
+Integration:
+├── Add apic_ops offset to kdlsym tables
+├── Implement APIC overwrite in Byepervisor
+├── Add CFI bypass code
+└── Test full exploit chain
+```
+
+---
+
+## 9. Additional Attack Vectors
 
 ### A. Hypercall Interface Analysis
 
@@ -435,9 +618,22 @@ Timing Windows:
 └── JIT compilation windows
 ```
 
+### D. Other Kernel Structures in RW Segments
+
+Following Flatz's pattern, look for other exploitable structures:
+
+```
+Potential Targets:
+├── Other *_ops structures (console_ops, bus_ops, etc.)
+├── Callback tables
+├── Interrupt handlers
+├── Timer callbacks
+└── Any function pointer in .data segment
+```
+
 ---
 
-## 9. Resources & References
+## 10. Resources & References
 
 ### Official Byepervisor
 - GitHub: https://github.com/PS5Dev/Byepervisor
@@ -459,7 +655,7 @@ Timing Windows:
 
 ---
 
-## 10. Conclusion
+## 11. Conclusion
 
 ### Current State
 
