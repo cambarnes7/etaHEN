@@ -703,6 +703,92 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
+        // SYSENTVEC STRUCTURE SCANNER - Find real sv_flags and other fields
+        ///////////////////////////////////////////////////////////////////////
+
+        const SYSENTVEC_PS5_OFFSET = 0xD11BB8;
+        const SYSENTVEC_PS4_OFFSET = 0xD11D30;
+
+        let sysentvecPs5 = krw.kdataBase.add32(SYSENTVEC_PS5_OFFSET);
+        let sysentvecPs4 = krw.kdataBase.add32(SYSENTVEC_PS4_OFFSET);
+
+        await log("[SYSENTVEC] Scanning structure fields...", LogLevel.INFO);
+        await log("[SYSENTVEC] PS5 @ 0x" + sysentvecPs5, LogLevel.INFO);
+        await log("[SYSENTVEC] PS4 @ 0x" + sysentvecPs4, LogLevel.INFO);
+
+        // Scan first 0x100 bytes of each sysentvec for small integer values
+        // (These are likely flags, not pointers)
+        let ps5Fields = [];
+        let ps4Fields = [];
+
+        for (let off = 0; off < 0x100; off += 8) {
+            let ps5Val = await krw.read8(sysentvecPs5.add32(off));
+            let ps4Val = await krw.read8(sysentvecPs4.add32(off));
+
+            // Check if it's a small value (potential flag) vs pointer
+            let ps5IsSmall = (ps5Val.hi === 0) && (ps5Val.low < 0x10000);
+            let ps4IsSmall = (ps4Val.hi === 0) && (ps4Val.low < 0x10000);
+
+            if (ps5IsSmall || ps4IsSmall) {
+                ps5Fields.push({ off, val: ps5Val.low });
+                ps4Fields.push({ off, val: ps4Val.low });
+
+                let diffMarker = (ps5Val.low !== ps4Val.low) ? " <-- DIFFERENT!" : "";
+                await log(`  +0x${off.toString(16).padStart(2,'0')}: PS5=0x${(ps5Val.low>>>0).toString(16)}, PS4=0x${(ps4Val.low>>>0).toString(16)}${diffMarker}`, LogLevel.INFO);
+            }
+        }
+
+        // Find fields that differ between PS5 and PS4 (potential ABI control)
+        let diffFields = [];
+        for (let i = 0; i < ps5Fields.length; i++) {
+            if (ps5Fields[i].val !== ps4Fields[i].val) {
+                diffFields.push({
+                    off: ps5Fields[i].off,
+                    ps5: ps5Fields[i].val,
+                    ps4: ps4Fields[i].val
+                });
+            }
+        }
+
+        if (diffFields.length > 0) {
+            await log("\n[SYSENTVEC] Fields that DIFFER between PS5/PS4:", LogLevel.WARN);
+            for (let d of diffFields) {
+                await log(`  +0x${d.off.toString(16)}: PS5=0x${d.ps5.toString(16)}, PS4=0x${d.ps4.toString(16)}`, LogLevel.WARN);
+            }
+
+            let testDiffFields = confirm(
+                "SYSENTVEC DIFFERENCE TEST\n\n" +
+                `Found ${diffFields.length} fields that differ between PS5 and PS4 sysentvec.\n\n` +
+                "These could be ABI control flags!\n\n" +
+                "Click OK to try writing PS4's values to PS5's fields.\n" +
+                "(Will restore after test)"
+            );
+
+            if (testDiffFields) {
+                for (let d of diffFields) {
+                    let addr = sysentvecPs5.add32(d.off);
+                    await log(`[SYSENTVEC] Writing PS4 value 0x${d.ps4.toString(16)} to PS5 +0x${d.off.toString(16)}...`, LogLevel.WARN);
+
+                    // Read current
+                    let current = await krw.read8(addr);
+
+                    // Write PS4's value
+                    await krw.write8(addr, new int64(d.ps4, 0));
+
+                    // Verify
+                    let verify = await krw.read8(addr);
+                    if ((verify.low >>> 0) === d.ps4) {
+                        await log(`[SYSENTVEC] SUCCESS! Field at +0x${d.off.toString(16)} is writable!`, LogLevel.SUCCESS);
+                    }
+
+                    // Restore original
+                    await krw.write8(addr, current);
+                    await log(`[SYSENTVEC] Restored original value`, LogLevel.INFO);
+                }
+            }
+        }
+
+        ///////////////////////////////////////////////////////////////////////
         // APIC READ TEST - Verify apic_ops offset (FW 4.03)
         ///////////////////////////////////////////////////////////////////////
 
