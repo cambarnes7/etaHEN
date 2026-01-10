@@ -574,17 +574,22 @@ async function main(userlandRW, wkOnly = false) {
         const DUMP_NET_ADDR = aton("192.168.1.100");  // Your PC's IP
         const DUMP_NET_PORT = htons_dump(9020);        // Port for netcat
 
+        // Log kernel base addresses first
+        await log("[INFO] ktextBase: " + krw.ktextBase, LogLevel.WARN);
+        await log("[INFO] kdataBase: " + krw.kdataBase, LogLevel.WARN);
+
+        // Test read from kdataBase to verify it works
+        let testVal = await krw.read8(krw.kdataBase);
+        await log("[INFO] Test read from kdataBase: " + testVal, LogLevel.INFO);
+
         let doDump = confirm(
-            "KERNEL .TEXT DUMP\n\n" +
-            "This will dump the kernel code section for IDA analysis.\n\n" +
-            "Prerequisites:\n" +
-            "1. Run: nc -l -p 9020 > kernel_text.bin\n" +
-            "2. Update DUMP_NET_ADDR in code to your PC's IP\n\n" +
-            "Current settings:\n" +
-            "IP: Check code (default 192.168.1.100)\n" +
-            "Port: 9020\n\n" +
-            "The dump will continue until PS5 crashes.\n\n" +
-            "Click OK to start dump, Cancel to skip."
+            "KERNEL DUMP\n\n" +
+            "ktextBase: " + krw.ktextBase + "\n" +
+            "kdataBase: " + krw.kdataBase + "\n\n" +
+            "Choose what to dump:\n" +
+            "OK = Dump from kdataBase (safer, known to work)\n" +
+            "Cancel = Skip dump\n\n" +
+            "Make sure nc -l -p 9020 > kernel_dump.bin is running!"
         );
 
         if (doDump) {
@@ -605,17 +610,12 @@ async function main(userlandRW, wkOnly = false) {
             let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
             await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
 
-            // Log actual kernel base addresses
-            await log("[DUMP] ktextBase: " + krw.ktextBase, LogLevel.WARN);
-            await log("[DUMP] kdataBase: " + krw.kdataBase, LogLevel.WARN);
-
-            // Use smaller 4KB buffer to reduce memory pressure
+            // Use kdataBase since we know that's readable
             let dump_page = p.malloc(0x1000);
-            // Use actual kernel text base from exploit, not hardcoded guess
-            let dump_addr = krw.ktextBase;
+            let dump_addr = krw.kdataBase;
 
-            await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
-            alert("Starting kernel .text dump from " + krw.ktextBase + "\n\nDump will continue until crash.");
+            await log("[DUMP] Starting dump from kdataBase: " + dump_addr, LogLevel.WARN);
+            alert("Starting kernel dump from kdataBase...\n\nDump will continue until crash.");
 
             for (let j = 0; ; j++) {
                 // Bulk copy 4KB from kernel to userspace
