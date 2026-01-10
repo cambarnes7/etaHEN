@@ -515,6 +515,12 @@ async function main(userlandRW, wkOnly = false) {
 
     populatePayloadsPage(wkOnly);
 
+    // ELF store - allocated later after dump dialog to save memory during dump
+    let SIZE_ELF_HEADER = 0x40;
+    let SIZE_ELF_PROGRAM_HEADER = 0x38;
+    var elf_store_size = SIZE_ELF_HEADER + (SIZE_ELF_PROGRAM_HEADER * 0x10) + 0x1000000; // 16MB
+    var elf_store = null; // Will be allocated after dump dialog
+
     var load_payload_into_elf_store_from_local_file = async function (filename) {
         await log("Loading ELF file: " + filename + " ...", LogLevel.LOG);
         const response = await fetch('payloads/' + filename);
@@ -539,16 +545,84 @@ async function main(userlandRW, wkOnly = false) {
         return byteArray.byteLength;
     }
 
-    let SIZE_ELF_HEADER = 0x40;
-    let SIZE_ELF_PROGRAM_HEADER = 0x38;
-    var elf_store_size = SIZE_ELF_HEADER + (SIZE_ELF_PROGRAM_HEADER * 0x10) + 0x1000000; // 16MB
-    var elf_store = p.malloc(elf_store_size, 1);
-
     if (!wkOnly) {
         var krw = await runUmtx2Exploit(p, chain, log);
 
         function get_kaddr(offset) {
             return krw.ktextBase.add32(offset);
+        }
+
+        ///////////////////////////////////////////////////////////////////////
+        // KERNEL .TEXT DUMP - For IDA reverse engineering
+        // Placed early to avoid memory pressure from elf_store allocation
+        ///////////////////////////////////////////////////////////////////////
+
+        function htons_dump(port) {
+            return ((port & 0xFF) << 8) | (port >>> 8);
+        }
+
+        function aton(ip) {
+            let chunks = ip.split('.');
+            let addr = 0;
+            for (let i = 0; i < 4; i++) {
+                addr |= (parseInt(chunks[i]) << (i * 8));
+            }
+            return addr >>> 0;
+        }
+
+        // CONFIGURE THESE FOR YOUR SETUP
+        const DUMP_NET_ADDR = aton("192.168.1.100");  // Your PC's IP
+        const DUMP_NET_PORT = htons_dump(9020);        // Port for netcat
+
+        let doDump = confirm(
+            "KERNEL .TEXT DUMP\n\n" +
+            "This will dump the kernel code section for IDA analysis.\n\n" +
+            "Prerequisites:\n" +
+            "1. Run: nc -l -p 9020 > kernel_text.bin\n" +
+            "2. Update DUMP_NET_ADDR in code to your PC's IP\n\n" +
+            "Current settings:\n" +
+            "IP: Check code (default 192.168.1.100)\n" +
+            "Port: 9020\n\n" +
+            "The dump will continue until PS5 crashes.\n\n" +
+            "Click OK to start dump, Cancel to skip."
+        );
+
+        if (doDump) {
+            let dump_sock_addr_store = p.malloc(0x10);
+            let dump_sock_fd = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low;
+            await log("[DUMP] Opened socket: " + dump_sock_fd, LogLevel.INFO);
+
+            for (let i = 0; i < 0x10; i += 0x8) {
+                p.write8(dump_sock_addr_store.add32(i), new int64(0, 0));
+            }
+
+            p.write1(dump_sock_addr_store.add32(0x00), 0x10);
+            p.write1(dump_sock_addr_store.add32(0x01), AF_INET);
+            p.write2(dump_sock_addr_store.add32(0x02), DUMP_NET_PORT);
+            p.write4(dump_sock_addr_store.add32(0x04), DUMP_NET_ADDR);
+
+            await log("[DUMP] Connecting to dump server...", LogLevel.INFO);
+            let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
+            await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
+
+            // Use smaller 4KB buffer to reduce memory pressure
+            let dump_page = p.malloc(0x1000);
+            let ktext_base = new int64(0xD2000000, 0xFFFFFFFF);
+            let dump_addr = ktext_base;
+
+            await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
+            alert("Starting kernel .text dump...\n\nDump will continue until crash.");
+
+            for (let j = 0; ; j++) {
+                // Bulk copy 4KB from kernel to userspace
+                await krw.copyout(dump_addr, dump_page, 0x1000);
+                await chain.syscall(SYS_WRITE, dump_sock_fd, dump_page, 0x1000);
+                dump_addr = dump_addr.add32(0x1000);
+
+                if (j % 256 === 0) {
+                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 0x1000 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
+                }
+            }
         }
 
         // Set security flags
@@ -611,98 +685,8 @@ async function main(userlandRW, wkOnly = false) {
             await log("Patched PS4 SDK version to 99.99", LogLevel.INFO);
         }
 
-        ///////////////////////////////////////////////////////////////////////
-        // KERNEL .TEXT DUMP - For IDA reverse engineering
-        ///////////////////////////////////////////////////////////////////////
-
-        function htons_dump(port) {
-            return ((port & 0xFF) << 8) | (port >>> 8);
-        }
-
-        function aton(ip) {
-            let chunks = ip.split('.');
-            let addr = 0;
-            for (let i = 0; i < 4; i++) {
-                addr |= (parseInt(chunks[i]) << (i * 8));
-            }
-            return addr >>> 0;
-        }
-
-        // CONFIGURE THESE FOR YOUR SETUP
-        const DUMP_NET_ADDR = aton("192.168.1.100");  // Your PC's IP
-        const DUMP_NET_PORT = htons_dump(9020);        // Port for dumpserver.py
-
-        let dump_sock_addr_store = p.malloc(0x10);
-        let dump_sock_connected = 0;
-        let dump_sock_fd = 0;
-
-        async function dump_connect() {
-            dump_sock_fd = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low;
-            await log("[DUMP] Opened socket: " + dump_sock_fd, LogLevel.INFO);
-
-            for (let i = 0; i < 0x10; i += 0x8) {
-                p.write8(dump_sock_addr_store.add32(i), new int64(0, 0));
-            }
-
-            p.write1(dump_sock_addr_store.add32(0x00), 0x10);
-            p.write1(dump_sock_addr_store.add32(0x01), AF_INET);
-            p.write2(dump_sock_addr_store.add32(0x02), DUMP_NET_PORT);
-            p.write4(dump_sock_addr_store.add32(0x04), DUMP_NET_ADDR);
-
-            await log("[DUMP] Connecting to dump server...", LogLevel.INFO);
-            let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
-            await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
-            dump_sock_connected = 1;
-        }
-
-        async function dump_send(buf, size) {
-            if (dump_sock_connected == 0) {
-                await dump_connect();
-            }
-            await chain.syscall(SYS_WRITE, dump_sock_fd, buf, size);
-        }
-
-        let doDump = confirm(
-            "KERNEL .TEXT DUMP\n\n" +
-            "This will dump the kernel code section for IDA analysis.\n\n" +
-            "Prerequisites:\n" +
-            "1. Run dumpserver.py on your PC (port 9020)\n" +
-            "2. Update DUMP_NET_ADDR in code to your PC's IP\n\n" +
-            "Current settings:\n" +
-            "IP: Check code (default 192.168.1.100)\n" +
-            "Port: 9020\n\n" +
-            "The dump will continue until PS5 crashes.\n" +
-            "Output: kernel_text.bin\n\n" +
-            "Click OK to start dump, Cancel to skip."
-        );
-
-        if (doDump) {
-            // Kernel .text base - estimated from function pointers in kernel_data.bin
-            // Pointers like 0xFFFFFFFFD2BB09C0 suggest .text starts around 0xD2000000
-            let ktext_base = new int64(0xD2000000, 0xFFFFFFFF);
-            let dump_addr = ktext_base;
-            let dump_page = p.malloc(0x4000);
-
-            await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
-            await log("[DUMP] Ensure netcat/dumpserver.py is running!", LogLevel.WARN);
-
-            alert("Starting kernel .text dump...\n\nDump will continue until crash.\nCheck netcat/dumpserver for output.");
-
-            for (let j = 0; ; j++) {
-                // Bulk copy 16KB from kernel to userspace in one operation
-                await krw.copyout(dump_addr, dump_page, 0x4000);
-
-                await dump_send(dump_page, 0x4000);
-                dump_addr = dump_addr.add32(0x4000);
-
-                if (j % 64 === 0) {
-                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 0x4000 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
-                }
-            }
-
-            // Should never reach here - dump runs until crash
-            await log("[DUMP] Dump complete (unexpected)", LogLevel.INFO);
-        }
+        // Allocate ELF store now (after dump dialog) to save memory if dumping
+        elf_store = p.malloc(elf_store_size, 1);
 
         ///////////////////////////////////////////////////////////////////////
         // Stage 6: loader
@@ -1005,6 +989,11 @@ async function main(userlandRW, wkOnly = false) {
         p.write8(timeout.add32(0x8), 50000); // tv_usec - 50000 us = 50 ms
 
         await log("elf loader listening on port 9020", LogLevel.INFO);
+    }
+
+    // Allocate elf_store for wkOnly mode (wasn't allocated above)
+    if (elf_store === null) {
+        elf_store = p.malloc(elf_store_size, 1);
     }
 
     async function fstat(fd, stat_buf) {
