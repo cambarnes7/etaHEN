@@ -724,10 +724,54 @@ async function main(userlandRW, wkOnly = false) {
             await hexdump_kdata(KDATA_OFFSET_GMET_STRING, 64, "GMET format string");
 
             await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
-            await log("Key findings to look for:", LogLevel.INFO);
-            await log("  - Values 0x1001/0x1000 indicate VMCB control dword", LogLevel.INFO);
-            await log("  - Values with bit 18 (0x40000) are SVM feature masks", LogLevel.INFO);
-            await log("  - Try modifying these to disable GMET", LogLevel.INFO);
+
+            // EXPERIMENTAL: Try to modify the SVM feature cache to disable GMET
+            // Offset 0x4bf0 appears to contain cached CPUID SVM features
+            // Value 0x740f12 has bit 18 (GMET) set
+            const SVM_FEATURE_CACHE_OFFSET = 0x4bf0;
+
+            let currentSvmFeatures = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET));
+            await log("[TEST] Current SVM feature cache @ +0x4bf0: 0x" + currentSvmFeatures.toString(16), LogLevel.WARN);
+            await log("[TEST] Bit 18 (GMET) is: " + ((currentSvmFeatures & 0x40000) ? "SET" : "CLEAR"), LogLevel.INFO);
+
+            let doModify = confirm(
+                "EXPERIMENTAL: Modify SVM Feature Cache?\n\n" +
+                "Current value at kdataBase+0x4bf0: 0x" + currentSvmFeatures.toString(16) + "\n" +
+                "Bit 18 (GMET support): " + ((currentSvmFeatures & 0x40000) ? "ENABLED" : "DISABLED") + "\n\n" +
+                "This will CLEAR bit 18 to make kernel think\n" +
+                "CPU doesn't support GMET.\n\n" +
+                "New value would be: 0x" + (currentSvmFeatures & ~0x40000).toString(16) + "\n\n" +
+                "OK = Modify (EXPERIMENTAL - may crash!)\n" +
+                "Cancel = Skip"
+            );
+
+            if (doModify) {
+                let newValue = currentSvmFeatures & ~0x40000;  // Clear bit 18
+                await log("[TEST] Writing new value: 0x" + newValue.toString(16), LogLevel.WARN);
+                await krw.write4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET), newValue);
+
+                // Verify
+                let verifyValue = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET));
+                await log("[TEST] Verify read: 0x" + verifyValue.toString(16), LogLevel.INFO);
+
+                if (verifyValue === newValue) {
+                    await log("[TEST] SUCCESS: SVM feature cache modified!", LogLevel.SUCCESS);
+                    await log("[TEST] GMET bit is now: " + ((verifyValue & 0x40000) ? "SET" : "CLEAR"), LogLevel.SUCCESS);
+                    await log("[TEST] Note: This may only affect future HV operations", LogLevel.INFO);
+                } else {
+                    await log("[TEST] FAILED: Write did not stick (value = 0x" + verifyValue.toString(16) + ")", LogLevel.ERROR);
+                }
+
+                // Also try the second location
+                const SVM_FEATURE_CACHE_OFFSET2 = 0x4dcc;
+                let current2 = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2));
+                if ((current2 & 0x40000) !== 0) {
+                    await log("[TEST] Also clearing bit 18 at +0x4dcc (was 0x" + current2.toString(16) + ")", LogLevel.WARN);
+                    await krw.write4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2), current2 & ~0x40000);
+                    let verify2 = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2));
+                    await log("[TEST] Verify +0x4dcc: 0x" + verify2.toString(16), LogLevel.INFO);
+                }
+            }
         }
 
         // OPTIONAL: Full kernel dump (disabled by default)
