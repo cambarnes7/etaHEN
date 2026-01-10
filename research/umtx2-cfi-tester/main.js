@@ -703,7 +703,7 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
-        // SYSENTVEC STRUCTURE SCANNER - Find real sv_flags and other fields
+        // SYSENTVEC DEEP ANALYSIS - Test sv_flags and Sony-specific fields
         ///////////////////////////////////////////////////////////////////////
 
         const SYSENTVEC_PS5_OFFSET = 0xD11BB8;
@@ -712,78 +712,132 @@ async function main(userlandRW, wkOnly = false) {
         let sysentvecPs5 = krw.kdataBase.add32(SYSENTVEC_PS5_OFFSET);
         let sysentvecPs4 = krw.kdataBase.add32(SYSENTVEC_PS4_OFFSET);
 
-        await log("[SYSENTVEC] Scanning structure fields...", LogLevel.INFO);
-        await log("[SYSENTVEC] PS5 @ 0x" + sysentvecPs5, LogLevel.INFO);
-        await log("[SYSENTVEC] PS4 @ 0x" + sysentvecPs4, LogLevel.INFO);
+        await log("[SYSENTVEC] Deep analysis of key fields...", LogLevel.INFO);
 
-        // Scan first 0x100 bytes of each sysentvec for small integer values
-        // (These are likely flags, not pointers)
-        let ps5Fields = [];
-        let ps4Fields = [];
+        // Key fields from analysis:
+        // +0x00: sv_size (syscall count) - PS5=0x2D4 (724), PS4=0x2A5 (677) - WRITABLE!
+        // +0xA0: sv_flags (ABI flags) = 0x10209 (with Sony bit 0x10000)
+        // +0xD0: Sony field - PS5=0x190, PS4=0x1B0 - WRITABLE!
 
-        for (let off = 0; off < 0x100; off += 8) {
-            let ps5Val = await krw.read8(sysentvecPs5.add32(off));
-            let ps4Val = await krw.read8(sysentvecPs4.add32(off));
+        let sv_size = await krw.read8(sysentvecPs5);
+        let sv_flags = await krw.read8(sysentvecPs5.add32(0xA0));
+        let sony_d0 = await krw.read8(sysentvecPs5.add32(0xD0));
 
-            // Check if it's a small value (potential flag) vs pointer
-            let ps5IsSmall = (ps5Val.hi === 0) && (ps5Val.low < 0x10000);
-            let ps4IsSmall = (ps4Val.hi === 0) && (ps4Val.low < 0x10000);
+        await log(`[SYSENTVEC] sv_size (+0x00): 0x${(sv_size.low>>>0).toString(16)} (${sv_size.low} syscalls)`, LogLevel.INFO);
+        await log(`[SYSENTVEC] sv_flags (+0xA0): 0x${(sv_flags.low>>>0).toString(16)}`, LogLevel.INFO);
+        await log(`[SYSENTVEC] Sony +0xD0: 0x${(sony_d0.low>>>0).toString(16)} (${sony_d0.low})`, LogLevel.INFO);
 
-            if (ps5IsSmall || ps4IsSmall) {
-                ps5Fields.push({ off, val: ps5Val.low });
-                ps4Fields.push({ off, val: ps4Val.low });
+        // ========== TEST 1: sv_flags Sony bit ==========
+        let testSvFlags = confirm(
+            "TEST 1: SV_FLAGS SONY BIT\n\n" +
+            "sv_flags = 0x" + (sv_flags.low>>>0).toString(16) + "\n\n" +
+            "Bit breakdown:\n" +
+            "  0x09 = SV_ABI_FREEBSD\n" +
+            "  0x200 = SV_ILP32 or other\n" +
+            "  0x10000 = SONY CUSTOM BIT\n\n" +
+            "Click OK to CLEAR the Sony bit (0x10000)\n" +
+            "This might disable Sony-specific security checks!"
+        );
 
-                let diffMarker = (ps5Val.low !== ps4Val.low) ? " <-- DIFFERENT!" : "";
-                await log(`  +0x${off.toString(16).padStart(2,'0')}: PS5=0x${(ps5Val.low>>>0).toString(16)}, PS4=0x${(ps4Val.low>>>0).toString(16)}${diffMarker}`, LogLevel.INFO);
+        if (testSvFlags) {
+            let addr = sysentvecPs5.add32(0xA0);
+            let original = await krw.read8(addr);
+            let newVal = (original.low >>> 0) & ~0x10000;
+
+            await log(`[SV_FLAGS] Clearing Sony bit: 0x${(original.low>>>0).toString(16)} -> 0x${newVal.toString(16)}`, LogLevel.WARN);
+            await krw.write8(addr, new int64(newVal, 0));
+
+            let verify = await krw.read8(addr);
+            if ((verify.low >>> 0) === newVal) {
+                await log("[SV_FLAGS] SUCCESS! Sony bit cleared!", LogLevel.SUCCESS);
+
+                let keep = confirm(
+                    "SV_FLAGS MODIFIED!\n\n" +
+                    "Sony bit (0x10000) is now CLEARED.\n" +
+                    "New value: 0x" + newVal.toString(16) + "\n\n" +
+                    "Click OK to KEEP and test behavior\n" +
+                    "Click Cancel to restore"
+                );
+
+                if (!keep) {
+                    await krw.write8(addr, original);
+                    await log("[SV_FLAGS] Restored original", LogLevel.INFO);
+                } else {
+                    await log("[SV_FLAGS] KEEPING MODIFIED - Test games/homebrew!", LogLevel.WARN);
+                }
+            } else {
+                await log("[SV_FLAGS] Write blocked or failed", LogLevel.WARN);
+                await krw.write8(addr, original);
             }
         }
 
-        // Find fields that differ between PS5 and PS4 (potential ABI control)
-        let diffFields = [];
-        for (let i = 0; i < ps5Fields.length; i++) {
-            if (ps5Fields[i].val !== ps4Fields[i].val) {
-                diffFields.push({
-                    off: ps5Fields[i].off,
-                    ps5: ps5Fields[i].val,
-                    ps4: ps4Fields[i].val
-                });
+        // ========== TEST 2: Sony field +0xD0 ==========
+        let testSonyD0 = confirm(
+            "TEST 2: SONY FIELD +0xD0\n\n" +
+            "Current: 0x" + (sony_d0.low>>>0).toString(16) + " (" + sony_d0.low + ")\n" +
+            "PS4 value: 0x1B0 (432)\n\n" +
+            "This field DIFFERS between PS5/PS4.\n" +
+            "Already confirmed WRITABLE!\n\n" +
+            "Click OK to set to 0 and KEEP it"
+        );
+
+        if (testSonyD0) {
+            let addr = sysentvecPs5.add32(0xD0);
+            let original = await krw.read8(addr);
+
+            await log("[SONY +0xD0] Setting to 0...", LogLevel.WARN);
+            await krw.write8(addr, new int64(0, 0));
+
+            let verify = await krw.read8(addr);
+            if ((verify.low >>> 0) === 0) {
+                await log("[SONY +0xD0] Now 0 - test behavior!", LogLevel.SUCCESS);
             }
+
+            // Don't restore - let user test
         }
 
-        if (diffFields.length > 0) {
-            await log("\n[SYSENTVEC] Fields that DIFFER between PS5/PS4:", LogLevel.WARN);
-            for (let d of diffFields) {
-                await log(`  +0x${d.off.toString(16)}: PS5=0x${d.ps5.toString(16)}, PS4=0x${d.ps4.toString(16)}`, LogLevel.WARN);
-            }
+        // ========== TEST 3: Disabled flags (0x00 + mask pattern) ==========
+        await log("\n[DISABLED FLAGS] Checking flags with value 0x00...", LogLevel.INFO);
 
-            let testDiffFields = confirm(
-                "SYSENTVEC DIFFERENCE TEST\n\n" +
-                `Found ${diffFields.length} fields that differ between PS5 and PS4 sysentvec.\n\n` +
-                "These could be ABI control flags!\n\n" +
-                "Click OK to try writing PS4's values to PS5's fields.\n" +
-                "(Will restore after test)"
-            );
+        // These are locations with flag=0x00 (potentially disabled features)
+        const DISABLED_FLAGS = [
+            { off: 0x0067ABFC, desc: "early data" },
+            { off: 0x007FB160, desc: "mid data" },
+            { off: 0x0099CB88, desc: "near security?" },
+        ];
 
-            if (testDiffFields) {
-                for (let d of diffFields) {
-                    let addr = sysentvecPs5.add32(d.off);
-                    await log(`[SYSENTVEC] Writing PS4 value 0x${d.ps4.toString(16)} to PS5 +0x${d.off.toString(16)}...`, LogLevel.WARN);
+        for (let f of DISABLED_FLAGS) {
+            let addr = krw.kdataBase.add32(f.off);
+            let val = await krw.read8(addr);
+            await log(`  0x${f.off.toString(16)}: flag=0x${(val.low>>>0).toString(16)} (${f.desc})`, LogLevel.INFO);
+        }
 
-                    // Read current
-                    let current = await krw.read8(addr);
+        let testDisabled = confirm(
+            "TEST 3: ENABLE DISABLED FLAGS?\n\n" +
+            "Found flags with value 0x00 (disabled?)\n\n" +
+            "These might be security features that are OFF.\n" +
+            "Enabling them (setting to 0x01) could:\n" +
+            "- Enable debug modes\n" +
+            "- Disable security checks\n" +
+            "- Change privilege behavior\n\n" +
+            "Click OK to enable first disabled flag"
+        );
 
-                    // Write PS4's value
-                    await krw.write8(addr, new int64(d.ps4, 0));
+        if (testDisabled) {
+            let addr = krw.kdataBase.add32(DISABLED_FLAGS[0].off);
+            let original = await krw.read8(addr);
 
-                    // Verify
-                    let verify = await krw.read8(addr);
-                    if ((verify.low >>> 0) === d.ps4) {
-                        await log(`[SYSENTVEC] SUCCESS! Field at +0x${d.off.toString(16)} is writable!`, LogLevel.SUCCESS);
-                    }
+            await log(`[DISABLED] Enabling 0x${DISABLED_FLAGS[0].off.toString(16)}...`, LogLevel.WARN);
+            await krw.write8(addr, new int64(1, original.hi));
 
-                    // Restore original
-                    await krw.write8(addr, current);
-                    await log(`[SYSENTVEC] Restored original value`, LogLevel.INFO);
+            let verify = await krw.read8(addr);
+            if ((verify.low >>> 0) === 1) {
+                await log("[DISABLED] Flag ENABLED!", LogLevel.SUCCESS);
+
+                let keep = confirm("Flag enabled! Keep it enabled for testing?");
+                if (!keep) {
+                    await krw.write8(addr, original);
+                    await log("[DISABLED] Restored", LogLevel.INFO);
                 }
             }
         }
