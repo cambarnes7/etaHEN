@@ -567,6 +567,38 @@ CFI Check Flow:
    when APIC code runs - needs testing
    ```
 
+### FW 4.03 Discovered Offsets
+
+**Found via kernel .data dump analysis (January 2025):**
+
+```
+apic_ops offset:        0x170650 (from kernel .data base)
+xapic_mode offset:      apic_ops + 0x10 (3rd pointer in struct)
+
+Full structure dump at 0x170650:
+  [0] create:          0xffffffffd2d889a6
+  [1] init:            0xffffffffd2dfa321
+  [2] xapic_mode:      0xffffffffd2e3bcca  <-- TARGET
+  [3] is_x2apic:       0xffffffffd2e61b33
+  [4] setup:           0xffffffffd2e0cc4b
+  [5] dump:            0xffffffffd2de6afa
+  [6] disable:         0xffffffffd2dada30
+  [7] eoi:             0xffffffffd2d5a27e
+  ... (28 total function pointers)
+```
+
+**To use in exploit:**
+```c
+uint64_t kdata_base = /* get from exploit */;
+uint64_t apic_ops = kdata_base + 0x170650;
+uint64_t xapic_mode_ptr = apic_ops + 0x10;
+
+// Overwrite with ROP gadget (requires CFI bypass)
+kernel_write8(xapic_mode_ptr, rop_gadget_addr);
+
+// Trigger suspend -> resume executes our code before HV
+```
+
 ### Current Status
 
 Per Flatz:
@@ -599,12 +631,22 @@ The APIC technique could be integrated as an alternative code path for FW 3.xx+.
 ### Research Tasks
 
 ```
-High Priority:
-├── Locate apic_ops in PS5 kernel (FW 3.xx+)
-├── Verify structure still exists (not removed like FreeBSD mainline)
-├── Map function pointer offsets
+COMPLETED:
+├── ✅ Locate apic_ops in PS5 kernel (FW 4.03)
+│   └── Offset: 0x170650 from kernel .data base
+├── ✅ Verify structure still exists
+│   └── Confirmed: 28 function pointers, matches FreeBSD apic_ops
+├── ✅ Map function pointer offsets
+│   └── xapic_mode at struct offset 0x10 (position [2])
+└── ✅ Document full structure with addresses
+
+High Priority (REMAINING):
 ├── Identify CFI bypass candidates
-└── Test timing window during resume
+│   └── Options: JIT spray, race condition, or find unchecked call
+├── Test timing window during resume
+│   └── Verify CFI state when xapic_mode is called
+├── Find usable ROP gadgets (XOM blocks .text reading)
+└── Build proof-of-concept
 
 Medium Priority:
 ├── Develop ROP chain for pre-HV context
