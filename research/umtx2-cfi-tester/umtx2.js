@@ -1470,6 +1470,12 @@ async function runUmtx2Exploit(p, chain, log = async () => { }) {
     await log(`Done! Exploit took:   ${toHumanReadableTime(totalDuration)}`, LogLevel.SUCCESS);
     if (debug) await log(`checkMemoryAccessFailCount: ${checkMemoryAccessFailCount}`, LogLevel.INFO);
 
+    // Bulk copy from kernel to userspace buffer
+    async function kernel_copyout(kaddr, uaddr, length) {
+        chainPushCopyout(kaddr, false, uaddr, false, length);
+        await chain.run();
+    }
+
     return {
         masterSock: masterSock,
         victimSock: victimSock,
@@ -1488,6 +1494,7 @@ async function runUmtx2Exploit(p, chain, log = async () => { }) {
         procUcredAddr: curprocUcred,
         procFdAddr: curprocFd,
         pipeAddr: pipeAddr,
-        pipeMem: pipeMem
+        pipeMem: pipeMem,
+        copyout: kernel_copyout
     };
 }

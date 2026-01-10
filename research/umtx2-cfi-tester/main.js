@@ -684,16 +684,13 @@ async function main(userlandRW, wkOnly = false) {
             let dump_page = p.malloc(0x4000);
 
             await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
-            await log("[DUMP] Ensure dumpserver.py is running!", LogLevel.WARN);
+            await log("[DUMP] Ensure netcat/dumpserver.py is running!", LogLevel.WARN);
 
-            alert("Starting kernel .text dump...\n\nDump will continue until crash.\nCheck dumpserver.py for output.");
+            alert("Starting kernel .text dump...\n\nDump will continue until crash.\nCheck netcat/dumpserver for output.");
 
             for (let j = 0; ; j++) {
-                // Read kernel memory 8 bytes at a time into userspace buffer
-                for (let off = 0; off < 0x4000; off += 8) {
-                    let val = await krw.read8(dump_addr.add32(off));
-                    p.write8(dump_page.add32(off), val);
-                }
+                // Bulk copy 16KB from kernel to userspace in one operation
+                await krw.copyout(dump_addr, dump_page, 0x4000);
 
                 await dump_send(dump_page, 0x4000);
                 dump_addr = dump_addr.add32(0x4000);
