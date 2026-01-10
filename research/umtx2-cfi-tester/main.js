@@ -644,10 +644,93 @@ async function main(userlandRW, wkOnly = false) {
         );
 
         if (doGmetAnalysis) {
-            await log("========== GMET/HYPERVISOR ANALYSIS ==========", LogLevel.SUCCESS);
+            await log("========== HYPERVISOR BYPASS ANALYSIS ==========", LogLevel.SUCCESS);
 
-            // Phase 1: Check start of .data for config globals
-            await log("[PHASE 1] Checking start of kernel .data section...", LogLevel.WARN);
+            // Phase 0: Search for HV-related strings to find key offsets
+            await log("[PHASE 0] Searching for HV-related strings...", LogLevel.WARN);
+
+            // Search for specific HV-related strings in first 1MB of .data
+            const hvStrings = ["vmcall", "vmmcall", "hypercall", "vmrun", "vmload", "vmsave",
+                               "svm_", "vmcb", "hv_", "hypervisor", "nested"];
+
+            async function searchString(searchStr, maxOffset) {
+                let results = [];
+                let searchBytes = [];
+                for (let i = 0; i < searchStr.length; i++) {
+                    searchBytes.push(searchStr.charCodeAt(i));
+                }
+
+                for (let offset = 0; offset < maxOffset; offset += 1) {
+                    let match = true;
+                    for (let j = 0; j < searchBytes.length && match; j++) {
+                        let byte = await krw.read1(krw.kdataBase.add32(offset + j));
+                        if (byte !== searchBytes[j]) match = false;
+                    }
+                    if (match) {
+                        results.push(offset);
+                        offset += searchBytes.length; // Skip past this match
+                    }
+                    if (offset % 0x10000 === 0) {
+                        await log("[SEARCH] " + searchStr + ": 0x" + offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
+                    }
+                }
+                return results;
+            }
+
+            // Search for CFI-related strings
+            await log("[PHASE 0] Searching for CFI-related strings...", LogLevel.WARN);
+            let cfiOffsets = await searchString("cfi", 0x80000);
+            if (cfiOffsets.length > 0) {
+                await log("[PHASE 0] Found 'cfi' at " + cfiOffsets.length + " offsets:", LogLevel.SUCCESS);
+                for (let off of cfiOffsets.slice(0, 15)) {
+                    await log("  +0x" + off.toString(16), LogLevel.INFO);
+                    await hexdump_kdata(off - 8, 64, "Context");
+                }
+            }
+
+            // Also search for "control flow" and related
+            let cfOffsets = await searchString("control_flow", 0x80000);
+            if (cfOffsets.length > 0) {
+                await log("[PHASE 0] Found 'control_flow':", LogLevel.SUCCESS);
+                for (let off of cfOffsets) {
+                    await hexdump_kdata(off - 8, 64, "Context");
+                }
+            }
+
+            // Search for shadow stack related (another CFI mechanism)
+            let ssOffsets = await searchString("shadow", 0x80000);
+            if (ssOffsets.length > 0) {
+                await log("[PHASE 0] Found 'shadow' at " + ssOffsets.length + " locations", LogLevel.INFO);
+            }
+
+            // Phase 1: Look for pointers to HV memory regions
+            // HV memory is typically at high addresses or specific physical ranges
+            await log("[PHASE 1] Scanning for potential HV pointers...", LogLevel.WARN);
+
+            let hvPointerCandidates = [];
+            for (let offset = 0; offset < 0x40000; offset += 8) {
+                let ptr = await krw.read8(krw.kdataBase.add32(offset));
+                // Look for pointers that might be HV addresses
+                // HV memory might be at different virtual address ranges
+                // Look for pointers NOT in kernel range (0xFFFFFFFF8xxxxxxx or 0xFFFFFFFF9xxxxxxx)
+                if (ptr.hi !== 0 && ptr.hi !== 0xFFFFFFFF) {
+                    // This is a non-canonical or unusual pointer
+                    hvPointerCandidates.push({offset: offset, ptr: ptr});
+                }
+                if (offset % 0x8000 === 0) {
+                    await log("[SCAN] 0x" + offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
+                }
+            }
+
+            if (hvPointerCandidates.length > 0 && hvPointerCandidates.length < 50) {
+                await log("[PHASE 1] Found unusual pointers (possible HV refs):", LogLevel.SUCCESS);
+                for (let c of hvPointerCandidates.slice(0, 10)) {
+                    await log("  +0x" + c.offset.toString(16) + " -> " + c.ptr, LogLevel.INFO);
+                }
+            }
+
+            // Phase 1b: Check start of .data for config globals
+            await log("[PHASE 1b] Checking start of kernel .data section...", LogLevel.WARN);
             await hexdump_kdata(0x0, 128, "Start of .data (offset 0)");
             await hexdump_kdata(0x100, 128, "Offset +0x100");
             await hexdump_kdata(0x1000, 128, "Offset +0x1000");
