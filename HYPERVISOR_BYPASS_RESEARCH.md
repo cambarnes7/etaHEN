@@ -638,19 +638,28 @@ COMPLETED:
 │   └── Confirmed: 28 function pointers, matches FreeBSD apic_ops
 ├── ✅ Map function pointer offsets
 │   └── xapic_mode at struct offset 0x10 (position [2])
-└── ✅ Document full structure with addresses
+├── ✅ Document full structure with addresses
+├── ✅ Live verification via UMTX2 exploit (January 2025)
+│   └── kdataBase: 0xffffffffd4550000
+│   └── apic_ops:  0xffffffffd46c0650 (kdataBase + 0x170650)
+│   └── xapic_mode: 0xffffffffd494bcca (valid kernel .text pointer)
+└── ✅ CFI behavior confirmed
+    └── Writing invalid pointer causes INSTANT crash (not on resume)
+    └── CFI actively validates apic_ops pointers during normal operation
 
-IN PROGRESS:
-└── 🔄 Crash test to verify offset
-    └── Write garbage to xapic_mode, trigger rest mode, verify crash on resume
+BLOCKER IDENTIFIED:
+└── ⚠️  CFI (Control Flow Integrity) blocks simple pointer overwrite
+    └── Cannot just write ROP gadget address - CFI validates immediately
+    └── Need CFI bypass BEFORE attempting APIC hijack
 
-High Priority (REMAINING):
+High Priority (NEXT STEPS):
+├── Research PS5 CFI implementation
+│   └── How does Sony's CFI work? Shadow stack? Type-based?
 ├── Identify CFI bypass candidates
-│   └── Options: JIT spray, race condition, or find unchecked call
-├── Test timing window during resume
-│   └── Verify CFI state when xapic_mode is called
-├── Find usable ROP gadgets (XOM blocks .text reading)
-└── Build proof-of-concept
+│   └── Options: Find unchecked indirect call, corrupt CFI metadata, race
+├── Find valid CFI target that can pivot to ROP
+│   └── Look for functions that are valid CFI targets but do useful things
+└── Alternative: Find different function pointer not CFI-protected
 
 Medium Priority:
 ├── Develop ROP chain for pre-HV context
