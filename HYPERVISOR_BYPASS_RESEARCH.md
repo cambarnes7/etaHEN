@@ -821,3 +821,284 @@ The difference between "kernel jailbreak" (kstuff) and "true jailbreak" (Byeperv
 - **Byepervisor**: Hardware-level control, full system access
 
 For FW 3.xx+, the community is effectively "kernel jailbroken" but not "hypervisor jailbroken" - which limits advanced capabilities like kernel dumping and hardware feature access.
+
+---
+
+## 12. CFI Discovery and Data-Only Attack Vectors
+
+### CFI Blocking Analysis (January 2025)
+
+After extensive testing on FW 4.03, we discovered that **Sony's CFI implementation is extremely aggressive**:
+
+**Testing Summary:**
+```
+TESTED STRUCTURE          RESULT      CFI STATUS
+─────────────────────────────────────────────────────
+apic_ops (xapic_mode)     CRASH       CFI-protected
+apic_ops (dump)           CRASH       CFI-protected
+apic_ops (disable)        CRASH       CFI-protected
+apic_ops (enable_mca)     CRASH       CFI-protected
+protosw (pr_input)        CRASH       CFI-protected
+cdevsw                    CRASH       CFI-protected
+linker_class              CRASH       CFI-protected
+vfsops                    CRASH       CFI-protected
+bdevsw                    CRASH       CFI-protected
+Valid function swap       CRASH       CFI-protected
+Same-value writeback      CRASH       CFI-protected (!)
+```
+
+**Key Finding:** CFI validates function pointers IMMEDIATELY on write, not just at call-time.
+Even writing a valid kernel function pointer to another valid slot triggers a crash.
+
+### Why Function Pointer Hijacking Is Not Viable
+
+Sony uses Clang CFI with shadow stacks and type-based validation:
+
+1. **Type Checking**: Each indirect call site has an expected function signature
+2. **Shadow Stack**: Return addresses are validated against a shadow copy
+3. **Write-Time Validation**: Modifications to function pointer tables are detected
+4. **Immediate Crash**: cfi_check_fail() triggers kernel panic instantly
+
+**Conclusion:** Direct function pointer hijacking is NOT a viable path on FW 3.xx+.
+
+---
+
+## 13. How Kstuff Actually Bypasses Security (Data-Only Attacks)
+
+### The Key Insight: Modify DATA, Not Code
+
+Kstuff achieves its goals by modifying **kernel data values**, not function pointers:
+
+```cpp
+// From daemon/source/msg.cpp - pause_resume_kstuff()
+bool pause_resume_kstuff() {
+    intptr_t sysentvec = KERNEL_ADDRESS_DATA_BASE + 0xd11bb8;     // FW 4.03
+    intptr_t sysentvec_ps4 = KERNEL_ADDRESS_DATA_BASE + 0xd11d30; // PS4 compat
+
+    // Toggle a 16-bit VALUE at offset +14 in sysentvec structure
+    if (kernel_getshort(sysentvec_ps4 + 14) == 0xffff) {
+        kernel_setshort(sysentvec + 14, 0xdeb7);      // Resume
+        kernel_setshort(sysentvec_ps4 + 14, 0xdeb7);
+    } else {
+        kernel_setshort(sysentvec + 14, 0xffff);      // Pause
+        kernel_setshort(sysentvec_ps4 + 14, 0xffff);
+    }
+    return true;
+}
+```
+
+**Why This Works:**
+- CFI only protects INDIRECT CALLS through function pointers
+- Modifying scalar data (integers, flags, short values) is NOT protected
+- Security decisions are often based on these data values
+
+### Sysentvec Offsets by Firmware
+
+```
+FIRMWARE       SYSENTVEC (PS5)    SYSENTVEC_PS4
+──────────────────────────────────────────────────
+FW 3.00-3.21   0xca0cd8           0xca0e50
+FW 4.00-4.51   0xd11bb8           0xd11d30
+FW 5.00-5.50   0xe00be8           0xe00d60
+FW 6.00-6.50   0xe210a8           0xe21220
+FW 7.00-7.01   0xe21ab8           0xe21c30
+FW 7.20-7.61   0xe21b78           0xe21cf0
+FW 8.00-8.60   0xe21ca8           0xe21e20
+FW 9.00-9.60   0xdba648           0xdba7c0
+FW 10.00-10.60 0xdba6d8           0xdba850
+```
+
+---
+
+## 14. Security-Critical Kernel Data Structures
+
+### ucred Structure (Process Credentials)
+
+The ucred structure controls process privileges. Modifying these fields affects security decisions:
+
+```cpp
+// Process credential structure - from fps_elf/src/ucred.cpp
+struct ucred {
+    // Standard FreeBSD fields
+    uint32_t cr_uid;      // +0x04: Effective user ID
+    uint32_t cr_ruid;     // +0x08: Real user ID
+    uint32_t cr_svuid;    // +0x0C: Saved user ID
+    uint32_t cr_ngroups;  // +0x10: Number of groups
+    uint32_t cr_rgid;     // +0x14: Real group ID
+
+    // Sony-specific fields (PS5)
+    uint64_t cr_sceAuthID;    // +0x58: Sony authorization ID
+    uint64_t cr_sceCaps[2];   // +0x60, +0x68: Sony capabilities (128-bit)
+    uint8_t  cr_sceAttr[8];   // +0x83: Sony attributes
+};
+
+// Privilege escalation example
+void jailbreak_process(pid_t pid) {
+    uintptr_t ucred = kernel_get_proc_ucred(pid);
+
+    uint32_t uid_store = 0;          // root
+    int64_t caps_store = -1;         // all capabilities
+    uint8_t attr_store[] = {0x80};   // bypass checks
+
+    kernel_copyin(&uid_store, ucred + 0x04, 4);   // cr_uid = 0
+    kernel_copyin(&uid_store, ucred + 0x08, 4);   // cr_ruid = 0
+    kernel_copyin(&caps_store, ucred + 0x60, 8);  // cr_sceCaps[0] = -1
+    kernel_copyin(&caps_store, ucred + 0x68, 8);  // cr_sceCaps[1] = -1
+    kernel_copyin(attr_store, ucred + 0x83, 1);   // cr_sceAttr[0] = 0x80
+}
+```
+
+### Process Structure Fields
+
+```cpp
+// From include/freebsd-helper.h
+struct proc {
+    struct proc *p_forw;           // +0x00: Forward link
+    TAILQ_HEAD(, thread) p_threads; // +0x10: Thread list
+    struct ucred *p_ucred;          // +0x40: Credentials pointer
+    struct filedesc *p_fd;          // +0x48: File descriptors
+    pid_t pid;                      // +0xBC: Process ID
+    // ... more fields
+};
+```
+
+### Filesystem/Jail Escape
+
+```cpp
+// Escape sandbox by modifying process vnode pointers
+void escape_jail(pid_t pid) {
+    uintptr_t root_vnode = kernel_get_root_vnode();
+
+    kernel_set_proc_rootdir(pid, root_vnode);  // Set root to /
+    kernel_set_proc_jaildir(pid, 0);           // Clear jail directory
+}
+```
+
+### Known Auth IDs (Sony)
+
+```cpp
+// Special authorization IDs that grant elevated privileges
+#define DEBUG_AUTHID        0x4800000000000007   // Debugger
+#define DECID_AUTH_ID       0x4800000000000022   // Process termination
+#define SHELLCORE_AUTHID    0x4800000000000007   // Shell core
+#define PTRACE_AUTH_ID      0x4800000000010003   // Ptrace capability
+```
+
+---
+
+## 15. Data-Only Attack Vectors for HV Bypass
+
+Given that CFI blocks function pointer hijacking, we need to find DATA that affects hypervisor-level security:
+
+### Potential Targets
+
+```
+CATEGORY                 STRUCTURE/FIELD           SECURITY IMPACT
+───────────────────────────────────────────────────────────────────────
+Page Table Control       pmap fields               Control memory mapping
+VM Configuration         vm_page flags             Affect memory protection
+IOMMU State              dmar structures           DMA protection
+HV Communication         hypercall params          HV request handling
+ACPI/Power Mgmt          pm_state flags            Suspend/resume behavior
+CPU Features             cpuid cache               CPU feature reporting
+MSR Access               msr_allowed list          Model-specific registers
+```
+
+### Sysentvec Field Analysis
+
+The sysentvec structure at offset +14 appears to control some syscall/ABI behavior.
+The exact semantics of 0xffff vs 0xdeb7 need reverse engineering:
+
+```cpp
+struct sysentvec {
+    int      sv_size;           // +0x00: Number of syscalls
+    struct sysent *sv_table;    // +0x08: Syscall table pointer
+    u_int    sv_mask;           // +0x10: Signal mask
+    short    sv_sigsize;        // +0x14: <-- THIS FIELD IS MODIFIED
+    // ...
+};
+```
+
+**Hypothesis:** The field at +14 may control signal handling or syscall validation.
+Setting it to 0xffff might disable certain security checks.
+
+### Research Direction: Pre-HV Data
+
+For APIC-style attacks, look for data that:
+1. Is read during resume BEFORE hypervisor starts
+2. Affects hardware initialization or security state
+3. Can be modified via kernel R/W
+
+```
+CANDIDATES:
+├── ACPI tables (if in writable memory)
+├── CPU microcode loading parameters
+├── PM resume state machine flags
+├── IOMMU initialization data
+└── Early boot security flags
+```
+
+---
+
+## 16. Updated Research Priorities
+
+### Immediate (Data-Only Approach)
+
+```
+1. Analyze sysentvec structure in detail
+   └── What does field at +14 actually control?
+   └── Are there other exploitable fields?
+
+2. Map ALL kernel data that affects security decisions
+   └── Process credentials (ucred) ✓ DONE
+   └── VM/paging structures
+   └── IOMMU configuration
+   └── Syscall tables (data, not pointers)
+
+3. Find HV-related data in kernel
+   └── Hypercall parameter validation data
+   └── VM configuration structures
+   └── NPT/GMET configuration flags
+```
+
+### Medium Term (Alternative CFI Bypass)
+
+```
+4. Research CFI implementation details
+   └── Where are CFI metadata tables?
+   └── Can they be modified?
+   └── Race conditions during initialization?
+
+5. Look for CFI-exempt code paths
+   └── Legacy code not compiled with CFI?
+   └── Hand-written assembly?
+   └── JIT compilation paths?
+```
+
+### Long Term (Hardware Approach)
+
+```
+6. ACPI/power management research
+   └── Resume sequence analysis
+   └── Pre-HV initialization data
+   └── Hardware state restoration
+
+7. AMD PSP interaction
+   └── How does kernel communicate with PSP?
+   └── Are there exploitable data paths?
+```
+
+---
+
+## 17. Key Takeaways
+
+1. **Function pointer hijacking is dead** on FW 3.xx+ due to aggressive CFI
+2. **Data-only attacks work** - kstuff proves this with sysentvec modification
+3. **ucred modifications** provide privilege escalation without CFI bypass
+4. **The path forward** is finding security-critical DATA, not function pointers
+5. **For HV bypass**, we need to find data that affects pre-hypervisor initialization
+
+The APIC approach remains valid in concept, but requires either:
+- Finding data (not function pointers) that affects resume behavior
+- Discovering a CFI bypass (very difficult)
+- Finding a timing window where CFI isn't active yet
