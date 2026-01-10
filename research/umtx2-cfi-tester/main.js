@@ -771,6 +771,40 @@ async function main(userlandRW, wkOnly = false) {
                     let verify2 = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2));
                     await log("[TEST] Verify +0x4dcc: 0x" + verify2.toString(16), LogLevel.INFO);
                 }
+
+                // TEST: Try to write to kernel .text to see if GMET is actually disabled
+                let doTextTest = confirm(
+                    "TEST: Try writing to kernel .text?\n\n" +
+                    "This will attempt to read a byte from ktextBase,\n" +
+                    "then write the SAME value back.\n\n" +
+                    "If GMET is disabled, this should succeed.\n" +
+                    "If GMET is still active, this may crash.\n\n" +
+                    "OK = Try write test\n" +
+                    "Cancel = Skip"
+                );
+
+                if (doTextTest) {
+                    await log("[GMET TEST] Reading from ktextBase...", LogLevel.WARN);
+                    let textByte = await krw.read1(krw.ktextBase);
+                    await log("[GMET TEST] Read byte: 0x" + textByte.toString(16), LogLevel.INFO);
+
+                    await log("[GMET TEST] Attempting to write same byte back...", LogLevel.WARN);
+                    try {
+                        await krw.write1(krw.ktextBase, textByte);
+                        await log("[GMET TEST] Write completed without crash!", LogLevel.SUCCESS);
+
+                        // Verify
+                        let verifyByte = await krw.read1(krw.ktextBase);
+                        if (verifyByte === textByte) {
+                            await log("[GMET TEST] Verify OK - value unchanged as expected", LogLevel.SUCCESS);
+                            await log("[GMET TEST] GMET may be disabled! Try function pointer test next.", LogLevel.SUCCESS);
+                        } else {
+                            await log("[GMET TEST] WARNING: Value changed to 0x" + verifyByte.toString(16), LogLevel.ERROR);
+                        }
+                    } catch (e) {
+                        await log("[GMET TEST] Write failed with error: " + e, LogLevel.ERROR);
+                    }
+                }
             }
         }
 
