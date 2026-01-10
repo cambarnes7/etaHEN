@@ -605,13 +605,17 @@ async function main(userlandRW, wkOnly = false) {
             let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
             await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
 
+            // Log actual kernel base addresses
+            await log("[DUMP] ktextBase: " + krw.ktextBase, LogLevel.WARN);
+            await log("[DUMP] kdataBase: " + krw.kdataBase, LogLevel.WARN);
+
             // Use smaller 4KB buffer to reduce memory pressure
             let dump_page = p.malloc(0x1000);
-            let ktext_base = new int64(0xD2000000, 0xFFFFFFFF);
-            let dump_addr = ktext_base;
+            // Use actual kernel text base from exploit, not hardcoded guess
+            let dump_addr = krw.ktextBase;
 
             await log("[DUMP] Starting kernel .text dump from 0x" + dump_addr, LogLevel.WARN);
-            alert("Starting kernel .text dump...\n\nDump will continue until crash.");
+            alert("Starting kernel .text dump from " + krw.ktextBase + "\n\nDump will continue until crash.");
 
             for (let j = 0; ; j++) {
                 // Bulk copy 4KB from kernel to userspace
