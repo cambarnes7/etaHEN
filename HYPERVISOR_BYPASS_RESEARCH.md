@@ -1102,3 +1102,96 @@ The APIC approach remains valid in concept, but requires either:
 - Finding data (not function pointers) that affects resume behavior
 - Discovering a CFI bypass (very difficult)
 - Finding a timing window where CFI isn't active yet
+
+---
+
+## 18. BREAKTHROUGH: Writable Mystery Flag at 0xD11D08
+
+### Discovery (2025-01-10)
+
+Through kernel_data.bin analysis, we discovered a writable data field between the two sysentvec structures:
+
+```
+LOCATION:
+  Offset:    0xD11D08 (kdata_base + 0xD11D08)
+  Value:     0x00000001
+  Mask:      0x0FFFFFFF (at offset 0xD11D0C)
+
+CONTEXT:
+  sysentvec_ps5: 0xD11BB8
+  mystery_flag:  0xD11D08 (+0x150 from sysentvec_ps5)
+  sysentvec_ps4: 0xD11D30
+```
+
+### Live Test Results
+
+**CONFIRMED WRITABLE** - The flag was successfully modified to 0 without triggering CFI or causing a crash!
+
+This proves:
+1. **Data-only writes bypass CFI** - as predicted
+2. **This specific flag is modifiable** at runtime
+3. **The flag is in a security-critical area** (between ABI structures)
+
+### What This Flag Might Control
+
+Given its location and the 28-bit mask (0x0FFFFFFF):
+
+1. **ABI compatibility flags** - controls syscall behavior between PS4/PS5 mode
+2. **Security policy index** - indexes into capability/permission tables
+3. **Execution context flags** - affects how code is interpreted
+4. **Debug/development flags** - leftover from Sony's internal builds
+
+### Next Steps
+
+1. **Keep flag at 0 and observe behavior**
+   - Run games
+   - Test suspend/resume cycle
+   - Check homebrew execution differences
+
+2. **IDA reverse engineering**
+   - Find cross-references to kdata_base + 0xD11D08
+   - Identify what code reads this flag
+   - Trace the decision branches
+
+3. **Test other values**
+   - Try 0xFFFFFFFF (all bits set)
+   - Try specific bit patterns matching the mask
+
+4. **Scan for similar flags**
+   - The gap area (0xD11CB8 - 0xD11D30) may contain more writable security data
+
+### Code Location
+
+Test code added to: `research/umtx2-cfi-tester/main.js`
+
+```javascript
+const MYSTERY_FLAG_OFFSET = 0xD11D08;
+const MYSTERY_MASK_OFFSET = 0xD11D0C;
+
+let mysteryFlagAddr = krw.kdataBase.add32(MYSTERY_FLAG_OFFSET);
+let mysteryFlagVal = await krw.read8(mysteryFlagAddr);
+
+// Write 0 to the flag - THIS WORKS!
+await krw.write8(mysteryFlagAddr, new int64(0, mysteryFlagVal.hi));
+```
+
+---
+
+## 19. Gap Area Analysis
+
+The region between sysentvec_ps5 and sysentvec_ps4 contains potentially interesting data:
+
+```
+Offset Range: 0xD11CB8 - 0xD11D30 (0x78 bytes = 120 bytes)
+
+Known non-zero entries from kernel_data.bin:
+  0xD11D08: 0x00000001  <- Mystery flag (WRITABLE!)
+  0xD11D0C: 0x0FFFFFFF  <- 28-bit mask
+```
+
+This area warrants further investigation as it may contain:
+- Additional writable security flags
+- Capability indexes
+- Policy configuration data
+
+All of these could potentially affect hypervisor or security behavior without triggering CFI.

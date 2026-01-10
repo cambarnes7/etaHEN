@@ -653,17 +653,50 @@ async function main(userlandRW, wkOnly = false) {
             if ((verifyVal.low >>> 0) === 0) {
                 await log("[MYSTERY] *** SUCCESS! Flag was modified without crash! ***", LogLevel.SUCCESS);
 
-                // Restore original
-                await krw.write8(mysteryFlagAddr, mysteryFlagVal);
-                await log("[MYSTERY] Restored original value", LogLevel.INFO);
-
-                alert(
-                    "SUCCESS!\n\n" +
-                    "The mystery flag at 0xD11D08 is WRITABLE!\n\n" +
-                    "Original value has been restored.\n\n" +
-                    "Next step: Test what happens when this flag stays 0\n" +
-                    "(might need to test with suspend/resume)"
+                // Ask if user wants to keep flag at 0 and test behavior
+                let keepZero = confirm(
+                    "SUCCESS! Flag is writable!\n\n" +
+                    "Do you want to KEEP the flag at 0 and test effects?\n\n" +
+                    "Click OK to leave flag=0 and scan the gap area\n" +
+                    "Click Cancel to restore original and continue"
                 );
+
+                if (keepZero) {
+                    await log("[MYSTERY] Keeping flag at 0, scanning gap area...", LogLevel.WARN);
+
+                    // Scan the entire gap between sysentvec_ps5 and sysentvec_ps4
+                    // sysentvec_ps5 = 0xD11BB8, sysentvec_ps4 = 0xD11D30
+                    // Gap = 0x178 bytes (376 bytes)
+                    const GAP_START = 0xD11CB8;  // sysentvec_ps5 + 0x100 (after main struct)
+                    const GAP_END = 0xD11D30;    // sysentvec_ps4 start
+
+                    await log("[MYSTERY] Scanning gap: 0x" + GAP_START.toString(16) + " - 0x" + GAP_END.toString(16), LogLevel.INFO);
+
+                    let gapData = "";
+                    for (let off = GAP_START; off < GAP_END; off += 8) {
+                        let addr = krw.kdataBase.add32(off);
+                        let val = await krw.read8(addr);
+                        if (val.low !== 0 || val.hi !== 0) {
+                            gapData += "0x" + off.toString(16) + ": 0x" + (val.hi >>> 0).toString(16).padStart(8,'0') + (val.low >>> 0).toString(16).padStart(8,'0') + "\n";
+                        }
+                    }
+
+                    await log("[MYSTERY] Non-zero data in gap:\n" + gapData, LogLevel.INFO);
+
+                    alert(
+                        "FLAG LEFT AT 0!\n\n" +
+                        "The mystery flag is now 0.\n\n" +
+                        "Try these tests:\n" +
+                        "1. Run a game\n" +
+                        "2. Test suspend/resume\n" +
+                        "3. Check if homebrew behaves differently\n\n" +
+                        "Watch for crashes or behavioral changes!"
+                    );
+                } else {
+                    // Restore original
+                    await krw.write8(mysteryFlagAddr, mysteryFlagVal);
+                    await log("[MYSTERY] Restored original value", LogLevel.INFO);
+                }
             } else {
                 await log("[MYSTERY] Write may have been blocked. Value: 0x" + (verifyVal.low >>> 0).toString(16), LogLevel.WARN);
             }
