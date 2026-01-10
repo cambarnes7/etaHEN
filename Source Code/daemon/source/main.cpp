@@ -327,6 +327,10 @@ int main() {
     payload_args_t *args = payload_get_args();
     kernel_base = args->kdata_base_addr;
 
+    // APIC_OPS scanner - runs once at startup
+    extern void scan_for_apic_ops(void);
+    scan_for_apic_ops();
+
     etaHEN_log("=========== starting etaHEN (0x%X) ... ===========", fw_ver);
     bool has_hv_bypass = (sceKernelMprotect(&buz[0], 100, 0x7) == 0);
     bool is_lite = if_exists("/system_tmp/lite_mode");
