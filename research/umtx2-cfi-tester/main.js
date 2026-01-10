@@ -712,7 +712,15 @@ async function main(userlandRW, wkOnly = false) {
         );
 
         if (do_swap_test) {
-            await log("[CFI v2] Writing eoi address to xapic_mode slot...", LogLevel.WARN);
+            // FIRST: Test writing the SAME value back (should never crash)
+            await log("[CFI v2] TEST 1: Writing SAME value back (sanity check)...", LogLevel.INFO);
+            await krw.write8(xapic_mode_addr, original_xapic_mode);
+            await log("[CFI v2] Same-value write OK!", LogLevel.SUCCESS);
+
+            // Small delay to ensure any async crash would happen
+            await new Promise(r => setTimeout(r, 500));
+
+            await log("[CFI v2] TEST 2: Now trying swap to eoi...", LogLevel.WARN);
             await krw.write8(xapic_mode_addr, eoi_func);
 
             const verify = await krw.read8(xapic_mode_addr);
