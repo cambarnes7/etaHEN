@@ -417,22 +417,59 @@ struct apic_ops is located in the kernel .data segment (RW permissions)
 With KRW (kernel read/write), you can overwrite function pointers inside it
 ```
 
-**Target Structure (from FreeBSD):**
+**Target Structure (from FreeBSD apicvar.h):**
 ```c
-// Note: This was removed from FreeBSD mainline in 2022 (commit e0516c7553da)
-// but PS5's FreeBSD fork likely still has it
+// Note: Removed from FreeBSD mainline in 2022 (commit e0516c7553da)
+// PS5's FreeBSD fork (based on older version) still has it
+// Full structure has ~28 function pointers (224 bytes on x86_64)
+
 struct apic_ops {
-    void (*xapic_mode)(void);           // <-- Target for overwrite
-    int  (*is_x2apic)(void);
+    // Core APIC operations
     void (*create)(u_int, int);
     void (*init)(vm_paddr_t);
+    void (*xapic_mode)(void);           // <-- TARGET: offset 0x10
+    bool (*is_x2apic)(void);
     void (*setup)(int);
     void (*dump)(const char *);
     void (*disable)(void);
     void (*eoi)(void);
+
+    // ID and status
     int  (*id)(void);
-    // ... vector, timer, PMC, CMC, IPI functions
+    int  (*intr_pending)(u_int);
+    void (*set_logical_id)(u_int, u_int, u_int);
+    u_int (*cpuid)(u_int);
+
+    // Vector management
+    u_int (*alloc_vector)(u_int, u_int);
+    u_int (*alloc_vectors)(u_int, u_int *, u_int, u_int);
+    void (*enable_vector)(u_int, u_int);
+    void (*disable_vector)(u_int, u_int);
+    void (*free_vector)(u_int, u_int, u_int);
+
+    // PMC, CMC, ELVT operations
+    int  (*enable_pmc)(void);
+    void (*disable_pmc)(void);
+    void (*reenable_pmc)(void);
+    void (*enable_cmc)(void);
+    int  (*enable_mca_elvt)(void);
+
+    // IPI operations
+    void (*ipi_raw)(register_t, u_int);
+    void (*ipi_vectored)(u_int, int);
+    int  (*ipi_wait)(int);
+    int  (*ipi_alloc)(inthand_t *);
+    void (*ipi_free)(int);
+
+    // LVT operations
+    int  (*set_lvt_mask)(u_int, u_int, u_char);
+    int  (*set_lvt_mode)(u_int, u_int, u_int32_t);
+    int  (*set_lvt_polarity)(u_int, u_int, enum intr_polarity);
+    int  (*set_lvt_triggermode)(u_int, u_int, enum intr_trigger);
 };
+
+// Scanner note: Look for ~28 consecutive kernel .text pointers in .data
+// Known FW 4.03 reference offset: allproc @ 0x27EDCB8
 ```
 
 ### Attack Flow
