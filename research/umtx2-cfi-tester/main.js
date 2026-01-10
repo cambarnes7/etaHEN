@@ -582,16 +582,110 @@ async function main(userlandRW, wkOnly = false) {
         let testVal = await krw.read8(krw.kdataBase);
         await log("[INFO] Test read from kdataBase: " + testVal, LogLevel.INFO);
 
-        let doDump = confirm(
-            "KERNEL DUMP\n\n" +
-            "ktextBase: " + krw.ktextBase + "\n" +
+        ///////////////////////////////////////////////////////////////////////
+        // GMET/VMCB ANALYSIS - Search for hypervisor control data
+        // Based on offsets found in kernel_data.bin analysis:
+        //   - GMET format string at offset 0x3A3CCC
+        //   - SVM feature table at offset 0x330BB0
+        //   - GMET is bit 18 (0x12) in SVM features
+        ///////////////////////////////////////////////////////////////////////
+
+        // Known offsets from kernel_data.bin (relative to kdataBase)
+        const KDATA_OFFSET_GMET_STRING = 0x3A3CCC;      // "EnableGMET:%d" format string
+        const KDATA_OFFSET_SVM_FEATURE_TABLE = 0x330BB0; // SVM feature name table
+        const KDATA_OFFSET_VM_PMAP = 0x409132;          // vm.pmap.pcid_enabled sysctl
+
+        // Helper to read and display memory region
+        async function hexdump_kdata(offset, length, label) {
+            await log("[GMET] " + label + " @ kdataBase+0x" + offset.toString(16) + ":", LogLevel.WARN);
+            let addr = krw.kdataBase.add32(offset);
+            let hex = "";
+            let ascii = "";
+            for (let i = 0; i < length; i++) {
+                let byte = await krw.read1(addr.add32(i));
+                hex += byte.toString(16).padStart(2, '0') + " ";
+                ascii += (byte >= 0x20 && byte < 0x7f) ? String.fromCharCode(byte) : ".";
+                if ((i + 1) % 16 === 0) {
+                    await log("  " + hex + " |" + ascii + "|", LogLevel.INFO);
+                    hex = "";
+                    ascii = "";
+                }
+            }
+            if (hex) {
+                await log("  " + hex.padEnd(48) + " |" + ascii + "|", LogLevel.INFO);
+            }
+        }
+
+        // Search for potential control variables (look for small integers near string refs)
+        async function search_before_string(string_offset, search_range) {
+            await log("[GMET] Searching " + search_range + " bytes BEFORE string for control vars...", LogLevel.WARN);
+            let found_candidates = [];
+            for (let i = search_range; i > 0; i -= 8) {
+                let addr = krw.kdataBase.add32(string_offset - i);
+                let val = await krw.read8(addr);
+                // Look for small values that could be flags/booleans
+                if (val.hi === 0 && val.low >= 0 && val.low <= 0xFF) {
+                    found_candidates.push({offset: string_offset - i, value: val.low});
+                }
+            }
+            return found_candidates;
+        }
+
+        let doGmetAnalysis = confirm(
+            "GMET/HYPERVISOR ANALYSIS\n\n" +
             "kdataBase: " + krw.kdataBase + "\n\n" +
-            "Choose what to dump:\n" +
-            "OK = Dump from kdataBase (safer, known to work)\n" +
-            "Cancel = Skip dump\n\n" +
-            "Make sure nc -l -p 9020 > kernel_dump.bin is running!"
+            "This will examine kernel memory at known offsets\n" +
+            "where GMET-related data was found:\n\n" +
+            "- GMET format string @ +0x3A3CCC\n" +
+            "- SVM feature table @ +0x330BB0\n" +
+            "- vm.pmap sysctl @ +0x409132\n\n" +
+            "OK = Run GMET analysis\n" +
+            "Cancel = Skip"
         );
 
+        if (doGmetAnalysis) {
+            await log("========== GMET/HYPERVISOR ANALYSIS ==========", LogLevel.SUCCESS);
+
+            // 1. Verify GMET string is where we expect
+            await hexdump_kdata(KDATA_OFFSET_GMET_STRING, 64, "GMET format string area");
+
+            // 2. Look at SVM feature table
+            await hexdump_kdata(KDATA_OFFSET_SVM_FEATURE_TABLE, 64, "SVM feature table");
+
+            // 3. Look BEFORE the GMET string for potential control variables
+            // The format string is used by a function that reads the actual enable flags
+            // Those flags are often in static variables near the string or in a struct
+            await log("[GMET] Searching for control variables before GMET string...", LogLevel.WARN);
+
+            // Check 256 bytes before the string
+            await hexdump_kdata(KDATA_OFFSET_GMET_STRING - 0x100, 0x100, "256 bytes BEFORE GMET string");
+
+            // 4. Also check what's after the string (could be in a data struct)
+            await hexdump_kdata(KDATA_OFFSET_GMET_STRING + 0x40, 64, "64 bytes AFTER GMET string");
+
+            // 5. Look for the VMCB 0x090 area string and check nearby data
+            // The VMCB offset 0x090 contains NP_ENABLE, SEV, GMET flags
+            await log("[GMET] Searching for 0x090 VMCB offset references...", LogLevel.WARN);
+
+            // Search near SVM feature table for config data
+            await hexdump_kdata(KDATA_OFFSET_SVM_FEATURE_TABLE - 0x100, 0x100, "256 bytes BEFORE SVM feature table");
+
+            // 6. Try to find small integer candidates that could be GMET enable flag
+            let candidates = await search_before_string(KDATA_OFFSET_GMET_STRING, 0x200);
+            if (candidates.length > 0) {
+                await log("[GMET] Potential control variable candidates:", LogLevel.SUCCESS);
+                for (let c of candidates) {
+                    await log("  Offset 0x" + c.offset.toString(16) + " = " + c.value, LogLevel.INFO);
+                }
+            }
+
+            await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
+            await log("Copy the hex dumps above for further analysis.", LogLevel.INFO);
+            await log("Look for values 0 or 1 that control EnableGMET.", LogLevel.INFO);
+        }
+
+        // OPTIONAL: Full kernel dump (disabled by default)
+        let doDump = false; // Set to confirm(...) to enable
         if (doDump) {
             let dump_sock_addr_store = p.malloc(0x10);
             let dump_sock_fd = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low;
@@ -610,7 +704,6 @@ async function main(userlandRW, wkOnly = false) {
             let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
             await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
 
-            // Use tiny buffer - write 8 bytes at a time directly to socket
             let dump_buf = p.malloc(0x8);
             let dump_addr = krw.kdataBase;
 
@@ -618,13 +711,12 @@ async function main(userlandRW, wkOnly = false) {
             alert("Starting kernel dump from kdataBase...\n\nDump will continue until crash.");
 
             for (let j = 0; ; j++) {
-                // Read 8 bytes at a time and send immediately
                 let val = await krw.read8(dump_addr);
                 p.write8(dump_buf, val);
                 await chain.syscall(SYS_WRITE, dump_sock_fd, dump_buf, 0x8);
                 dump_addr = dump_addr.add32(0x8);
 
-                if (j % 0x8000 === 0) {  // Every 256KB
+                if (j % 0x8000 === 0) {
                     await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 8 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
                 }
             }
