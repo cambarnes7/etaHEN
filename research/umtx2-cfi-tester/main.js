@@ -646,42 +646,88 @@ async function main(userlandRW, wkOnly = false) {
         if (doGmetAnalysis) {
             await log("========== GMET/HYPERVISOR ANALYSIS ==========", LogLevel.SUCCESS);
 
-            // 1. Verify GMET string is where we expect
-            await hexdump_kdata(KDATA_OFFSET_GMET_STRING, 64, "GMET format string area");
+            // Phase 1: Check start of .data for config globals
+            await log("[PHASE 1] Checking start of kernel .data section...", LogLevel.WARN);
+            await hexdump_kdata(0x0, 128, "Start of .data (offset 0)");
+            await hexdump_kdata(0x100, 128, "Offset +0x100");
+            await hexdump_kdata(0x1000, 128, "Offset +0x1000");
 
-            // 2. Look at SVM feature table
-            await hexdump_kdata(KDATA_OFFSET_SVM_FEATURE_TABLE, 64, "SVM feature table");
+            // Phase 2: Search for dwords with GMET-related bit patterns
+            // VMCB offset 0x090 contains: NP_ENABLE(bit0), SEV(bit1), ESSEV(bit2), GMET(bit12=0x1000)
+            // So a value like 0x1001 means NP+GMET enabled
+            await log("[PHASE 2] Scanning for VMCB control bit patterns...", LogLevel.WARN);
+            await log("Looking for values: 0x1001 (NP+GMET), 0x1 (NP only), 0x1000 (GMET only)...", LogLevel.INFO);
 
-            // 3. Look BEFORE the GMET string for potential control variables
-            // The format string is used by a function that reads the actual enable flags
-            // Those flags are often in static variables near the string or in a struct
-            await log("[GMET] Searching for control variables before GMET string...", LogLevel.WARN);
-
-            // Check 256 bytes before the string
-            await hexdump_kdata(KDATA_OFFSET_GMET_STRING - 0x100, 0x100, "256 bytes BEFORE GMET string");
-
-            // 4. Also check what's after the string (could be in a data struct)
-            await hexdump_kdata(KDATA_OFFSET_GMET_STRING + 0x40, 64, "64 bytes AFTER GMET string");
-
-            // 5. Look for the VMCB 0x090 area string and check nearby data
-            // The VMCB offset 0x090 contains NP_ENABLE, SEV, GMET flags
-            await log("[GMET] Searching for 0x090 VMCB offset references...", LogLevel.WARN);
-
-            // Search near SVM feature table for config data
-            await hexdump_kdata(KDATA_OFFSET_SVM_FEATURE_TABLE - 0x100, 0x100, "256 bytes BEFORE SVM feature table");
-
-            // 6. Try to find small integer candidates that could be GMET enable flag
-            let candidates = await search_before_string(KDATA_OFFSET_GMET_STRING, 0x200);
-            if (candidates.length > 0) {
-                await log("[GMET] Potential control variable candidates:", LogLevel.SUCCESS);
-                for (let c of candidates) {
-                    await log("  Offset 0x" + c.offset.toString(16) + " = " + c.value, LogLevel.INFO);
+            let vmcbBitCandidates = [];
+            // Scan first 256KB of .data for these specific patterns
+            for (let offset = 0; offset < 0x40000; offset += 4) {
+                let val = await krw.read4(krw.kdataBase.add32(offset));
+                // Look for VMCB control values
+                if (val === 0x1001 || val === 0x1000 || val === 0x1 ||
+                    val === 0x1003 || val === 0x1007 || val === 0x1005) {
+                    vmcbBitCandidates.push({offset: offset, value: val});
+                }
+                if (offset % 0x8000 === 0) {
+                    await log("[SCAN] 0x" + offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
                 }
             }
 
+            if (vmcbBitCandidates.length > 0) {
+                await log("[PHASE 2] Found VMCB-like bit patterns:", LogLevel.SUCCESS);
+                for (let c of vmcbBitCandidates) {
+                    let meaning = "";
+                    if (c.value & 0x1) meaning += "NP ";
+                    if (c.value & 0x2) meaning += "SEV ";
+                    if (c.value & 0x4) meaning += "ESSEV ";
+                    if (c.value & 0x1000) meaning += "GMET ";
+                    await log("  +0x" + c.offset.toString(16) + " = 0x" + c.value.toString(16) + " [" + meaning.trim() + "]", LogLevel.INFO);
+                    // Show context
+                    await hexdump_kdata(c.offset - 16, 48, "Context around +0x" + c.offset.toString(16));
+                }
+            } else {
+                await log("[PHASE 2] No VMCB control patterns found in first 256KB", LogLevel.WARN);
+            }
+
+            // Phase 3: Look for SVM feature bitmask (CPUID 8000_000Ah EDX)
+            // GMET is bit 18 = 0x40000
+            await log("[PHASE 3] Scanning for SVM feature mask (bit 18 = GMET)...", LogLevel.WARN);
+
+            let svmFeatureCandidates = [];
+            for (let offset = 0; offset < 0x40000; offset += 4) {
+                let val = await krw.read4(krw.kdataBase.add32(offset));
+                // Look for values with bit 18 set (GMET in SVM features)
+                if ((val & 0x40000) !== 0 && val < 0x1000000) {
+                    svmFeatureCandidates.push({offset: offset, value: val});
+                }
+                if (offset % 0x8000 === 0) {
+                    await log("[SCAN] 0x" + offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
+                }
+            }
+
+            if (svmFeatureCandidates.length > 0) {
+                await log("[PHASE 3] Found values with GMET bit (0x40000):", LogLevel.SUCCESS);
+                for (let c of svmFeatureCandidates.slice(0, 15)) {
+                    await log("  +0x" + c.offset.toString(16) + " = 0x" + c.value.toString(16), LogLevel.INFO);
+                }
+                if (svmFeatureCandidates.length > 15) {
+                    await log("  ... and " + (svmFeatureCandidates.length - 15) + " more", LogLevel.INFO);
+                }
+            }
+
+            // Phase 4: Check around vm.pmap sysctl for HV-related sysctls
+            await log("[PHASE 4] Checking near vm.pmap sysctl area...", LogLevel.WARN);
+            await hexdump_kdata(KDATA_OFFSET_VM_PMAP - 0x200, 256, "Before vm.pmap");
+            await hexdump_kdata(KDATA_OFFSET_VM_PMAP, 256, "At/after vm.pmap");
+
+            // Phase 5: Verify GMET string location (sanity check)
+            await log("[PHASE 5] Verifying GMET string location...", LogLevel.WARN);
+            await hexdump_kdata(KDATA_OFFSET_GMET_STRING, 64, "GMET format string");
+
             await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
-            await log("Copy the hex dumps above for further analysis.", LogLevel.INFO);
-            await log("Look for values 0 or 1 that control EnableGMET.", LogLevel.INFO);
+            await log("Key findings to look for:", LogLevel.INFO);
+            await log("  - Values 0x1001/0x1000 indicate VMCB control dword", LogLevel.INFO);
+            await log("  - Values with bit 18 (0x40000) are SVM feature masks", LogLevel.INFO);
+            await log("  - Try modifying these to disable GMET", LogLevel.INFO);
         }
 
         // OPTIONAL: Full kernel dump (disabled by default)
