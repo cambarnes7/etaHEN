@@ -696,8 +696,8 @@ async function main(userlandRW, wkOnly = false) {
         ];
 
         // Which candidate to test (set to index, or -1 for read-only mode)
-        // Crashed: 0, 1
-        const CFI_TEST_INDEX = 2;  // protosw_3
+        // Crashed: 0, 1, 2
+        const CFI_TEST_INDEX = 3;  // protosw_4
 
         await log("[CFI TEST] Scanning " + cfi_test_candidates.length + " candidates...", LogLevel.INFO);
 
