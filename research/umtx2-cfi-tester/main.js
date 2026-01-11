@@ -835,6 +835,152 @@ async function main(userlandRW, wkOnly = false) {
                     await log("[.TEXT] Write failed: " + e, LogLevel.ERROR);
                 }
             }
+
+            // =========================================================================
+            // RESEARCH ANALYSIS SUITE
+            // Comprehensive analysis for HV bypass research
+            // =========================================================================
+
+            let runResearch = confirm(
+                "HV BYPASS RESEARCH SUITE\n\n" +
+                "Run comprehensive analysis?\n" +
+                "- Dump calibration (verify offsets)\n" +
+                "- Full pointer map (0x0-0x10000)\n" +
+                "- Extended SVM cache scan\n" +
+                "- Mystery flag analysis\n" +
+                "- .text read attempt\n\n" +
+                "OK = Run analysis\n" +
+                "Cancel = Skip"
+            );
+
+            if (runResearch) {
+                // ===== CALIBRATION =====
+                await log("========== DUMP CALIBRATION ==========", LogLevel.SUCCESS);
+                await log("kdataBase: " + krw.kdataBase, LogLevel.INFO);
+                await log("ktextBase: " + krw.ktextBase, LogLevel.INFO);
+
+                let cal_svm1 = await krw.read4(krw.kdataBase.add32(0x4bf0));
+                let cal_svm2 = await krw.read4(krw.kdataBase.add32(0x4dcc));
+                let cal_ptr = await krw.read8(krw.kdataBase.add32(0x4a48));
+
+                await log("Calibration values (search in kernel_data.bin):", LogLevel.WARN);
+                await log("  0x4bf0: 0x" + cal_svm1.toString(16) + " (SVM cache 1)", LogLevel.INFO);
+                await log("  0x4dcc: 0x" + cal_svm2.toString(16) + " (SVM cache 2)", LogLevel.INFO);
+                await log("  0x4a48: " + cal_ptr + " (writable pointer)", LogLevel.INFO);
+
+                // ===== FULL POINTER MAP =====
+                await log("========== FULL POINTER MAP (0x0-0x10000) ==========", LogLevel.SUCCESS);
+
+                let textPtrs = [];
+                let dataPtrs = [];
+                let otherPtrs = [];
+
+                for (let off = 0; off < 0x10000; off += 8) {
+                    let val = await krw.read8(krw.kdataBase.add32(off));
+
+                    if (val.hi !== 0xffffffff) continue;
+
+                    // Filter out obvious masks
+                    let lowHex = val.low.toString(16).padStart(8, '0');
+                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
+
+                    let textOff = val.low - krw.ktextBase.low;
+                    let dataOff = val.low - krw.kdataBase.low;
+
+                    if (textOff >= 0 && textOff < 0x2000000) {
+                        textPtrs.push({off, textOff, val});
+                    } else if (dataOff >= 0 && dataOff < 0x2000000) {
+                        dataPtrs.push({off, dataOff, val});
+                    } else {
+                        otherPtrs.push({off, val});
+                    }
+                }
+
+                await log("Found " + textPtrs.length + " .text pointers", LogLevel.SUCCESS);
+                await log("Found " + dataPtrs.length + " .data pointers", LogLevel.INFO);
+                await log("Found " + otherPtrs.length + " other pointers", LogLevel.INFO);
+
+                // Log .text pointers (most interesting)
+                await log("--- .text pointers (potential code refs) ---", LogLevel.WARN);
+                for (let p of textPtrs) {
+                    await log("  0x" + p.off.toString(16) + " -> .text+0x" + p.textOff.toString(16), LogLevel.WARN);
+                }
+
+                // ===== EXTENDED SVM CACHE SCAN =====
+                await log("========== EXTENDED SVM CACHE SCAN ==========", LogLevel.SUCCESS);
+                let svmMatches = [];
+                for (let off = 0; off < 0x20000; off += 4) {
+                    let val = await krw.read4(krw.kdataBase.add32(off));
+                    if (val === 0x740f12 || val === 0x700f12) {
+                        svmMatches.push({off, val});
+                        let gmet = (val & 0x40000) !== 0;
+                        await log("[SVM] 0x" + off.toString(16) + ": 0x" + val.toString(16) +
+                            " (GMET " + (gmet ? "SET" : "CLEAR") + ")", LogLevel.SUCCESS);
+                    }
+                }
+                await log("Total SVM cache matches: " + svmMatches.length, LogLevel.INFO);
+
+                // ===== MYSTERY FLAG ANALYSIS =====
+                await log("========== MYSTERY FLAG ANALYSIS ==========", LogLevel.SUCCESS);
+                const MYSTERY_OFFSET = 0xD11D08;
+
+                // Check if offset is readable (might be outside our dump range)
+                try {
+                    let mysteryVal = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
+                    await log("Mystery flag at 0xD11D08: 0x" + mysteryVal.toString(16), LogLevel.WARN);
+
+                    // Read surrounding context
+                    await log("Context around 0xD11D00:", LogLevel.INFO);
+                    for (let ctx = 0xD11D00; ctx < 0xD11D20; ctx += 4) {
+                        let ctxVal = await krw.read4(krw.kdataBase.add32(ctx));
+                        let marker = (ctx === MYSTERY_OFFSET) ? " <-- MYSTERY FLAG" : "";
+                        await log("  0x" + ctx.toString(16) + ": 0x" + ctxVal.toString(16) + marker, LogLevel.INFO);
+                    }
+                } catch (e) {
+                    await log("Mystery flag offset 0xD11D08 not accessible: " + e, LogLevel.ERROR);
+                }
+
+                // ===== .TEXT READ ATTEMPT =====
+                await log("========== .TEXT READ ATTEMPT ==========", LogLevel.SUCCESS);
+                try {
+                    let textVal = await krw.read8(krw.ktextBase);
+                    await log("[!!!] .TEXT IS READABLE: " + textVal, LogLevel.SUCCESS);
+                    await log("[!!!] This means we can dump kernel .text!", LogLevel.SUCCESS);
+
+                    let dumpText = confirm(
+                        ".TEXT IS READABLE!\n\n" +
+                        "This is unexpected - GMET should block this.\n" +
+                        "We can dump the kernel .text section!\n\n" +
+                        "Dump first 0x100 bytes to log?\n" +
+                        "OK = Dump sample\n" +
+                        "Cancel = Skip"
+                    );
+
+                    if (dumpText) {
+                        await log("Dumping first 0x100 bytes of .text:", LogLevel.WARN);
+                        for (let toff = 0; toff < 0x100; toff += 8) {
+                            let tval = await krw.read8(krw.ktextBase.add32(toff));
+                            await log("  .text+0x" + toff.toString(16) + ": " + tval, LogLevel.INFO);
+                        }
+                    }
+                } catch (e) {
+                    await log("[.TEXT] Not readable (GMET active): " + e, LogLevel.INFO);
+                    await log("[.TEXT] This is expected - need to extract kernel from firmware", LogLevel.INFO);
+                }
+
+                // ===== SUMMARY =====
+                await log("========== RESEARCH SUMMARY ==========", LogLevel.SUCCESS);
+                await log("kdataBase: " + krw.kdataBase, LogLevel.INFO);
+                await log("ktextBase: " + krw.ktextBase, LogLevel.INFO);
+                await log(".text pointers in writable region: " + textPtrs.length, LogLevel.INFO);
+                await log("SVM cache locations found: " + svmMatches.length, LogLevel.INFO);
+                await log("", LogLevel.INFO);
+                await log("Next steps:", LogLevel.WARN);
+                await log("1. Extract kernel from 4.03 PUP using bootrom", LogLevel.INFO);
+                await log("2. Load into IDA, find code referencing 0xD11D08", LogLevel.INFO);
+                await log("3. Find manumode variable location", LogLevel.INFO);
+                await log("4. Trace dmem_resume_svm function", LogLevel.INFO);
+            }
         }
 
         // OPTIONAL: Full kernel dump (disabled by default)
