@@ -703,7 +703,7 @@ async function main(userlandRW, wkOnly = false) {
             await log("=== PS2 Emulator Memory Analysis ===", LogLevel.INFO);
             await log("Looking for mast1c0re-critical addresses...", LogLevel.INFO);
 
-            const searchTerms = ["ps2", "emu", "eboot", "racer"];
+            const searchTerms = ["CUSA", "ps2", "emu", "eboot"];
             let allProcesses = [];
 
             for (const term of searchTerms) {
