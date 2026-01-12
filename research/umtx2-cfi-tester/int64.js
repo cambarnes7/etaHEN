@@ -107,7 +107,20 @@ function int64(low, hi) {
         return new int64(new_lo, new_hi);
     }
 
-    /** 
+    /**
+     * Compare equality with another int64 or number
+     * @param {int64|number} other
+     * @returns {boolean}
+     */
+    this.eq = function (other) {
+        if (other instanceof int64) {
+            return this.low === other.low && this.hi === other.hi;
+        }
+        // Handle numeric comparison
+        return this.low === (other >>> 0) && this.hi === 0;
+    }
+
+    /**
      * @param {number} radix
      * @returns {string}
      */
