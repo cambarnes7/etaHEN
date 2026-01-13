@@ -578,6 +578,119 @@ async function main(userlandRW, wkOnly = false) {
         const VM_PROT_WRITE = 0x2;
         const VM_PROT_EXECUTE = 0x4;
 
+        // Page table constants for x86-64
+        const PAGE_SHIFT = 12;
+        const PAGE_SIZE = 1 << PAGE_SHIFT;  // 4096
+        const PAGE_MASK = PAGE_SIZE - 1;
+        const PTE_PRESENT = 0x1;
+        const PTE_FRAME_MASK = 0x000FFFFFFFFFF000n;  // Physical address bits
+
+        // vmspace structure - pmap offset (needs to be determined for PS5)
+        // On FreeBSD, pmap is typically at offset 0x100+ in vmspace
+        const VMSPACE_PMAP_OFFSET = 0x100;  // This may need adjustment
+
+        // Direct map base - on FreeBSD this is typically 0xfffffe0000000000
+        // On PS5 this may be different - we'll try to detect it
+        let DMAP_BASE = new int64(0x00000000, 0xfffffe00);
+
+        // Translate user virtual address to physical address via page tables
+        async function translateUserVA(vmspace, userVA) {
+            // Get pmap from vmspace
+            const pmap = vmspace.add32(VMSPACE_PMAP_OFFSET);
+
+            // PML4 is typically at offset 0 of pmap structure
+            const pml4_phys = await krw.read8(pmap);
+
+            if (pml4_phys.hi === 0 && pml4_phys.low === 0) {
+                await log(`pmap PML4 is null`, LogLevel.WARN);
+                return null;
+            }
+
+            // Convert user VA to BigInt for bit operations
+            const va = BigInt(userVA.hi) * 0x100000000n + BigInt(userVA.low);
+
+            // Extract page table indices from virtual address
+            const pml4_idx = Number((va >> 39n) & 0x1FFn);
+            const pdpt_idx = Number((va >> 30n) & 0x1FFn);
+            const pd_idx = Number((va >> 21n) & 0x1FFn);
+            const pt_idx = Number((va >> 12n) & 0x1FFn);
+            const page_offset = Number(va & 0xFFFn);
+
+            await log(`VA ${userVA.toString()}: PML4[${pml4_idx}] PDPT[${pdpt_idx}] PD[${pd_idx}] PT[${pt_idx}] +${page_offset.toString(16)}`, LogLevel.DEBUG);
+
+            // Read PML4 entry - need to convert physical to kernel VA via direct map
+            const pml4_pa = BigInt(pml4_phys.hi) * 0x100000000n + BigInt(pml4_phys.low);
+            const pml4_kva = DMAP_BASE.add32(Number(pml4_pa & 0xFFFFFFFFn));
+            if (pml4_pa > 0xFFFFFFFFn) {
+                pml4_kva.hi += Number(pml4_pa >> 32n);
+            }
+
+            const pml4e = await krw.read8(pml4_kva.add32(pml4_idx * 8));
+            if ((pml4e.low & PTE_PRESENT) === 0) {
+                await log(`PML4E not present`, LogLevel.WARN);
+                return null;
+            }
+
+            // Get PDPT physical address from PML4E
+            const pdpt_pa = BigInt(pml4e.hi & 0x000FFFFF) * 0x100000000n + BigInt(pml4e.low & 0xFFFFF000);
+            const pdpt_kva = DMAP_BASE.add32(Number(pdpt_pa & 0xFFFFFFFFn));
+
+            const pdpte = await krw.read8(pdpt_kva.add32(pdpt_idx * 8));
+            if ((pdpte.low & PTE_PRESENT) === 0) {
+                await log(`PDPTE not present`, LogLevel.WARN);
+                return null;
+            }
+
+            // Check for 1GB page
+            if (pdpte.low & 0x80) {
+                const phys = (BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xC0000000)) + (va & 0x3FFFFFFFn);
+                return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
+            }
+
+            // Get PD physical address
+            const pd_pa = BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xFFFFF000);
+            const pd_kva = DMAP_BASE.add32(Number(pd_pa & 0xFFFFFFFFn));
+
+            const pde = await krw.read8(pd_kva.add32(pd_idx * 8));
+            if ((pde.low & PTE_PRESENT) === 0) {
+                await log(`PDE not present`, LogLevel.WARN);
+                return null;
+            }
+
+            // Check for 2MB page
+            if (pde.low & 0x80) {
+                const phys = (BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFE00000)) + (va & 0x1FFFFFn);
+                return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
+            }
+
+            // Get PT physical address
+            const pt_pa = BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFFFF000);
+            const pt_kva = DMAP_BASE.add32(Number(pt_pa & 0xFFFFFFFFn));
+
+            const pte = await krw.read8(pt_kva.add32(pt_idx * 8));
+            if ((pte.low & PTE_PRESENT) === 0) {
+                await log(`PTE not present`, LogLevel.WARN);
+                return null;
+            }
+
+            // Get final physical address
+            const phys = (BigInt(pte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pte.low & 0xFFFFF000)) + BigInt(page_offset);
+            return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
+        }
+
+        // Read from user-space memory via page table translation
+        async function readUserMem8(vmspace, userVA) {
+            const phys = await translateUserVA(vmspace, userVA);
+            if (!phys) return null;
+
+            // Convert physical to kernel VA via direct map
+            const kva = new int64(DMAP_BASE.low + phys.low, DMAP_BASE.hi + phys.hi);
+            // Handle carry
+            if (kva.low < phys.low) kva.hi++;
+
+            return await krw.read8(kva);
+        }
+
         // Read null-terminated string from kernel memory
         async function kreadString(addr, maxLen = 32) {
             let str = "";
@@ -820,17 +933,58 @@ async function main(userlandRW, wkOnly = false) {
                 await log(`Executable: ${executable.length}, Writable: ${writable.length}`, LogLevel.INFO);
                 await log(`IOP candidates: ${iopCandidates.length}, Eboot candidates: ${ebootCandidates.length}`, LogLevel.INFO);
 
-                // NOTE: Cannot search for IOP RAM pointer with kernel R/W primitives
-                // The addresses in mappings are USER-SPACE virtual addresses of the ps2emu process
-                // We can only read KERNEL memory with krw.read8()
-                // To read user-space memory, we'd need to:
-                // 1. Walk the process's page tables to get physical addresses
-                // 2. Read from kernel's direct-map of physical memory
-                // For now, just log what we found
                 await log(`\n=== Summary ===`, LogLevel.INFO);
                 await log(`Found ${iopCandidates.length} IOP RAM regions (PS2 emulated memory)`, LogLevel.INFO);
+
                 if (ebootCandidates.length > 0) {
-                    await log(`Potential eboot base: ${ebootCandidates[0].start.toString()}`, LogLevel.SUCCESS);
+                    const ebootBase = ebootCandidates[0].start;
+                    await log(`Eboot base: ${ebootBase.toString()}`, LogLevel.SUCCESS);
+
+                    // Calculate mast1c0re addresses (using Okage offsets as reference)
+                    // These offsets may differ for Star Wars Racer
+                    const N_STATUS_OFFSET = 0x897810;
+                    const S_STATUS_OFFSET = 0x897820;
+                    const IOP_RAM_PTR_OFFSET = 0xAF6E38;
+
+                    const nStatusAddr = ebootBase.add32(N_STATUS_OFFSET);
+                    const sStatusAddr = ebootBase.add32(S_STATUS_OFFSET);
+                    const iopPtrAddr = ebootBase.add32(IOP_RAM_PTR_OFFSET);
+
+                    await log(`\n=== Calculated mast1c0re addresses (Okage offsets) ===`, LogLevel.INFO);
+                    await log(`  N_STATUS_BUFFER: ${nStatusAddr.toString()}`, LogLevel.INFO);
+                    await log(`  S_STATUS_BUFFER: ${sStatusAddr.toString()}`, LogLevel.INFO);
+                    await log(`  IOP_RAM_POINTER: ${iopPtrAddr.toString()}`, LogLevel.INFO);
+
+                    // Try to verify by reading user-space memory via page tables
+                    await log(`\n=== Attempting to read user-space memory via page tables ===`, LogLevel.INFO);
+                    const vmspace = await krw.read8(p.proc.add32(PROC_P_VMSPACE));
+
+                    // Try to read the IOP RAM pointer - should contain 0x9000000000
+                    await log(`Trying to read IOP_RAM_POINTER at ${iopPtrAddr.toString()}...`, LogLevel.INFO);
+                    const iopPtrValue = await readUserMem8(vmspace, iopPtrAddr);
+                    if (iopPtrValue) {
+                        await log(`  IOP_RAM_POINTER value: ${iopPtrValue.toString()}`, LogLevel.SUCCESS);
+                        if (iopPtrValue.hi === 0x90 && iopPtrValue.low === 0) {
+                            await log(`  ✓ Matches expected 0x9000000000!`, LogLevel.SUCCESS);
+                        } else {
+                            await log(`  ✗ Expected 0x9000000000, offsets may be different for this game`, LogLevel.WARN);
+                        }
+                    } else {
+                        await log(`  Failed to read (page not present or wrong DMAP base)`, LogLevel.WARN);
+                    }
+
+                    // Try to read from eboot base to verify we can read
+                    await log(`Trying to read eboot header at ${ebootBase.toString()}...`, LogLevel.INFO);
+                    const ebootHeader = await readUserMem8(vmspace, ebootBase);
+                    if (ebootHeader) {
+                        await log(`  Eboot header: ${ebootHeader.toString()}`, LogLevel.SUCCESS);
+                        // ELF magic is 0x464C457F ("\x7FELF")
+                        if ((ebootHeader.low & 0xFFFFFFFF) === 0x464C457F) {
+                            await log(`  ✓ Valid ELF header!`, LogLevel.SUCCESS);
+                        }
+                    } else {
+                        await log(`  Failed to read eboot header`, LogLevel.WARN);
+                    }
                 }
             }
         }
