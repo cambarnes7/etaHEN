@@ -601,6 +601,47 @@ async function main(userlandRW, wkOnly = false) {
         ];
         let DMAP_BASE = DMAP_BASES[0];  // Will be updated when we find the right one
 
+        // Try to detect the correct DMAP base by reading from known physical addresses
+        async function detectDmapBase() {
+            await log("=== Detecting DMAP base ===", LogLevel.INFO);
+
+            // Physical address 0x1000 should contain something readable
+            // Try each DMAP base and see which one gives us valid-looking data
+            for (const dmap of DMAP_BASES) {
+                try {
+                    // Try reading from physical address 0x1000 via this DMAP
+                    const testAddr = new int64(0x1000, dmap.hi);
+                    const val = await krw.read8(testAddr);
+                    await log(`  DMAP ${dmap.toString()}: read @ +0x1000 = ${val.toString()}`, LogLevel.DEBUG);
+
+                    // If we get non-zero data, this might be the right DMAP
+                    if (val.low !== 0 || val.hi !== 0) {
+                        await log(`  -> Non-zero data found, possible DMAP base`, LogLevel.SUCCESS);
+                    }
+                } catch (e) {
+                    await log(`  DMAP ${dmap.toString()}: read failed - ${e}`, LogLevel.DEBUG);
+                }
+            }
+
+            // Also try to find DMAP by looking at kernel addresses
+            // The kernel text/data bases can help us understand the VA layout
+            await log(`ktextBase: ${krw.ktextBase.toString()}`, LogLevel.INFO);
+            await log(`kdataBase: ${krw.kdataBase.toString()}`, LogLevel.INFO);
+
+            // On PS5, try to find if there's a pattern
+            // Look at what's around kdataBase to understand memory layout
+            await log("=== Memory around kdataBase ===", LogLevel.DEBUG);
+            for (let off = 0; off < 0x100; off += 0x20) {
+                try {
+                    const addr = krw.kdataBase.add32(off);
+                    const val = await krw.read8(addr);
+                    await log(`  kdataBase+${off.toString(16)}: ${val.toString()}`, LogLevel.DEBUG);
+                } catch (e) {
+                    break;
+                }
+            }
+        }
+
         // Translate user virtual address to physical address via page tables
         async function translateUserVA(vmspace, userVA) {
             // First, we need to find the pmap within vmspace
@@ -1066,6 +1107,7 @@ async function main(userlandRW, wkOnly = false) {
         // PS2EMU MEMORY FINDER (optional - for mast1c0re research)
         // Uncomment to find emulator addresses when Star Wars Racer is running
         // =========================================================================
+        await detectDmapBase();  // Try to figure out the correct DMAP base
         await findMast1coreAddresses();
 
         // =========================================================================
