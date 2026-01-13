@@ -650,26 +650,46 @@ async function main(userlandRW, wkOnly = false) {
 
             let pml4_candidates = [];
 
-            // Dump vmspace to find pmap/PML4
-            await log(`Probing vmspace for pmap/PML4...`, LogLevel.DEBUG);
+            // Dump vmspace pmap region to find PML4
+            await log(`=== vmspace pmap region (0x100-0x300) ===`, LogLevel.DEBUG);
+            let kva_candidates = [];
+
             for (let off = 0x100; off < 0x300; off += 8) {
                 const val = await krw.read8(vmspace.add32(off));
-                // PML4 physical address (CR3) should be:
-                // - Page aligned (low 12 bits = 0)
-                // - In reasonable physical memory range
-                // - Non-zero
-                // - NOT look like a user VA (user VAs are typically < 0x800000000000 but > 0x100000)
-                if (val.low !== 0 || val.hi !== 0) {
-                    if ((val.low & 0xFFF) === 0 && val.hi < 0x8) {
-                        // PML4 physical addresses are typically in low physical memory (< 4GB)
-                        // Skip obvious user VAs (which are typically > 256MB on PS5 due to ASLR)
-                        // Keep candidates that look like they could be page table physical addresses
-                        const isLikelyPhys = val.hi === 0 && val.low > 0x100000 && val.low < 0x20000000; // 1MB - 512MB
-                        if (isLikelyPhys) {
-                            await log(`  +${off.toString(16)}: ${val.toString()} (possible PML4 phys)`, LogLevel.DEBUG);
-                            pml4_candidates.push({ offset: off, phys: val });
-                        }
+                if (val.low === 0 && val.hi === 0) continue;
+
+                const hiUnsigned = val.hi >>> 0;
+                let type = "";
+
+                // Check if it's a kernel VA (0xffff...)
+                if (hiUnsigned >= 0xffff0000) {
+                    type = " [KVA]";
+                    kva_candidates.push({ offset: off, kva: val });
+                }
+                // Check if it looks like a physical address
+                else if ((val.low & 0xFFF) === 0 && val.hi < 0x8 && val.low > 0x100000 && val.low < 0x20000000) {
+                    type = " [PHYS?]";
+                    pml4_candidates.push({ offset: off, phys: val });
+                }
+
+                await log(`  +${off.toString(16)}: ${val.toString()}${type}`, LogLevel.DEBUG);
+            }
+
+            await log(`Found ${kva_candidates.length} KVA candidates, ${pml4_candidates.length} phys candidates`, LogLevel.INFO);
+
+            // Try KVA candidates first - read directly without DMAP
+            for (const candidate of kva_candidates) {
+                try {
+                    const pml4e_addr = candidate.kva.add32(pml4_idx * 8);
+                    const pml4e = await krw.read8(pml4e_addr);
+
+                    if ((pml4e.low & PTE_PRESENT) !== 0 && (pml4e.low & 0xFFFFF000) !== 0) {
+                        await log(`KVA +${candidate.offset.toString(16)} -> PML4E[${pml4_idx}] = ${pml4e.toString()} PRESENT!`, LogLevel.SUCCESS);
+                        // Found a working PML4 via kernel VA!
+                        // But the entries inside point to physical addresses, so we still need DMAP...
                     }
+                } catch (e) {
+                    // Not readable
                 }
             }
 
