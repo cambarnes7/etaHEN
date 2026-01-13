@@ -644,9 +644,15 @@ async function main(userlandRW, wkOnly = false) {
                 pml4_kva.hi += Number(pml4_pa >> 32n);
             }
 
-            const pml4e = await krw.read8(pml4_kva.add32(pml4_idx * 8));
+            await log(`PML4 phys: ${pml4_phys.toString()}, PML4 KVA: ${pml4_kva.toString()}`, LogLevel.DEBUG);
+            const pml4e_addr = pml4_kva.add32(pml4_idx * 8);
+            await log(`Reading PML4E at ${pml4e_addr.toString()} (idx ${pml4_idx})`, LogLevel.DEBUG);
+
+            const pml4e = await krw.read8(pml4e_addr);
+            await log(`PML4E value: ${pml4e.toString()}`, LogLevel.DEBUG);
+
             if ((pml4e.low & PTE_PRESENT) === 0) {
-                await log(`PML4E not present`, LogLevel.WARN);
+                await log(`PML4E not present (value=${pml4e.toString()})`, LogLevel.WARN);
                 return null;
             }
 
@@ -835,6 +841,14 @@ async function main(userlandRW, wkOnly = false) {
 
                     const nextEntry = await krw.read8(entry.add32(VM_MAP_ENTRY_NEXT));
                     await log(`    next entry: ${nextEntry.toString()}`, LogLevel.DEBUG);
+
+                    // Check if next entry looks like a valid kernel pointer (0xffff...)
+                    const nextHi = nextEntry.hi >>> 0;
+                    if (nextHi < 0xffff0000) {
+                        await log(`  Loop exit: next entry ${nextEntry.toString()} is not a valid kernel pointer`, LogLevel.WARN);
+                        break;
+                    }
+
                     entry = nextEntry;
                 } catch (e) {
                     await log(`  Loop exit: exception ${e}`, LogLevel.WARN);
