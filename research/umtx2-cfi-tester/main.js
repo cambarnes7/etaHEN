@@ -799,13 +799,19 @@ async function main(userlandRW, wkOnly = false) {
                 // Analyze mappings
                 let executable = [], writable = [], iopCandidates = [], ebootCandidates = [];
                 for (const m of mappings) {
-                    if (m.prot.includes('X')) executable.push(m);
+                    if (m.prot.includes('X')) {
+                        executable.push(m);
+                        // Log ALL executable regions to find the eboot
+                        await log(`EXEC: ${m.start.toString()} - ${m.end.toString()} [${m.prot}]`, LogLevel.DEBUG);
+                    }
                     if (m.prot.includes('W') && !m.prot.includes('X')) writable.push(m);
                     if (m.start.hi >= 0x90 && m.start.hi <= 0x91) {
                         iopCandidates.push(m);
                         await log(`IOP CANDIDATE: ${m.start.toString()} - ${m.end.toString()} [${m.prot}]`, LogLevel.SUCCESS);
                     }
-                    if (m.start.hi === 0 && m.start.low < 0x10000000 && m.prot.includes('X')) {
+                    // Broaden eboot detection - any executable region could be eboot
+                    // Original check was too narrow (< 0x10000000)
+                    if (m.prot.includes('X') && m.start.hi === 0) {
                         ebootCandidates.push(m);
                         await log(`EBOOT CANDIDATE: ${m.start.toString()} - ${m.end.toString()} [${m.prot}]`, LogLevel.SUCCESS);
                     }
@@ -814,8 +820,18 @@ async function main(userlandRW, wkOnly = false) {
                 await log(`Executable: ${executable.length}, Writable: ${writable.length}`, LogLevel.INFO);
                 await log(`IOP candidates: ${iopCandidates.length}, Eboot candidates: ${ebootCandidates.length}`, LogLevel.INFO);
 
-                // Search for IOP pointer
-                await findIopRamPointer(writable);
+                // NOTE: Cannot search for IOP RAM pointer with kernel R/W primitives
+                // The addresses in mappings are USER-SPACE virtual addresses of the ps2emu process
+                // We can only read KERNEL memory with krw.read8()
+                // To read user-space memory, we'd need to:
+                // 1. Walk the process's page tables to get physical addresses
+                // 2. Read from kernel's direct-map of physical memory
+                // For now, just log what we found
+                await log(`\n=== Summary ===`, LogLevel.INFO);
+                await log(`Found ${iopCandidates.length} IOP RAM regions (PS2 emulated memory)`, LogLevel.INFO);
+                if (ebootCandidates.length > 0) {
+                    await log(`Potential eboot base: ${ebootCandidates[0].start.toString()}`, LogLevel.SUCCESS);
+                }
             }
         }
 
