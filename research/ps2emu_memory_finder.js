@@ -39,7 +39,9 @@ const VM_MAP_ENTRY_PROTECTION = 0x60; // vm_prot_t protection
 const VM_MAP_ENTRY_EFLAGS = 0x44;  // int eflags
 
 // vmspace structure offsets
-const VMSPACE_VM_MAP_HEADER = 0x0; // struct vm_map_entry vm_map.header
+// On PS5, vm_map has an sx lock (~0x50 bytes) before the header entry
+// vmspace offset 0 = vm_map, vm_map offset 0x50 = header entry
+const VM_MAP_HEADER_OFFSET = 0x50;
 
 // Protection flags
 const VM_PROT_READ = 0x1;
@@ -99,9 +101,11 @@ async function dumpProcessMemoryMap(k, procAddr) {
     const vmspace = await k.read8(procAddr.add32(PROC_P_VMSPACE));
     log(`vmspace @ ${vmspace.toString()}`, LogLevel.INFO);
 
-    // Get the vm_map header (first entry in the map)
-    const mapHeader = vmspace; // vm_map is at offset 0 in vmspace
+    // Get the vm_map header (after the sx lock in vm_map structure)
+    const mapHeader = vmspace.add32(VM_MAP_HEADER_OFFSET);
+    log(`mapHeader @ ${mapHeader.toString()}`, LogLevel.DEBUG);
     const firstEntry = await k.read8(mapHeader.add32(VM_MAP_ENTRY_NEXT));
+    log(`firstEntry @ ${firstEntry.toString()}`, LogLevel.DEBUG);
 
     let entry = firstEntry;
     let mappings = [];

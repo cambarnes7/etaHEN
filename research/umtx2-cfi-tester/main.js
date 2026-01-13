@@ -569,6 +569,10 @@ async function main(userlandRW, wkOnly = false) {
         const VM_MAP_ENTRY_END = 0x28;
         const VM_MAP_ENTRY_PROTECTION = 0x60;
 
+        // On PS5, vm_map has an sx lock before the header entry
+        // vm_map structure: [sx lock ~0x50 bytes][header entry][...]
+        const VM_MAP_HEADER_OFFSET = 0x50;
+
         // Protection flags
         const VM_PROT_READ = 0x1;
         const VM_PROT_WRITE = 0x2;
@@ -613,8 +617,11 @@ async function main(userlandRW, wkOnly = false) {
             const vmspace = await krw.read8(procAddr.add32(PROC_P_VMSPACE));
             await log(`vmspace @ ${vmspace.toString()}`, LogLevel.INFO);
 
-            const mapHeader = vmspace;
+            // The vm_map header entry is after the sx lock in the vm_map structure
+            const mapHeader = vmspace.add32(VM_MAP_HEADER_OFFSET);
+            await log(`mapHeader @ ${mapHeader.toString()}`, LogLevel.DEBUG);
             const firstEntry = await krw.read8(mapHeader.add32(VM_MAP_ENTRY_NEXT));
+            await log(`firstEntry @ ${firstEntry.toString()}`, LogLevel.DEBUG);
             let entry = firstEntry;
             let mappings = [];
 
