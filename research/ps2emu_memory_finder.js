@@ -101,11 +101,47 @@ async function dumpProcessMemoryMap(k, procAddr) {
     const vmspace = await k.read8(procAddr.add32(PROC_P_VMSPACE));
     log(`vmspace @ ${vmspace.toString()}`, LogLevel.INFO);
 
-    // Get the vm_map header (after the sx lock in vm_map structure)
-    const mapHeader = vmspace.add32(VM_MAP_HEADER_OFFSET);
-    log(`mapHeader @ ${mapHeader.toString()}`, LogLevel.DEBUG);
-    const firstEntry = await k.read8(mapHeader.add32(VM_MAP_ENTRY_NEXT));
-    log(`firstEntry @ ${firstEntry.toString()}`, LogLevel.DEBUG);
+    // Debug: dump first 0x100 bytes of vmspace to find vm_map structure
+    log("=== vmspace hex dump (finding vm_map header) ===", LogLevel.DEBUG);
+    for (let off = 0; off < 0x100; off += 0x10) {
+        const v0 = await k.read8(vmspace.add32(off));
+        const v1 = await k.read8(vmspace.add32(off + 8));
+        log(`  +${off.toString(16).padStart(2,'0')}: ${v0.toString()} ${v1.toString()}`, LogLevel.DEBUG);
+    }
+
+    // Try to find the vm_map header by looking for self-referential pointers
+    let mapHeader = null;
+    let firstEntry = null;
+
+    const tryOffsets = [0x0, 0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8];
+
+    for (const headerOffset of tryOffsets) {
+        const testHeader = vmspace.add32(headerOffset);
+        const prevPtr = await k.read8(testHeader);
+        const nextPtr = await k.read8(testHeader.add32(0x8));
+
+        if (prevPtr.hi >= 0xfffffd00 && nextPtr.hi >= 0xfffffd00) {
+            log(`  Candidate header @ +${headerOffset.toString(16)}: prev=${prevPtr.toString()} next=${nextPtr.toString()}`, LogLevel.SUCCESS);
+
+            if (!nextPtr.eq(testHeader)) {
+                const testStart = await k.read8(nextPtr.add32(VM_MAP_ENTRY_START));
+                const testEnd = await k.read8(nextPtr.add32(VM_MAP_ENTRY_END));
+                log(`    -> entry start=${testStart.toString()} end=${testEnd.toString()}`, LogLevel.DEBUG);
+
+                if (testEnd.hi > 0 || testStart.hi > 0 || testEnd.low > testStart.low) {
+                    mapHeader = testHeader;
+                    firstEntry = nextPtr;
+                    log(`  FOUND valid vm_map header at offset 0x${headerOffset.toString(16)}!`, LogLevel.SUCCESS);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!mapHeader) {
+        log("Could not find vm_map header automatically", LogLevel.WARN);
+        return [];
+    }
 
     let entry = firstEntry;
     let mappings = [];
