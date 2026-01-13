@@ -120,7 +120,10 @@ async function dumpProcessMemoryMap(k, procAddr) {
         const prevPtr = await k.read8(testHeader);
         const nextPtr = await k.read8(testHeader.add32(0x8));
 
-        if (prevPtr.hi >= 0xfffffd00 && nextPtr.hi >= 0xfffffd00) {
+        // Check if these look like valid kernel pointers (0xffff.... pattern)
+        const prevHi = prevPtr.hi >>> 0;
+        const nextHi = nextPtr.hi >>> 0;
+        if (prevHi >= 0xffff0000 && nextHi >= 0xffff0000) {
             log(`  Candidate header @ +${headerOffset.toString(16)}: prev=${prevPtr.toString()} next=${nextPtr.toString()}`, LogLevel.SUCCESS);
 
             if (!nextPtr.eq(testHeader)) {
