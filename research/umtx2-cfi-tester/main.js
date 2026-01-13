@@ -590,8 +590,16 @@ async function main(userlandRW, wkOnly = false) {
         const VMSPACE_PMAP_OFFSET = 0x100;  // This may need adjustment
 
         // Direct map base - on FreeBSD this is typically 0xfffffe0000000000
-        // On PS5 this may be different - we'll try to detect it
-        let DMAP_BASE = new int64(0x00000000, 0xfffffe00);
+        // On PS5 this may be different - we'll try multiple bases
+        const DMAP_BASES = [
+            new int64(0x00000000, 0xfffffe00),  // 0xfffffe0000000000 - standard FreeBSD
+            new int64(0x00000000, 0xfffff800),  // 0xfffff80000000000 - alternative
+            new int64(0x00000000, 0xffff8000),  // 0xffff800000000000 - another variant
+            new int64(0x00000000, 0xfffffc00),  // 0xfffffc0000000000 - another variant
+            new int64(0x00000000, 0xffffd000),  // 0xffffd00000000000 - PS5 specific?
+            new int64(0x00000000, 0xffffc000),  // 0xffffc00000000000 - PS5 specific?
+        ];
+        let DMAP_BASE = DMAP_BASES[0];  // Will be updated when we find the right one
 
         // Translate user virtual address to physical address via page tables
         async function translateUserVA(vmspace, userVA) {
@@ -629,89 +637,101 @@ async function main(userlandRW, wkOnly = false) {
                 return null;
             }
 
-            // Try each candidate until we find one that works
-            for (const candidate of pml4_candidates) {
-                const pml4_phys = candidate.phys;
-                await log(`Trying PML4 candidate at +${candidate.offset.toString(16)}: ${pml4_phys.toString()}`, LogLevel.DEBUG);
+            // Convert user VA to BigInt for bit operations
+            const va = BigInt(userVA.hi) * 0x100000000n + BigInt(userVA.low);
 
-                // Convert user VA to BigInt for bit operations
-                const va = BigInt(userVA.hi) * 0x100000000n + BigInt(userVA.low);
+            // Extract page table indices from virtual address
+            const pml4_idx = Number((va >> 39n) & 0x1FFn);
+            const pdpt_idx = Number((va >> 30n) & 0x1FFn);
+            const pd_idx = Number((va >> 21n) & 0x1FFn);
+            const pt_idx = Number((va >> 12n) & 0x1FFn);
+            const page_offset = Number(va & 0xFFFn);
 
-                // Extract page table indices from virtual address
-                const pml4_idx = Number((va >> 39n) & 0x1FFn);
-                const pdpt_idx = Number((va >> 30n) & 0x1FFn);
-                const pd_idx = Number((va >> 21n) & 0x1FFn);
-                const pt_idx = Number((va >> 12n) & 0x1FFn);
-                const page_offset = Number(va & 0xFFFn);
+            // Try each DMAP base with each PML4 candidate
+            for (const dmap of DMAP_BASES) {
+                for (const candidate of pml4_candidates) {
+                    const pml4_phys = candidate.phys;
 
-                // Read PML4 entry via direct map
-                const pml4_pa = BigInt(pml4_phys.hi) * 0x100000000n + BigInt(pml4_phys.low);
-                const pml4_kva = DMAP_BASE.add32(Number(pml4_pa & 0xFFFFFFFFn));
-                if (pml4_pa > 0xFFFFFFFFn) {
-                    pml4_kva.hi += Number(pml4_pa >> 32n);
-                }
+                    // Read PML4 entry via direct map
+                    const pml4_pa = BigInt(pml4_phys.hi) * 0x100000000n + BigInt(pml4_phys.low);
+                    const pml4_kva = new int64(dmap.low, dmap.hi);
+                    pml4_kva.low = (pml4_kva.low + Number(pml4_pa & 0xFFFFFFFFn)) >>> 0;
+                    if (pml4_kva.low < dmap.low) pml4_kva.hi++;
+                    if (pml4_pa > 0xFFFFFFFFn) {
+                        pml4_kva.hi += Number(pml4_pa >> 32n);
+                    }
 
-                const pml4e_addr = pml4_kva.add32(pml4_idx * 8);
-                const pml4e = await krw.read8(pml4e_addr);
+                    const pml4e_addr = pml4_kva.add32(pml4_idx * 8);
+                    const pml4e = await krw.read8(pml4e_addr);
 
-                if ((pml4e.low & PTE_PRESENT) === 0) {
-                    await log(`  PML4E[${pml4_idx}] not present (value=${pml4e.toString()})`, LogLevel.DEBUG);
-                    continue;  // Try next candidate
-                }
+                    // Check if PML4E looks valid (present bit set, and looks like a page table entry)
+                    if ((pml4e.low & PTE_PRESENT) === 0) {
+                        continue;  // Try next combination
+                    }
 
-                await log(`  PML4E[${pml4_idx}] = ${pml4e.toString()} (present!)`, LogLevel.SUCCESS);
+                    // Additional validation: PML4E should have physical address bits set
+                    if ((pml4e.low & 0xFFFFF000) === 0 && pml4e.hi === 0) {
+                        continue;  // Doesn't look like a valid PTE
+                    }
 
-                // Get PDPT physical address from PML4E
-                const pdpt_pa = BigInt(pml4e.hi & 0x000FFFFF) * 0x100000000n + BigInt(pml4e.low & 0xFFFFF000);
-                const pdpt_kva = DMAP_BASE.add32(Number(pdpt_pa & 0xFFFFFFFFn));
+                    await log(`Found working DMAP: ${dmap.toString()}, PML4 @ +${candidate.offset.toString(16)}`, LogLevel.SUCCESS);
+                    await log(`  PML4E[${pml4_idx}] = ${pml4e.toString()} (present!)`, LogLevel.SUCCESS);
 
-                const pdpte = await krw.read8(pdpt_kva.add32(pdpt_idx * 8));
-                if ((pdpte.low & PTE_PRESENT) === 0) {
-                    await log(`  PDPTE[${pdpt_idx}] not present`, LogLevel.DEBUG);
-                    continue;
-                }
+                    // Update global DMAP_BASE for future calls
+                    DMAP_BASE = dmap;
 
-                // Check for 1GB page
-                if (pdpte.low & 0x80) {
-                    const phys = (BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xC0000000)) + (va & 0x3FFFFFFFn);
-                    await log(`  1GB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
+                    // Get PDPT physical address from PML4E
+                    const pdpt_pa = BigInt(pml4e.hi & 0x000FFFFF) * 0x100000000n + BigInt(pml4e.low & 0xFFFFF000);
+                    const pdpt_kva = DMAP_BASE.add32(Number(pdpt_pa & 0xFFFFFFFFn));
+
+                    const pdpte = await krw.read8(pdpt_kva.add32(pdpt_idx * 8));
+                    if ((pdpte.low & PTE_PRESENT) === 0) {
+                        await log(`  PDPTE[${pdpt_idx}] not present`, LogLevel.DEBUG);
+                        continue;
+                    }
+
+                    // Check for 1GB page
+                    if (pdpte.low & 0x80) {
+                        const phys = (BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xC0000000)) + (va & 0x3FFFFFFFn);
+                        await log(`  1GB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
+                        return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
+                    }
+
+                    // Get PD physical address
+                    const pd_pa = BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xFFFFF000);
+                    const pd_kva = DMAP_BASE.add32(Number(pd_pa & 0xFFFFFFFFn));
+
+                    const pde = await krw.read8(pd_kva.add32(pd_idx * 8));
+                    if ((pde.low & PTE_PRESENT) === 0) {
+                        await log(`  PDE[${pd_idx}] not present`, LogLevel.DEBUG);
+                        continue;
+                    }
+
+                    // Check for 2MB page
+                    if (pde.low & 0x80) {
+                        const phys = (BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFE00000)) + (va & 0x1FFFFFn);
+                        await log(`  2MB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
+                        return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
+                    }
+
+                    // Get PT physical address
+                    const pt_pa = BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFFFF000);
+                    const pt_kva = DMAP_BASE.add32(Number(pt_pa & 0xFFFFFFFFn));
+
+                    const pte = await krw.read8(pt_kva.add32(pt_idx * 8));
+                    if ((pte.low & PTE_PRESENT) === 0) {
+                        await log(`  PTE[${pt_idx}] not present`, LogLevel.DEBUG);
+                        continue;
+                    }
+
+                    // Get final physical address
+                    const phys = (BigInt(pte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pte.low & 0xFFFFF000)) + BigInt(page_offset);
+                    await log(`  4KB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
                     return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
                 }
-
-                // Get PD physical address
-                const pd_pa = BigInt(pdpte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pdpte.low & 0xFFFFF000);
-                const pd_kva = DMAP_BASE.add32(Number(pd_pa & 0xFFFFFFFFn));
-
-                const pde = await krw.read8(pd_kva.add32(pd_idx * 8));
-                if ((pde.low & PTE_PRESENT) === 0) {
-                    await log(`  PDE[${pd_idx}] not present`, LogLevel.DEBUG);
-                    continue;
-                }
-
-                // Check for 2MB page
-                if (pde.low & 0x80) {
-                    const phys = (BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFE00000)) + (va & 0x1FFFFFn);
-                    await log(`  2MB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
-                    return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
-                }
-
-                // Get PT physical address
-                const pt_pa = BigInt(pde.hi & 0x000FFFFF) * 0x100000000n + BigInt(pde.low & 0xFFFFF000);
-                const pt_kva = DMAP_BASE.add32(Number(pt_pa & 0xFFFFFFFFn));
-
-                const pte = await krw.read8(pt_kva.add32(pt_idx * 8));
-                if ((pte.low & PTE_PRESENT) === 0) {
-                    await log(`  PTE[${pt_idx}] not present`, LogLevel.DEBUG);
-                    continue;
-                }
-
-                // Get final physical address
-                const phys = (BigInt(pte.hi & 0x000FFFFF) * 0x100000000n + BigInt(pte.low & 0xFFFFF000)) + BigInt(page_offset);
-                await log(`  4KB page -> phys ${phys.toString(16)}`, LogLevel.SUCCESS);
-                return new int64(Number(phys & 0xFFFFFFFFn), Number(phys >> 32n));
             }
 
-            await log(`None of the PML4 candidates worked`, LogLevel.WARN);
+            await log(`None of the DMAP/PML4 combinations worked`, LogLevel.WARN);
             return null;
         }
 
