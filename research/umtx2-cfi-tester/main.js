@@ -595,14 +595,33 @@ async function main(userlandRW, wkOnly = false) {
 
         // Translate user virtual address to physical address via page tables
         async function translateUserVA(vmspace, userVA) {
-            // Get pmap from vmspace
-            const pmap = vmspace.add32(VMSPACE_PMAP_OFFSET);
+            // First, we need to find the pmap within vmspace
+            // The pmap contains the PML4 physical address
+            // Probe vmspace to find a value that looks like a physical address (page-aligned, reasonable range)
 
-            // PML4 is typically at offset 0 of pmap structure
-            const pml4_phys = await krw.read8(pmap);
+            let pml4_phys = null;
 
-            if (pml4_phys.hi === 0 && pml4_phys.low === 0) {
-                await log(`pmap PML4 is null`, LogLevel.WARN);
+            // Dump vmspace to find pmap/PML4
+            await log(`Probing vmspace for pmap/PML4...`, LogLevel.DEBUG);
+            for (let off = 0x100; off < 0x300; off += 8) {
+                const val = await krw.read8(vmspace.add32(off));
+                // PML4 physical address should be:
+                // - Page aligned (low 12 bits = 0)
+                // - In reasonable physical memory range (< 0x800000000, i.e. < 32GB)
+                // - Non-zero
+                if (val.low !== 0 || val.hi !== 0) {
+                    if ((val.low & 0xFFF) === 0 && val.hi < 0x8) {
+                        await log(`  +${off.toString(16)}: ${val.toString()} (possible PML4 phys)`, LogLevel.DEBUG);
+                        if (!pml4_phys) {
+                            pml4_phys = val;
+                            await log(`  Using this as PML4 physical address`, LogLevel.SUCCESS);
+                        }
+                    }
+                }
+            }
+
+            if (!pml4_phys || (pml4_phys.hi === 0 && pml4_phys.low === 0)) {
+                await log(`Could not find PML4 physical address in vmspace`, LogLevel.WARN);
                 return null;
             }
 
