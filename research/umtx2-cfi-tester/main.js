@@ -672,9 +672,18 @@ async function main(userlandRW, wkOnly = false) {
             let entry = firstEntry;
             let mappings = [];
 
+            await log(`Starting entry loop: entry=${entry.toString()} mapHeader=${mapHeader.toString()}`, LogLevel.DEBUG);
+
             for (let i = 0; i < 1000; i++) {
-                if (entry.low === 0 && entry.hi === 0) break;
-                if (entry.eq(mapHeader)) break;
+                if (entry.low === 0 && entry.hi === 0) {
+                    await log(`  Loop exit: entry is null`, LogLevel.DEBUG);
+                    break;
+                }
+                // Compare addresses manually since .eq() might not work
+                if (entry.low === mapHeader.low && entry.hi === mapHeader.hi) {
+                    await log(`  Loop exit: entry equals mapHeader (circular list complete)`, LogLevel.DEBUG);
+                    break;
+                }
 
                 try {
                     const start = await krw.read8(entry.add32(VM_MAP_ENTRY_START));
@@ -686,9 +695,14 @@ async function main(userlandRW, wkOnly = false) {
                         ((prot & VM_PROT_WRITE) ? 'W' : '-') +
                         ((prot & VM_PROT_EXECUTE) ? 'X' : '-');
 
+                    await log(`  Map[${mappings.length}]: ${start.toString()}-${end.toString()} [${protStr}]`, LogLevel.DEBUG);
                     mappings.push({ start, end, size, prot: protStr, protRaw: prot });
-                    entry = await krw.read8(entry.add32(VM_MAP_ENTRY_NEXT));
+
+                    const nextEntry = await krw.read8(entry.add32(VM_MAP_ENTRY_NEXT));
+                    await log(`    next entry: ${nextEntry.toString()}`, LogLevel.DEBUG);
+                    entry = nextEntry;
                 } catch (e) {
+                    await log(`  Loop exit: exception ${e}`, LogLevel.WARN);
                     break;
                 }
             }
