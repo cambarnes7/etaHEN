@@ -689,7 +689,10 @@ async function main(userlandRW, wkOnly = false) {
                     const start = await krw.read8(entry.add32(VM_MAP_ENTRY_START));
                     const end = await krw.read8(entry.add32(VM_MAP_ENTRY_END));
                     const prot = await krw.read4(entry.add32(VM_MAP_ENTRY_PROTECTION));
-                    const size = end.sub64(start);
+                    // Calculate size manually since int64 doesn't have sub64
+                    const sizeLow = (end.low - start.low) >>> 0;
+                    const sizeHi = end.hi - start.hi - (end.low < start.low ? 1 : 0);
+                    const size = new int64(sizeLow, sizeHi);
                     const protStr =
                         ((prot & VM_PROT_READ) ? 'R' : '-') +
                         ((prot & VM_PROT_WRITE) ? 'W' : '-') +
@@ -828,7 +831,7 @@ async function main(userlandRW, wkOnly = false) {
         // PS2EMU MEMORY FINDER (optional - for mast1c0re research)
         // Uncomment to find emulator addresses when Star Wars Racer is running
         // =========================================================================
-        // await findMast1coreAddresses();
+        await findMast1coreAddresses();
 
         // =========================================================================
         // JAILBREAK - Security flags, credentials, sandbox escape
