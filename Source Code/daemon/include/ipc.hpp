@@ -192,4 +192,5 @@ void* messageThread(void*);
 bool GetFileContents(const char *path, char **buffer);
 bool touch_file(const char *destfile);
 bool decrypt_dir(const std::string& inputPath, const std::string& outputPath) ;
+int dump_system_selfs(const char *output_base_dir);
 void *IPC_loop(void *args);

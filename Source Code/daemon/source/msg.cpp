@@ -1218,6 +1218,23 @@ void handleIPC(struct clientArgs *client, std::string &inputStr,
 	reply(sender_app, false);
     break;
   }
+  case BREW_DUMP_SYSTEM_SELFS: {
+    etaHEN_log("BREW_DUMP_SYSTEM_SELFS called");
+    reply(sender_app, false);
+
+    // Default output to USB if available, otherwise /data/etaHEN/system_dump
+    const char *dest = json_getPropertyValue(my_json, "dest_path");
+    const char *output_dir = (dest && strlen(dest) > 0) ? dest : "/data/etaHEN/system_dump";
+
+    notify(true, "Starting system SELF dump (pagertab swap)\nOutput: %s", output_dir);
+    int res = dump_system_selfs(output_dir);
+    if (res == 0) {
+      notify(true, "System SELF dump completed successfully!\nOutput: %s", output_dir);
+    } else {
+      notify(true, "System SELF dump finished with errors\nCheck logs for details");
+    }
+    break;
+  }
   default:
     notify(true, "Unknown command 0x%X", command);
     reply(sender_app, true);

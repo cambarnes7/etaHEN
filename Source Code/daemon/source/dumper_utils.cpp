@@ -404,6 +404,118 @@ bool ends_with(const std::string& str, const std::string& suffix) {
 
 }
 #define SELF_ORBIS_MAGIC        0x1D3D154F
+int dump_system_selfs(const char *output_base_dir) {
+    // Known PS5 system directories containing SELFs/SPRXs
+    static const char *system_dirs[] = {
+        "/system/common/lib",
+        "/system_ex/common_ex/lib",
+        "/system/sys",
+        "/system/vsh/app",
+        "/system/priv/lib",
+        "/system/common/lib/Firmware",
+        "/system_ex/app",
+        "/mini-syscore.elf",
+    };
+    static const int num_dirs = sizeof(system_dirs) / sizeof(system_dirs[0]);
+
+    int total_success = 0;
+    int total_failed = 0;
+
+    mkdir(output_base_dir, 0777);
+    etaHEN_log("[SysDump] Starting system SELF dump to %s", output_base_dir);
+    notify(false, "Starting system SELF dump...\nThis may take a while");
+
+    for (int d = 0; d < num_dirs; d++) {
+        const char *sys_dir = system_dirs[d];
+        struct stat st;
+
+        if (stat(sys_dir, &st) != 0)
+            continue;
+
+        // Handle single file (e.g., /mini-syscore.elf)
+        if (S_ISREG(st.st_mode)) {
+            char out_path[1024];
+            const char *basename = strrchr(sys_dir, '/');
+            basename = basename ? basename + 1 : sys_dir;
+            snprintf(out_path, sizeof(out_path), "%s/%s", output_base_dir, basename);
+
+            if (Check_ELF_Magic(sys_dir, SELF_PROSPERO_MAGIC) || Check_ELF_Magic(sys_dir, SELF_ORBIS_MAGIC)) {
+                etaHEN_log("[SysDump] Decrypting %s", sys_dir);
+                if (decrypt_self_by_path(sys_dir, out_path, &total_success, &total_failed) == 0) {
+                    etaHEN_log("[SysDump] OK: %s", basename);
+                }
+            }
+            continue;
+        }
+
+        // Handle directory
+        if (!S_ISDIR(st.st_mode))
+            continue;
+
+        // Build output subdirectory mirroring the system path
+        // e.g., /system/common/lib -> <output>/system_common_lib/
+        char dir_suffix[256];
+        const char *p = sys_dir;
+        if (*p == '/') p++;
+        int j = 0;
+        for (; *p && j < (int)sizeof(dir_suffix) - 1; p++) {
+            dir_suffix[j++] = (*p == '/') ? '_' : *p;
+        }
+        dir_suffix[j] = '\0';
+
+        char out_dir[1024];
+        snprintf(out_dir, sizeof(out_dir), "%s/%s", output_base_dir, dir_suffix);
+        mkdir(out_dir, 0777);
+
+        etaHEN_log("[SysDump] Scanning %s -> %s", sys_dir, out_dir);
+
+        // Use libSelfDecryptor's decrypt_self_by_path for each SELF found
+        // This uses the pagertab swap (data-only, no .text patches needed)
+        DIR *dir = opendir(sys_dir);
+        if (!dir)
+            continue;
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type != DT_REG)
+                continue;
+
+            const char *ext = strrchr(entry->d_name, '.');
+            if (!ext)
+                continue;
+
+            // Target SELF-like extensions
+            bool is_self_ext = (strcasecmp(ext, ".sprx") == 0 ||
+                                strcasecmp(ext, ".prx") == 0 ||
+                                strcasecmp(ext, ".self") == 0 ||
+                                strcasecmp(ext, ".elf") == 0 ||
+                                strcasecmp(ext, ".bin") == 0 ||
+                                strcasecmp(ext, ".dll") == 0);
+            if (!is_self_ext)
+                continue;
+
+            char in_path[1024];
+            char out_path[1024];
+            snprintf(in_path, sizeof(in_path), "%s/%s", sys_dir, entry->d_name);
+            snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, entry->d_name);
+
+            if (!Check_ELF_Magic(in_path, SELF_PROSPERO_MAGIC) && !Check_ELF_Magic(in_path, SELF_ORBIS_MAGIC))
+                continue;
+
+            etaHEN_log("[SysDump] Decrypting %s", entry->d_name);
+            decrypt_self_by_path(in_path, out_path, &total_success, &total_failed);
+        }
+
+        closedir(dir);
+    }
+
+    etaHEN_log("[SysDump] Complete. Success: %d, Failed: %d", total_success, total_failed);
+    notify(false, "System SELF dump complete!\nSuccess: %d, Failed: %d\nOutput: %s",
+           total_success, total_failed, output_base_dir);
+
+    return total_failed == 0 ? 0 : -1;
+}
+
 bool decrypt_dir(const std::string& inputPath, const std::string& outputPath) {
 
     OrbisKernelSwVersion sys_ver;
