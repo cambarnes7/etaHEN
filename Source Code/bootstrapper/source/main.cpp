@@ -393,13 +393,17 @@ if (!if_exists("/data/etaHEN/assets/store.png")) {
   }
  
  /*
-  * KCFI bypass for FW >= 3.00 (kstuff path).
+  * KCFI bypass for FW >= 3.00: Redirect IDT[6] through kstuff's INT1 handler.
   *
-  * Two-strategy approach:
-  * 1. IDT[6] redirect: Route UD2 (Invalid Opcode) exceptions through kstuff's
-  *    INT1 handler chain (IST7). This prevents kernel panics on CFI failures.
-  * 2. Kernel text probe: Check if kstuff has relaxed XOM on kernel text pages.
-  *    If readable, future cfi_check_fail() offsets for FW >= 3.00 can be added.
+  * Copies IDT[1] (kstuff's IST7 handler) to IDT[6] so that UD2 exceptions
+  * from KCFI hash mismatches enter kstuff's handler instead of panicking.
+  *
+  * Verified by disassembly of the kstuff payload binary (payload_bin.c):
+  * The handler at offset 0x276d0 processes ring 0 faults through a chain of
+  * breakpoint table lookups and address validators. When no match is found
+  * (as with a KCFI UD2 address), it falls through to offset 0x27d42 which
+  * executes "add qword [rbx+0xe8], 2" (regs[RIP] += 2), skipping the
+  * 2-byte UD2 instruction and allowing the kernel to continue.
   *
   * Must be called AFTER kstuff has finished installing its IDT entries.
   */
@@ -461,11 +465,6 @@ if (!if_exists("/data/etaHEN/assets/store.png")) {
          klog_puts("cfi_bypass: IDT[6] already redirected");
      }
 
-     /* Strategy 2: Probe kernel text readability for future direct patching */
-     uint8_t probe;
-     if (kernel_copyout(KERNEL_ADDRESS_TEXT_BASE, &probe, 1) == 0) {
-         klog_puts("cfi_bypass: kernel text readable post-kstuff (direct patch possible)");
-     }
  }
 
  bool if_exists(const char *path) {
