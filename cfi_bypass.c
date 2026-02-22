@@ -93,9 +93,6 @@
 #include <ps5/payload.h>
 #include <ps5/kernel.h>
 
-/* Kernel data base address (set by ps5api) */
-extern unsigned long KERNEL_ADDRESS_DATA_BASE;
-
 /* IDT entry size */
 #define IDT_ENTRY_SIZE  16
 
@@ -127,50 +124,51 @@ static uint64_t get_idt_base(uint32_t fw_version) {
      * These are offsets from KERNEL_ADDRESS_DATA_BASE.
      * kstuff is required for FW >= 3.00 (Byepervisor handles < 3.00).
      */
+    uint64_t kdata = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
     switch ((fw_version & 0xFFFF0000)) {
     /* FW 3.xx */
     case 0x03000000: case 0x03100000:
     case 0x03200000: case 0x03210000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x642dc80;
+        return kdata + 0x642dc80;
 
     /* FW 4.xx */
     case 0x04000000: case 0x04020000: case 0x04030000:
     case 0x04500000: case 0x04510000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x64cdc80;
+        return kdata + 0x64cdc80;
 
     /* FW 5.xx */
     case 0x05000000: case 0x05020000:
     case 0x05100000: case 0x05500000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x660dca0;
+        return kdata + 0x660dca0;
 
     /* FW 6.xx */
     case 0x06000000: case 0x06020000: case 0x06500000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x655dde0;
+        return kdata + 0x655dde0;
 
     /* FW 7.xx */
     case 0x07000000: case 0x07010000: case 0x07200000:
     case 0x07400000: case 0x07600000: case 0x07610000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x2E7FDF0;
+        return kdata + 0x2E7FDF0;
 
     /* FW 8.xx */
     case 0x08000000: case 0x08200000:
     case 0x08400000: case 0x08600000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x2eb3df0;
+        return kdata + 0x2eb3df0;
 
     /* FW 9.xx */
     case 0x09000000: case 0x09050000: case 0x09200000:
     case 0x09400000: case 0x09600000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x2d94300;
+        return kdata + 0x2d94300;
 
     /* FW 10.xx */
     case 0x10000000: case 0x10010000: case 0x10200000:
     case 0x10400000: case 0x10600000:
-        return KERNEL_ADDRESS_DATA_BASE + 0x2d5c300;
+        return kdata + 0x2d5c300;
 
     default:
         printf("[cfi_bypass] WARNING: Unknown FW 0x%08x, trying 4.03 offset\n",
                fw_version);
-        return KERNEL_ADDRESS_DATA_BASE + 0x64cdc80;
+        return kdata + 0x64cdc80;
     }
 }
 
@@ -178,7 +176,7 @@ int main(void) {
     uint32_t fw_version = get_fw_version();
     printf("[cfi_bypass] PS5 KCFI Bypass - FW 0x%08x\n", fw_version);
     printf("[cfi_bypass] KERNEL_ADDRESS_DATA_BASE = 0x%lx\n",
-           KERNEL_ADDRESS_DATA_BASE);
+           (unsigned long)KERNEL_ADDRESS_DATA_BASE);
 
     uint64_t idt_base = get_idt_base(fw_version);
     printf("[cfi_bypass] IDT base = 0x%lx\n", idt_base);
