@@ -1168,8 +1168,11 @@ int main(void) {
 
           if (!kstuff_not_loaded) {
               klog_puts("kstuff loaded");
-              /* Patch IDT[6] to route KCFI UD2 through kstuff's handler */
-              patch_idt_cfi_bypass(sys_ver.version);
+              /* TODO: KCFI bypass disabled - requires kstuff uelf modification
+               * to handle INT6 by advancing RIP+=2. Without it, UD2 exceptions
+               * infinite-loop through the handler. Re-enable once uelf is patched.
+               * patch_idt_cfi_bypass(sys_ver.version);
+               */
           }
 
           if (cleanup_kstuff) {
