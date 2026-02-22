@@ -392,6 +392,69 @@ if (!if_exists("/data/etaHEN/assets/store.png")) {
       return kstuff_start;
   }
  
+ /*
+  * KCFI bypass: Patch IDT[6] (Invalid Opcode / UD2) to share INT1's handler.
+  * This routes KCFI check failures through kstuff's uelf handler which
+  * advances RIP by 2, skipping the UD2 and landing on 'call target'.
+  * Must be called AFTER kstuff has finished installing its IDT entries.
+  */
+ static void patch_idt_cfi_bypass(uint32_t fw_version) {
+     uint64_t idt_offset;
+     switch (fw_version & 0xFFFF0000) {
+     case 0x03000000: case 0x03100000:
+     case 0x03200000: case 0x03210000:
+         idt_offset = 0x642dc80; break;
+     case 0x04000000: case 0x04020000: case 0x04030000:
+     case 0x04500000: case 0x04510000:
+         idt_offset = 0x64cdc80; break;
+     case 0x05000000: case 0x05020000:
+     case 0x05100000: case 0x05500000:
+         idt_offset = 0x660dca0; break;
+     case 0x06000000: case 0x06020000: case 0x06500000:
+         idt_offset = 0x655dde0; break;
+     case 0x07000000: case 0x07010000: case 0x07200000:
+     case 0x07400000: case 0x07600000: case 0x07610000:
+         idt_offset = 0x2E7FDF0; break;
+     case 0x08000000: case 0x08200000:
+     case 0x08400000: case 0x08600000:
+         idt_offset = 0x2eb3df0; break;
+     case 0x09000000: case 0x09050000: case 0x09200000:
+     case 0x09400000: case 0x09600000:
+         idt_offset = 0x2d94300; break;
+     case 0x10000000: case 0x10010000: case 0x10200000:
+     case 0x10400000: case 0x10600000:
+         idt_offset = 0x2d5c300; break;
+     default:
+         klog_printf("cfi_bypass: unknown FW 0x%x, skipping IDT patch\n",
+                     fw_version);
+         return;
+     }
+
+     uint64_t idt_base = KERNEL_ADDRESS_DATA_BASE + idt_offset;
+
+     /* Read IDT[1] (INT1 = Debug, installed by kstuff with IST7) */
+     uint8_t int1_entry[16];
+     if (kernel_copyout(idt_base + 16 * 1, int1_entry, 16) != 0) {
+         klog_puts("cfi_bypass: failed to read IDT[1]");
+         return;
+     }
+
+     /* Verify kstuff installed IST7 on INT1 */
+     if ((int1_entry[4] & 7) != 7) {
+         klog_printf("cfi_bypass: IDT[1] IST=%d (expected 7), kstuff not ready?\n",
+                     int1_entry[4] & 7);
+         return;
+     }
+
+     /* Copy INT1 entry to INT6, preserving handler address and IST7 */
+     if (kernel_copyin(int1_entry, idt_base + 16 * 6, 16) != 0) {
+         klog_puts("cfi_bypass: failed to write IDT[6]");
+         return;
+     }
+
+     klog_puts("cfi_bypass: IDT[6] patched - KCFI UD2 routed through kstuff");
+ }
+
  bool if_exists(const char *path) {
    struct stat buffer;
    return (stat(path, &buffer) == 0);
@@ -1103,8 +1166,11 @@ int main(void) {
               sleep(1);
           }
 
-          if (!kstuff_not_loaded)
+          if (!kstuff_not_loaded) {
               klog_puts("kstuff loaded");
+              /* Patch IDT[6] to route KCFI UD2 through kstuff's handler */
+              patch_idt_cfi_bypass(sys_ver.version);
+          }
 
           if (cleanup_kstuff) {
               free(kstuff_address);
