@@ -33,11 +33,156 @@ along with this program; see the file COPYING. If not, see
 
 #include <machine/param.h>
 #include <ps5/payload.h>
+#include <ps5/kernel.h>
 #include <ps5/klog.h>
 #include "payload_bin.c"
 
 int patch_app_db(void);
 int sceKernelSetProcessName(const char *name);
+
+/*
+ * KCFI bypass: Patch IDT[6] to redirect Invalid Opcode exceptions
+ * through kstuff's INT1 handler (IST7).
+ *
+ * Also attempts direct cfi_check_fail() patching if kernel text
+ * is writable after kstuff has modified the hypervisor.
+ */
+#define IDT_ENTRY_SIZE 16
+
+static uint64_t cfi_get_idt_offset(uint32_t fw) {
+    switch (fw & 0xFFFF0000) {
+    case 0x03000000: case 0x03100000:
+    case 0x03200000: case 0x03210000: return 0x642dc80;
+    case 0x04000000: case 0x04020000: case 0x04030000:
+    case 0x04500000: case 0x04510000: return 0x64cdc80;
+    case 0x05000000: case 0x05020000:
+    case 0x05100000: case 0x05500000: return 0x660dca0;
+    case 0x06000000: case 0x06020000: case 0x06500000: return 0x655dde0;
+    case 0x07000000: case 0x07010000: case 0x07200000:
+    case 0x07400000: case 0x07600000: case 0x07610000: return 0x2E7FDF0;
+    case 0x08000000: case 0x08200000:
+    case 0x08400000: case 0x08600000: return 0x2eb3df0;
+    case 0x09000000: case 0x09050000: case 0x09200000:
+    case 0x09400000: case 0x09600000: return 0x2d94300;
+    case 0x10000000: case 0x10010000: case 0x10200000:
+    case 0x10400000: case 0x10600000: return 0x2d5c300;
+    default: return 0;
+    }
+}
+
+static void cfi_bypass_idt_patch(uint32_t fw) {
+    uint64_t idt_off = cfi_get_idt_offset(fw);
+    if (!idt_off) {
+        klog_printf("[cfi] IDT patch: unsupported FW 0x%x\n", fw);
+        return;
+    }
+
+    uint64_t idt_base = KERNEL_ADDRESS_DATA_BASE + idt_off;
+
+    /* Read IDT[1] - kstuff's INT1 handler with IST7 */
+    uint8_t int1[16], int6[16];
+    if (kernel_copyout(idt_base + 16, int1, 16) != 0) {
+        klog_puts("[cfi] IDT patch: failed to read IDT[1]");
+        return;
+    }
+
+    /* Verify kstuff set IST7 on INT1 */
+    if ((int1[4] & 7) != 7) {
+        klog_printf("[cfi] IDT patch: IDT[1] IST=%d (expected 7)\n", int1[4] & 7);
+        return;
+    }
+
+    /* Check if already patched */
+    kernel_copyout(idt_base + 16 * 6, int6, 16);
+    if (memcmp(int1, int6, 16) == 0) {
+        klog_puts("[cfi] IDT patch: IDT[6] already redirected");
+        return;
+    }
+
+    /* Copy INT1 entry to IDT[6] */
+    if (kernel_copyin(int1, idt_base + 16 * 6, 16) != 0) {
+        klog_puts("[cfi] IDT patch: failed to write IDT[6]");
+        return;
+    }
+
+    /* Verify */
+    uint8_t verify[16];
+    kernel_copyout(idt_base + 16 * 6, verify, 16);
+    if (memcmp(int1, verify, 16) != 0) {
+        klog_puts("[cfi] IDT patch: verification failed");
+        return;
+    }
+
+    klog_puts("[cfi] IDT patch: IDT[6] -> INT1 handler (IST7)");
+}
+
+static void cfi_bypass_direct_patch(uint32_t fw) {
+    /*
+     * Attempt direct cfi_check_fail() -> RET patch.
+     * This works on FW < 3.00 where Byepervisor made text writable.
+     * On FW >= 3.00, kstuff may have relaxed XOM enough for this to work.
+     * If kernel text is still execute-only, the copyout/copyin will fail
+     * gracefully and we rely on the IDT redirect instead.
+     */
+    uint64_t offset = 0;
+    switch (fw & 0xFFFF0000) {
+    case 0x01000000: case 0x01010000: case 0x01020000: offset = 0x4587e0; break;
+    case 0x01050000: offset = 0x458c10; break;
+    case 0x01100000: offset = 0x458C50; break;
+    case 0x01110000: offset = 0x458D10; break;
+    case 0x01120000: case 0x01130000: case 0x01140000: offset = 0x458D70; break;
+    case 0x02000000: offset = 0x41FC60; break;
+    case 0x02200000: case 0x02250000: case 0x02260000: offset = 0x41FCB0; break;
+    case 0x02300000: offset = 0x41FB70; break;
+    case 0x02500000: case 0x02700000: offset = 0x41FCA0; break;
+    default:
+        klog_printf("[cfi] direct: no cfi_check_fail offset for FW 0x%x\n", fw);
+        return;
+    }
+
+    uint64_t target = KERNEL_ADDRESS_TEXT_BASE + offset;
+
+    uint8_t cur;
+    if (kernel_copyout(target, &cur, 1) != 0) {
+        klog_puts("[cfi] direct: kernel text not readable (XOM)");
+        return;
+    }
+
+    if (cur == 0xC3) {
+        klog_puts("[cfi] direct: cfi_check_fail already patched");
+        return;
+    }
+
+    uint8_t ret = 0xC3;
+    if (kernel_copyin(&ret, target, 1) != 0) {
+        klog_puts("[cfi] direct: kernel text not writable");
+        return;
+    }
+
+    uint8_t verify;
+    if (kernel_copyout(target, &verify, 1) != 0 || verify != 0xC3) {
+        klog_printf("[cfi] direct: verify failed (0x%02x)\n", verify);
+        return;
+    }
+
+    klog_puts("[cfi] direct: cfi_check_fail() patched to RET");
+}
+
+static void cfi_bypass(void) {
+    uint32_t fw = 0;
+    size_t sz = sizeof(fw);
+    sysctlbyname("kern.sdk_version", &fw, &sz, NULL, 0);
+
+    klog_printf("[cfi] KCFI bypass starting - FW 0x%08x\n", fw);
+
+    /* Try direct patch first (most reliable when it works) */
+    cfi_bypass_direct_patch(fw);
+
+    /* Apply IDT redirect as complementary/fallback layer */
+    if (fw >= 0x03000000) {
+        cfi_bypass_idt_patch(fw);
+    }
+}
 
 #define ROUND_PG(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define TRUNC_PG(x) ((x) & ~(PAGE_SIZE - 1))
@@ -255,6 +400,9 @@ int main(void) {
         puts("patching app.db");
         *args->payloadout = patch_app_db();
     }
+
+    /* Apply KCFI bypass now that kstuff has initialized */
+    cfi_bypass();
 
     klog_printf("Remounting /system_ex and mounting titles...\n");
     remount_system_ex();

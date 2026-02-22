@@ -393,9 +393,14 @@ if (!if_exists("/data/etaHEN/assets/store.png")) {
   }
  
  /*
-  * KCFI bypass: Patch IDT[6] (Invalid Opcode / UD2) to share INT1's handler.
-  * This routes KCFI check failures through kstuff's uelf handler which
-  * advances RIP by 2, skipping the UD2 and landing on 'call target'.
+  * KCFI bypass for FW >= 3.00 (kstuff path).
+  *
+  * Two-strategy approach:
+  * 1. IDT[6] redirect: Route UD2 (Invalid Opcode) exceptions through kstuff's
+  *    INT1 handler chain (IST7). This prevents kernel panics on CFI failures.
+  * 2. Kernel text probe: Check if kstuff has relaxed XOM on kernel text pages.
+  *    If readable, future cfi_check_fail() offsets for FW >= 3.00 can be added.
+  *
   * Must be called AFTER kstuff has finished installing its IDT entries.
   */
  static void patch_idt_cfi_bypass(uint32_t fw_version) {
@@ -425,34 +430,42 @@ if (!if_exists("/data/etaHEN/assets/store.png")) {
      case 0x10400000: case 0x10600000:
          idt_offset = 0x2d5c300; break;
      default:
-         klog_printf("cfi_bypass: unknown FW 0x%x, skipping IDT patch\n",
-                     fw_version);
+         klog_printf("cfi_bypass: unknown FW 0x%x, skipping\n", fw_version);
          return;
      }
 
      uint64_t idt_base = KERNEL_ADDRESS_DATA_BASE + idt_offset;
 
-     /* Read IDT[1] (INT1 = Debug, installed by kstuff with IST7) */
+     /* Strategy 1: IDT[6] redirect through kstuff's INT1 handler */
      uint8_t int1_entry[16];
      if (kernel_copyout(idt_base + 16 * 1, int1_entry, 16) != 0) {
          klog_puts("cfi_bypass: failed to read IDT[1]");
          return;
      }
 
-     /* Verify kstuff installed IST7 on INT1 */
      if ((int1_entry[4] & 7) != 7) {
          klog_printf("cfi_bypass: IDT[1] IST=%d (expected 7), kstuff not ready?\n",
                      int1_entry[4] & 7);
          return;
      }
 
-     /* Copy INT1 entry to INT6, preserving handler address and IST7 */
-     if (kernel_copyin(int1_entry, idt_base + 16 * 6, 16) != 0) {
-         klog_puts("cfi_bypass: failed to write IDT[6]");
-         return;
+     uint8_t int6_entry[16];
+     kernel_copyout(idt_base + 16 * 6, int6_entry, 16);
+     if (memcmp(int1_entry, int6_entry, 16) != 0) {
+         if (kernel_copyin(int1_entry, idt_base + 16 * 6, 16) != 0) {
+             klog_puts("cfi_bypass: failed to write IDT[6]");
+         } else {
+             klog_puts("cfi_bypass: IDT[6] patched - UD2 routed through kstuff");
+         }
+     } else {
+         klog_puts("cfi_bypass: IDT[6] already redirected");
      }
 
-     klog_puts("cfi_bypass: IDT[6] patched - KCFI UD2 routed through kstuff");
+     /* Strategy 2: Probe kernel text readability for future direct patching */
+     uint8_t probe;
+     if (kernel_copyout(KERNEL_ADDRESS_TEXT_BASE, &probe, 1) == 0) {
+         klog_puts("cfi_bypass: kernel text readable post-kstuff (direct patch possible)");
+     }
  }
 
  bool if_exists(const char *path) {
@@ -1168,11 +1181,7 @@ int main(void) {
 
           if (!kstuff_not_loaded) {
               klog_puts("kstuff loaded");
-              /* TODO: KCFI bypass disabled - requires kstuff uelf modification
-               * to handle INT6 by advancing RIP+=2. Without it, UD2 exceptions
-               * infinite-loop through the handler. Re-enable once uelf is patched.
-               * patch_idt_cfi_bypass(sys_ver.version);
-               */
+              patch_idt_cfi_bypass(sys_ver.version);
           }
 
           if (cleanup_kstuff) {
