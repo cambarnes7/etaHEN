@@ -8,20 +8,19 @@ struct patch
     int size;
 };
 
-/* Skip enum definitions if macOS system header already provided them */
+/* Skip uio_rw if macOS system header already provided it */
 #ifndef _SYS_UIO_H_
 enum	uio_rw { UIO_READ, UIO_WRITE };
+#endif
 
-/* Segment flag values. */
+/* Segment flag values (FreeBSD kernel specific, not in macOS headers) */
 enum uio_seg {
 	UIO_USERSPACE,		/* from user data space */
 	UIO_SYSSPACE,		/* from system space */
 	UIO_NOCOPY		    /* don't copy, already in object */
 };
-#endif
 
-/* Always define struct uio - macOS only forward-declares it,
-   and we need the PS5/FreeBSD kernel layout */
+/* PS5/FreeBSD kernel uio layout (macOS only forward-declares it) */
 struct uio {
 	struct	iovec *uio_iov;		/* scatter/gather list */
 	int	uio_iovcnt;		/* length of scatter/gather list */
