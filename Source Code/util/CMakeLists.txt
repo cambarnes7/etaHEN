@@ -87,8 +87,6 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     microhttpd
     psl          # For PSL (Public Suffix List) functions
     zstd         # For ZSTD compression support
-    crypto       # For OpenSSL crypto functions (EVP_*, MD5_*, DES_*)
-    ssl          # For additional SSL functions
 )
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Add post-build command
