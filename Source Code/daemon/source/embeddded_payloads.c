@@ -1,3 +1,6 @@
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x) _STRINGIFY(x)
+
  __asm__(
 
 
@@ -5,7 +8,7 @@
 	".type   ps5debug_start, @object\n"
 	".align  16\n"
 	"ps5debug_start:\n"
-    	".incbin \"assets/ps5debug.elf\"\n"
+    	".incbin \"" STRINGIFY(SRC_DIR) "/assets/ps5debug.elf\"\n"
 	"ps5debug_end:\n"
 	    ".global ps5debug_size\n"
 	    ".type   ps5debug_size, @object\n"
@@ -18,7 +21,7 @@
 	".type   shellui_elf_start, @object\n"
 	".align  16\n"
 	"shellui_elf_start:\n"
-    	".incbin \"assets/shellui.elf\"\n"
+    	".incbin \"" STRINGIFY(SRC_DIR) "/assets/shellui.elf\"\n"
 	"shellui_elf_end:\n"
 	    ".global shellui_elf_size\n"
 	    ".type   shellui_elf_size, @object\n"

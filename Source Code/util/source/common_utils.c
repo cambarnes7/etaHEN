@@ -45,15 +45,18 @@ atomic_bool not_connected = false;
 
 #define SCE_NET_CTL_ERROR_NOT_CONNECTED 0x80412108
 #define SCE_NET_CTL_ERROR_NOT_AVAIL 0x80412109
- 
+
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x) _STRINGIFY(x)
+
  __asm__(
 
-  
+
 	".global elfldr_start\n"
 	".type   elfldr_start, @object\n"
 	".align  16\n"
 	"elfldr_start:\n"
-    	".incbin \"assets/elfldr.elf\"\n"
+    	".incbin \"" STRINGIFY(SRC_DIR) "/assets/elfldr.elf\"\n"
 	"elfldr_end:\n"
 	    ".global elfldr_size\n"
 	    ".type   elfldr_size, @object\n"

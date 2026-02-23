@@ -57,7 +57,7 @@ file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/mc4decrypter/*.c ${D_SRC}/*.cpp ${D_SRC
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all -Wno-unused-const-variable")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -Wa,-I\"${D_CWD}\"")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -DSRC_DIR=\"${D_CWD}\"")
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
 target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")

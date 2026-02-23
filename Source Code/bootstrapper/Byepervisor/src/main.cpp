@@ -25,6 +25,9 @@ extern "C" {
 #include "self.h"
 #include "util.h"
 
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x) _STRINGIFY(x)
+
 struct UserServiceLoginUserIdList
 {
 	int user_id[4];
@@ -47,7 +50,7 @@ extern "C"
     ".type KELF, @object\n"
     ".align 16\n"
     "KELF:\n"
-    ".incbin \"../hen/hen.bin\"\n"  // Path to binary file
+    ".incbin \"" STRINGIFY(BOOTSTRAPPER_DIR) "/Byepervisor/hen/hen.bin\"\n"
     "KELF_END:\n"
     ".global KELF_SZ\n"
     ".type KELF_SZ, @object\n"
