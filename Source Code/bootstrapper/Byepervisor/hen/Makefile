@@ -6,7 +6,7 @@ BIN := hen.bin
 
 CFLAGS := --target=x86_64-pc-none-elf -std=c++11 -Wall -Werror -D_KERNEL -I./include -O2 -fno-builtin -nostdlib -fno-stack-protector -fno-plt -fPIC -Wno-error=frame-address -Wno-unused-const-variable
 SFLAGS := --target=x86_64-pc-none-elf -nostdlib
-LFLAGS := -Xlinker -T ./link.x -Wl,--build-id=none -nostartfiles
+LFLAGS := -fuse-ld=lld -Xlinker -T ./link.x -Wl,--build-id=none -nostartfiles
 
 ODIR        := build
 SDIR        := src
