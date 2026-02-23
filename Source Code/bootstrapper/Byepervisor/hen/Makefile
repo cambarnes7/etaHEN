@@ -22,7 +22,7 @@ $(ODIR)/%.o: $(SDIR)/%.cpp
 	$(CXX) -c -o $@ $< $(CFLAGS)
 
 $(ODIR)/%.o: $(SDIR)/%.s
-	$(AS) -c -o $@ $< $(SFLAGS)
+	$(CXX) -c -o $@ $< $(CFLAGS)
 
 $(ODIR):
 	@mkdir $@
