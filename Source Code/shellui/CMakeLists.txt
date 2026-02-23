@@ -56,6 +56,7 @@ set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-nested-anon-types -Wno-gnu-anonymous-struct -Wno-zero-length-array -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 ")
+set(CMAKE_ASM_FLAGS "--target=x86_64-sie-ps5 -Wa,-I${D_CWD}")
 
 # Add a custom target for running encryptxml.py
 find_package(Python3 REQUIRED)
