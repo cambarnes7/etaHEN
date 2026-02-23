@@ -96,6 +96,7 @@
 
 extern "C" {
 #include <ps5/kernel.h>
+int sceKernelMprotect(void *addr, size_t len, int prot);
 }
 
 #include <stdio.h>
