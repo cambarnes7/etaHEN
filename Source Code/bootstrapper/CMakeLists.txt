@@ -77,7 +77,7 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 )
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND sh -c "stat -f %z $<TARGET_FILE:${PROJECT_NAME}> > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size 2>/dev/null || stat -c %s $<TARGET_FILE:${PROJECT_NAME}> > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size"
+    COMMAND ${CMAKE_COMMAND} -DELF_FILE=$<TARGET_FILE:${PROJECT_NAME}> -P ${CMAKE_CURRENT_SOURCE_DIR}/get_size.cmake
     COMMENT "Getting original payload size..."
 )
 
