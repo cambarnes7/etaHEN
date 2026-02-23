@@ -78,11 +78,6 @@
 			"inherits": "nix-base",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
-			},
-			"vendor": {
-				"microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
-					"sourceDir": "$env{HOME}/.vs/$ms{projectDirName}"
-				}
 			}
 		},
 		{
@@ -91,11 +86,6 @@
 			"inherits": "nix-base",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
-			},
-			"vendor": {
-				"microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
-					"sourceDir": "$env{HOME}/.vs/$ms{projectDirName}"
-				}
 			}
 		}
 	],
