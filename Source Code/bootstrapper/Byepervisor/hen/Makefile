@@ -5,7 +5,7 @@ ELF := hen.elf
 BIN := hen.bin
 
 CFLAGS := --target=x86_64-pc-none-elf -std=c++11 -Wall -Werror -D_KERNEL -I./include -O2 -fno-builtin -nostdlib -fno-stack-protector -fno-plt -fPIC -Wno-error=frame-address -Wno-unused-const-variable
-#SFLAGS := -nostartfiles -nostdlib -fPIC
+SFLAGS := --target=x86_64-pc-none-elf -nostdlib
 LFLAGS := -Xlinker -T ./link.x -Wl,--build-id=none -nostartfiles
 
 ODIR        := build
@@ -22,7 +22,7 @@ $(ODIR)/%.o: $(SDIR)/%.cpp
 	$(CXX) -c -o $@ $< $(CFLAGS)
 
 $(ODIR)/%.o: $(SDIR)/%.s
-	$(CXX) -c -o $@ $< $(CFLAGS)
+	$(CXX) -c -o $@ $< $(SFLAGS)
 
 $(ODIR):
 	@mkdir $@
