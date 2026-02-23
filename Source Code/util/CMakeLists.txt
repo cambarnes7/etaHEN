@@ -81,7 +81,8 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
     SceHttp2 
     SceSsl 
     z 
-    curl 
+    curl
+    wolfssl
     SelfDecryptor
     minizip 
     microhttpd
