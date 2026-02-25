@@ -38,14 +38,8 @@
 		{
 			"name": "nix-base",
 			"hidden": true,
-			"generator": "Ninja",
 			"binaryDir": "${sourceDir}/build/${presetName}",
 			"installDir": "${sourceDir}/build/install/${presetName}",
-			"toolchainFile": "${env:PS5SDK}/cmake/toolchain-ps5.cmake",
-			"cacheVariables": {
-				"CMAKE_C_COMPILER": "clang",
-				"CMAKE_CXX_COMPILER": "clang++"
-			},
 			"condition": {
 				"type": "notEquals",
 				"lhs": "${hostSystemName}",
@@ -78,11 +72,6 @@
 			"inherits": "nix-base",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
-			},
-			"vendor": {
-				"microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
-					"sourceDir": "$env{HOME}/.vs/$ms{projectDirName}"
-				}
 			}
 		},
 		{
@@ -91,11 +80,6 @@
 			"inherits": "nix-base",
 			"cacheVariables": {
 				"CMAKE_BUILD_TYPE": "Debug"
-			},
-			"vendor": {
-				"microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
-					"sourceDir": "$env{HOME}/.vs/$ms{projectDirName}"
-				}
 			}
 		}
 	],

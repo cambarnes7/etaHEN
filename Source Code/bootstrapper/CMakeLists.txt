@@ -50,7 +50,7 @@ target_compile_options(${PROJECT_NAME} PUBLIC
 message("========== build: ${PROJECT_NAME} ==========")
 
 
-file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/*.cpp ${D_SRC}/../include/*.h ${D_SRC}/../include/*.hpp ${D_SRC}/*.s ${D_SRC}/../Byepervisor/src/*.cpp  ${D_SRC}/../Byepervisor_DevKit/src/*.S ${D_SRC}/../Byepervisor_DevKit/src/*.c ${D_SRC}/../../extern/tiny-json/*.cpp ${D_SRC}/../../extern/tiny-json/*.hpp ${D_SRC}/../../extern/cJSON/*.cpp ${D_SRC}/../../extern/cJSON/*.hpp ${D_SRC}/../../lib/backtrace.cpp)
+file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/*.cpp ${D_SRC}/../include/*.h ${D_SRC}/../include/*.hpp ${D_SRC}/*.s ${D_SRC}/../Byepervisor/src/*.cpp ${D_SRC}/../Byepervisor/src/*.c ${D_SRC}/../Byepervisor_DevKit/src/*.S ${D_SRC}/../Byepervisor_DevKit/src/*.c ${D_SRC}/../../extern/tiny-json/*.cpp ${D_SRC}/../../extern/tiny-json/*.hpp ${D_SRC}/../../extern/cJSON/*.cpp ${D_SRC}/../../extern/cJSON/*.hpp ${D_SRC}/../../lib/backtrace.cpp)
 
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all")
@@ -60,7 +60,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
 target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite3)
+target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_dependencies(${PROJECT_NAME} daemon util shellui)
 
@@ -77,7 +77,7 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 )
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND stat -c %s $<TARGET_FILE:${PROJECT_NAME}> > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size
+    COMMAND sh -c "wc -c < $<TARGET_FILE:${PROJECT_NAME}> | tr -d ' ' > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size"
     COMMENT "Getting original payload size..."
 )
 
