@@ -55,6 +55,7 @@ along with this program; see the file COPYING. If not, see
   ******************************************************************************/
  #include <util.hpp>
  #include <freebsd-helper.h>
+ #include "../Byepervisor/src/cfi_bypass.h"
  
  extern "C" {
  #include "elfldr.h"
@@ -1103,8 +1104,21 @@ int main(void) {
               sleep(1);
           }
 
-          if (!kstuff_not_loaded)
+          if (!kstuff_not_loaded) {
               klog_puts("kstuff loaded");
+
+              /* Apply KCFI bypass: redirect IDT[6] (#UD) through kstuff's
+               * INT1 handler. KCFI UD2 instructions are silently skipped
+               * (handler does RIP += 2 on fallthrough). */
+              save_original_idt6();
+              int cfi_ret = patch_idt_cfi_bypass();
+              if (cfi_ret == 0) {
+                  klog_puts("[CFI] KCFI bypass installed successfully");
+                  notify("[etaHEN] KCFI bypass active");
+              } else {
+                  klog_printf("[CFI] KCFI bypass failed: %d\n", cfi_ret);
+              }
+          }
 
           if (cleanup_kstuff) {
               free(kstuff_address);
