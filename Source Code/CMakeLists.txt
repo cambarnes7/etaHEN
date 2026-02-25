@@ -10,7 +10,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)	# static libs are archiv
 # PS5 payload linker settings: custom linker script and PS5-specific ELF layout
 # Note: clang auto-selects lld for x86_64-sie-ps5 cross target, no -fuse-ld needed
 add_link_options(
-    -nodefaultlibs
     "LINKER:-T${PROJECT_ROOT}/linker.x"
     "LINKER:--build-id=none"
     "LINKER:-zmax-page-size=16384"
