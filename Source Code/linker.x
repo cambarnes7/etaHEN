@@ -9,6 +9,7 @@ PHDRS {
 	phdr_rodata   PT_LOAD         FLAGS(0x4);
 	phdr_relro    PT_LOAD         FLAGS(0x4);
 	phdr_eh_frame PT_GNU_EH_FRAME FLAGS(0x4);
+	phdr_dynload  PT_LOAD         FLAGS(0x4);
     phdr_dynamic  PT_DYNAMIC      FLAGS(0x0);
 }
 
@@ -116,16 +117,20 @@ SECTIONS {
     PROVIDE (__payload_end = .);
 
 	/* this needs to be forced aligned to 0x4000 */
+	/* .dynamic must be in both PT_LOAD (so it's mapped into memory) and
+	   PT_DYNAMIC (so the ELF loader finds the dynamic table). .dynsym and
+	   .dynstr only need PT_LOAD — they're referenced via DT_SYMTAB/DT_STRTAB
+	   pointers in the dynamic table. */
     .dynamic : ALIGN(0x4000) {
         PROVIDE_HIDDEN (_DYNAMIC = .);
         *(.dynamic);
-    } : phdr_dynamic
+    } : phdr_dynload : phdr_dynamic
 
     .dynsym : {
         *(.dynsym);
-    } : phdr_dynamic
+    } : phdr_dynload
 
     .dynstr : {
         *(.dynstr);
-    } : phdr_dynamic
+    } : phdr_dynload
 }

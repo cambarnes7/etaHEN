@@ -15,7 +15,7 @@ set(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 #   4. Allow unresolved symbols — PS5 ELF loader resolves them at runtime
 #      via the .dynsym table (NID resolution system)
 string(REPLACE "-fuse-ld=lld" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --target=x86_64-freebsd-pc-elf -fuse-ld=lld -nostdlib -Wl,--unresolved-symbols=ignore-all")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --target=x86_64-freebsd-pc-elf -fuse-ld=lld -nostdlib -pie -Wl,--unresolved-symbols=ignore-all")
 
 # Add PS5 SDK lib path for additional libraries
 link_directories("${PS5_PAYLOAD_SDK}/lib")
