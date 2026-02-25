@@ -31,7 +31,7 @@ include_directories	(SYSTEM "${PS5_PAYLOAD_SDK}")
 include_directories	(SYSTEM "${PS5_PAYLOAD_SDK}/include")
 
 add_executable(${PROJECT_NAME})
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${PROJECT_NAME}.elf")
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "ps5debug.elf")
 
 # Must build with clang
 if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "[Cc]lang")

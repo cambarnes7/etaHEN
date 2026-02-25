@@ -58,7 +58,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pe
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}" "${D_SRC}" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
 target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

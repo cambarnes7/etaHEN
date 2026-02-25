@@ -59,10 +59,19 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-keyword-macro -fPIC -fPIE -march=znver2
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 
+# Copy elfldr.bin as elfldr.elf asset for .incbin embedding
+file(MAKE_DIRECTORY "${D_CWD}/assets")
+add_custom_command(OUTPUT "${D_CWD}/assets/elfldr.elf"
+    COMMAND ${CMAKE_COMMAND} -E copy "${PROJECT_ROOT}/lib/elfldr.bin" "${D_CWD}/assets/elfldr.elf"
+    DEPENDS "${PROJECT_ROOT}/lib/elfldr.bin"
+    COMMENT "Copying elfldr.bin to util/assets/elfldr.elf for embedding"
+)
+add_custom_target(elfldr_asset DEPENDS "${D_CWD}/assets/elfldr.elf")
+
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}" "${D_SRC}")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-add_dependencies(${PROJECT_NAME} hijacker NineS)
+add_dependencies(${PROJECT_NAME} hijacker NineS elfldr_asset)
 target_link_libraries(${PROJECT_NAME} PUBLIC 
     hijacker 
     SceLibcInternal 
