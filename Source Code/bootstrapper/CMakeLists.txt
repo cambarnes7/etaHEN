@@ -78,8 +78,14 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Stripping debugging information from ${PROJECT_NAME}.elf"
 )
 
+# stat -c is Linux, stat -f is macOS
+if(APPLE)
+    set(STAT_SIZE_CMD stat -f %z)
+else()
+    set(STAT_SIZE_CMD stat -c %s)
+endif()
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND stat -c %s $<TARGET_FILE:${PROJECT_NAME}> > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size
+    COMMAND ${STAT_SIZE_CMD} $<TARGET_FILE:${PROJECT_NAME}> > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size
     COMMENT "Getting original payload size..."
 )
 
