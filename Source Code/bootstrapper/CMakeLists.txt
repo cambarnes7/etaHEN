@@ -76,8 +76,12 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Stripping debugging information from ${PROJECT_NAME}.elf"
 )
 
+# Generate a cmake helper script to get file size (avoids shell escaping issues)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/get_size.cmake"
+    "file(SIZE \"\${FILE}\" FILESIZE)\nfile(WRITE \"\${FILE}.lzma.size\" \"\${FILESIZE}\")\n")
+
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND sh -c "wc -c < $<TARGET_FILE:${PROJECT_NAME}> | tr -d ' ' > $<TARGET_FILE:${PROJECT_NAME}>.lzma.size"
+    COMMAND ${CMAKE_COMMAND} -DFILE=$<TARGET_FILE:${PROJECT_NAME}> -P "${CMAKE_CURRENT_BINARY_DIR}/get_size.cmake"
     COMMENT "Getting original payload size..."
 )
 
