@@ -58,7 +58,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pe
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
+# Include bootstrapper dir itself so .incbin "assets/..." paths resolve correctly
+# (Ninja runs all commands from the top-level build dir, not per-subproject)
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
 target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite3 SceNotification)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
