@@ -20,6 +20,7 @@ SECTIONS {
 		PROVIDE_HIDDEN(__text_start = .);
         *(.text .text.*);
 		PROVIDE_HIDDEN(__text_stop = .);
+		PROVIDE_HIDDEN(__text_end = .);
     } : phdr_text
 
     .init : {
