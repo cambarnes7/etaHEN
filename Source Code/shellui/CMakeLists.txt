@@ -52,7 +52,7 @@ message("========== build: ${PROJECT_NAME} ==========")
 
 file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/*.cpp ${D_SRC}/../include/*.h ${D_SRC}/../include/*.hpp ${D_SRC}/*.s ${D_SRC}/../../extern/tiny-json/*.cpp ${D_SRC}/../../extern/tiny-json/*.hpp ${D_SRC}/../../extern/cJSON/*.cpp ${D_SRC}/../../extern/cJSON/*.hpp ${D_SRC}/../../lib/backtrace.cpp)
 
-set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -I${D_CWD}/")
+# Removed CMAKE_ASM_FLAGS -I approach (breaks on paths with spaces)
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-nested-anon-types -Wno-gnu-anonymous-struct -Wno-zero-length-array -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors -fexceptions")
@@ -69,7 +69,7 @@ add_custom_target(run_encryptxml
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
 add_dependencies(${PROJECT_NAME} run_encryptxml)
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
 target_link_libraries	(${PROJECT_NAME} PUBLIC hijacker ScePad SceRegMgr SceSystemService SceNet SceSysmodule SceUserService SceNetCtl SceSysCore kernel_sys SceAppInstUtil)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
