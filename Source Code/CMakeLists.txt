@@ -29,6 +29,11 @@ foreach(_stublib crypto ssl)
         file(WRITE "${PROJECT_ROOT}/lib/lib${_stublib}.a" "!<arch>\n")
     endif()
 endforeach()
+
+# The PS5 SDK names SQLite as libsqlite.a but the project links -lsqlite3
+if(NOT EXISTS "${PROJECT_ROOT}/lib/libsqlite3.a" AND EXISTS "${PROJECT_ROOT}/lib/libsqlite.a")
+    file(CREATE_LINK "${PROJECT_ROOT}/lib/libsqlite.a" "${PROJECT_ROOT}/lib/libsqlite3.a" COPY_ON_ERROR)
+endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_ROOT}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)	# static libs are archive
