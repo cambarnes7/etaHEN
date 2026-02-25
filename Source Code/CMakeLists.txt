@@ -7,8 +7,16 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_ROOT}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)	# static libs are archive
 
-# PS5 payload linker settings: use lld, custom linker script, and PS5-specific ELF layout
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -nodefaultlibs -T${PROJECT_ROOT}/linker.x -Wl,--build-id=none -Wl,-zmax-page-size=16384 -Wl,-zcommon-page-size=16384 -Wl,--hash-style=sysv")
+# PS5 payload linker settings: custom linker script and PS5-specific ELF layout
+# Note: clang auto-selects lld for x86_64-sie-ps5 cross target, no -fuse-ld needed
+add_link_options(
+    -nodefaultlibs
+    "LINKER:-T${PROJECT_ROOT}/linker.x"
+    "LINKER:--build-id=none"
+    "LINKER:-zmax-page-size=16384"
+    "LINKER:-zcommon-page-size=16384"
+    "LINKER:--hash-style=sysv"
+)
 
 include_directories	(SYSTEM "${PROJECT_ROOT}/include")
 include_directories(SYSTEM "${PS5_PAYLOAD_SDK}")
