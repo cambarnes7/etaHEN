@@ -7,15 +7,18 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_ROOT}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_ROOT}/lib)	# static libs are archive
 
-# PS5 payload linker settings: custom linker script and PS5-specific ELF layout
-# Note: clang auto-selects lld for x86_64-sie-ps5 cross target, no -fuse-ld needed
+# Replicate ps5-payload-sdk prospero-lld linker flags
+# (prospero-lld adds these automatically but we invoke lld directly on macOS)
 add_link_options(
-    "LINKER:-T${PROJECT_ROOT}/linker.x"
-    "LINKER:--build-id=none"
-    "LINKER:-zmax-page-size=16384"
-    "LINKER:-zcommon-page-size=16384"
-    "LINKER:--hash-style=sysv"
+    "LINKER:--pie"
+    "LINKER:-T,${PROJECT_ROOT}/elf_x86_64.x"
+    "LINKER:--eh-frame-hdr"
+    "LINKER:-zmax-page-size=0x4000"
+    "LINKER:--hash-style=gnu"
 )
+
+# Replicate ps5-payload-sdk prospero-clang compiler flags
+add_compile_options(-fno-plt -femulated-tls)
 
 include_directories	(SYSTEM "${PROJECT_ROOT}/include")
 include_directories(SYSTEM "${PS5_PAYLOAD_SDK}")
