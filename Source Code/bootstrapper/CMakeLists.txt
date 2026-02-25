@@ -78,8 +78,10 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Stripping debugging information from ${PROJECT_NAME}.elf"
 )
 
-# stat -c is Linux, stat -f is macOS
-if(APPLE)
+# stat -c is Linux, stat -f is macOS. Check HOST system since this
+# runs on the build machine, not the target (APPLE is false when
+# cross-compiling for PS5/FreeBSD).
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
     set(STAT_SIZE_CMD stat -f %z)
 else()
     set(STAT_SIZE_CMD stat -c %s)
