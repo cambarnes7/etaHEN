@@ -62,7 +62,7 @@ message("========== build: ${PROJECT_NAME} ==========")
 
 
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -march=znver2 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC  -fstack-protector-all")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC -fno-plt  -fstack-protector-all")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -O3 -march=znver2 -Wall -Wextra -Wmove -Wmost -Werror -fno-exceptions")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g0 -O0")
 add_dependencies(${PROJECT_NAME} NidResolver)

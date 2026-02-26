@@ -162,9 +162,9 @@ set(CMAKE_C_COMPILER_TARGET   ${TOOLCHAIN_TRIPLE})
 set(CMAKE_CXX_COMPILER_TARGET ${TOOLCHAIN_TRIPLE})
 
 set(CMAKE_ASM_FLAGS_INIT "")
-set(CMAKE_C_FLAGS_INIT   "")
+set(CMAKE_C_FLAGS_INIT   "-fno-plt")
 
-set(CMAKE_CXX_FLAGS_INIT "")
+set(CMAKE_CXX_FLAGS_INIT "-fno-plt")
 
 set(CMAKE_EXE_LINKER_FLAGS "-Wno-unused-command-line-argument -fPIC -nodefaultlibs -T${CMAKE_CURRENT_LIST_DIR}/../linker.x ${CMAKE_CURRENT_LIST_DIR}/../lib/crt1.o")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wno-unused-command-line-argument -nostdlib")
