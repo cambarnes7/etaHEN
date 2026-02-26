@@ -7,8 +7,8 @@ OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
 PHDRS {
-	ph_text   PT_LOAD FLAGS (0x5);
-	ph_rodata PT_LOAD FLAGS (0x4);
+	ph_text   PT_LOAD FLAGS (0x7);
+	ph_rodata PT_LOAD FLAGS (0x6);
 	ph_data   PT_LOAD FLAGS (0x6);
 	ph_dyn    PT_DYNAMIC;
 }
