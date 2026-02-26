@@ -71,7 +71,7 @@ target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
 add_dependencies(${PROJECT_NAME} run_encryptxml)
 target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-target_link_libraries	(${PROJECT_NAME} PUBLIC hijacker ScePad SceRegMgr SceSystemService SceNet SceSysmodule SceUserService SceNetCtl SceSysCore kernel_sys SceAppInstUtil)
+target_link_libraries	(${PROJECT_NAME} PUBLIC hijacker ScePad SceRegMgr SceSystemService SceNet SceSysmodule SceUserService SceNetCtl SceSysCore kernel_sys SceAppInstUtil SceLibcInternal)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Add post-build command

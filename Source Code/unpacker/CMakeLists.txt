@@ -72,7 +72,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
 target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-target_link_libraries	(${PROJECT_NAME} PUBLIC kernel_sys)
+target_link_libraries	(${PROJECT_NAME} PUBLIC kernel_sys SceLibcInternal SceNet)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_dependencies(${PROJECT_NAME} bootstrapper)
 

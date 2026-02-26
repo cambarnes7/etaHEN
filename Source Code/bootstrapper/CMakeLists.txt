@@ -63,7 +63,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}"
 set_source_files_properties("${D_SRC}/daemon.c" PROPERTIES INCLUDE_DIRECTORIES "${D_CWD}")
 set_source_files_properties("${D_SRC}/../Byepervisor/src/main.cpp" PROPERTIES INCLUDE_DIRECTORIES "${D_CWD}/Byepervisor/src;${D_CWD}/include;${D_SRC}/../Byepervisor/include;${D_SRC}/../Byepervisor_DevKit/include;${D_SRC}/../Byepervisor_DevKit/include/offsets;${PS5_PAYLOAD_SDK};${PS5_PAYLOAD_SDK}/include;${CMAKE_SOURCE_DIR}/include")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite3 SceNotification)
+target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite3 SceNotification SceLibcInternal SceNet)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_dependencies(${PROJECT_NAME} daemon util shellui)
 
