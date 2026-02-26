@@ -1,3 +1,5 @@
+ENTRY(_start)
+
 PHDRS {
 	/*
 	 * PF_X = 0x1
@@ -7,9 +9,9 @@ PHDRS {
     phdr_text     PT_LOAD         FLAGS(0x5);
     phdr_data     PT_LOAD         FLAGS(0x6);
 	phdr_rodata   PT_LOAD         FLAGS(0x4);
-	phdr_relro    PT_LOAD         FLAGS(0x4);
+	phdr_relro    PT_LOAD         FLAGS(0x6);
 	phdr_eh_frame PT_GNU_EH_FRAME FLAGS(0x4);
-    phdr_dynamic  PT_DYNAMIC      FLAGS(0x0);
+    phdr_dynamic  PT_DYNAMIC      FLAGS(0x6);
 }
 
 SECTIONS {
@@ -20,6 +22,7 @@ SECTIONS {
 		PROVIDE_HIDDEN(__text_start = .);
         *(.text .text.*);
 		PROVIDE_HIDDEN(__text_stop = .);
+		PROVIDE_HIDDEN(__text_end = .);
     } : phdr_text
 
     .init : {
@@ -88,12 +91,14 @@ SECTIONS {
         PROVIDE_HIDDEN(__init_array_start = .);
         KEEP (*(.init_array .init_array.*));
         PROVIDE_HIDDEN(__init_array_stop = .);
+        PROVIDE_HIDDEN(__init_array_end = .);
     } : phdr_relro
 
     .fini_array : {
         PROVIDE_HIDDEN(__fini_array_start = .);
         KEEP (*(.fini_array .fini_array.*));
         PROVIDE_HIDDEN(__fini_array_stop = .);
+        PROVIDE_HIDDEN(__fini_array_end = .);
     } : phdr_relro
 
     .got : {
@@ -112,19 +117,23 @@ SECTIONS {
         *(rela.plt);
     } : phdr_relro
 
-    PROVIDE (__payload_end = .);
-
-	/* this needs to be forced aligned to 0x4000 */
-    .dynamic : ALIGN(0x4000) {
-        PROVIDE_HIDDEN (_DYNAMIC = .);
-        *(.dynamic);
-    } : phdr_dynamic
-
+	/* dynamic sections - must be in a LOAD segment for elfldr to copy them */
     .dynsym : {
         *(.dynsym);
-    } : phdr_dynamic
+    } : phdr_relro
+
+    .gnu.hash : {
+        *(.gnu.hash);
+    } : phdr_relro
 
     .dynstr : {
         *(.dynstr);
-    } : phdr_dynamic
+    } : phdr_relro
+
+    .dynamic : ALIGN(0x10) {
+        PROVIDE_HIDDEN (_DYNAMIC = .);
+        *(.dynamic);
+    } : phdr_relro : phdr_dynamic
+
+    PROVIDE (__payload_end = .);
 }

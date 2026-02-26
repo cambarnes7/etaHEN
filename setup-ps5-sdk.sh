@@ -58,26 +58,9 @@ cp -r "$PAYLOAD_SDK_DIR"/include_bsd/* "$SDK_DIR/include/"
 mkdir -p "$SDK_DIR/include/ps5"
 cp -r "$PAYLOAD_SDK_DIR"/include_ps5/* "$SDK_DIR/include/ps5/"
 
-# Copy linker script from etaHEN source tree (not from ps5-payload-sdk which uses a different format)
+# Copy linker script from etaHEN source tree (already has all required fixes:
+# ENTRY(_start), __text_end, __init/fini_array_end symbols, and .dynamic in LOAD segment)
 cp "$SCRIPT_DIR/Source Code/linker.x" "$SDK_DIR/linker.x"
-
-# Add ENTRY(_start) to linker script (required for proper ELF entry point)
-if ! grep -q 'ENTRY(_start)' "$SDK_DIR/linker.x"; then
-    sed -i '1i ENTRY(_start)\n' "$SDK_DIR/linker.x"
-fi
-
-# Add __text_end symbol to linker script (etaHEN's backtrace.cpp references it)
-if ! grep -q '__text_end' "$SDK_DIR/linker.x"; then
-    sed -i 's/PROVIDE_HIDDEN(__text_stop = .);/PROVIDE_HIDDEN(__text_stop = .);\n\t\tPROVIDE_HIDDEN(__text_end = .);/' "$SDK_DIR/linker.x"
-fi
-
-# Add __init_array_end and __fini_array_end symbols (CRT expects these)
-if ! grep -q '__init_array_end' "$SDK_DIR/linker.x"; then
-    sed -i 's/PROVIDE_HIDDEN(__init_array_stop = .);/PROVIDE_HIDDEN(__init_array_stop = .);\n        PROVIDE_HIDDEN(__init_array_end = .);/' "$SDK_DIR/linker.x"
-fi
-if ! grep -q '__fini_array_end' "$SDK_DIR/linker.x"; then
-    sed -i 's/PROVIDE_HIDDEN(__fini_array_stop = .);/PROVIDE_HIDDEN(__fini_array_stop = .);\n        PROVIDE_HIDDEN(__fini_array_end = .);/' "$SDK_DIR/linker.x"
-fi
 
 # Build CRT (C Runtime startup code) from ps5-payload-sdk
 echo ">>> Building CRT (crt1.o)..."
