@@ -48,6 +48,10 @@ SECTIONS {
 	    *(.dynamic)
 	} : ph_data : ph_dyn
 
+	.got : {
+	    *(.got .got.*)
+	} : ph_data
+
 	.bss (NOLOAD) : ALIGN(CONSTANT(MAXPAGESIZE)) {
 	    PROVIDE_HIDDEN (__bss_start = .);
 	    *(.bss .bss.*);
