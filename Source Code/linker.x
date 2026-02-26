@@ -1,139 +1,59 @@
+/* Linker script based on ps5-payload-sdk elf_x86_64.x by John Tornblom
+   Modified for etaHEN to add __text_end, __payload_start/end symbols
+   and merge .ctors into init_array */
+
+OUTPUT_FORMAT("elf64-x86-64")
+OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
 PHDRS {
-	/*
-	 * PF_X = 0x1
-	 * PF_W = 0x2
-	 * PF_R = 0x4
-	 */
-    phdr_text     PT_LOAD         FLAGS(0x5);
-    phdr_data     PT_LOAD         FLAGS(0x6);
-	phdr_rodata   PT_LOAD         FLAGS(0x4);
-	phdr_relro    PT_LOAD         FLAGS(0x6);
-	phdr_eh_frame PT_GNU_EH_FRAME FLAGS(0x4);
-    phdr_dynamic  PT_DYNAMIC      FLAGS(0x6);
+	ph_text   PT_LOAD FLAGS (0x5);
+	ph_rodata PT_LOAD FLAGS (0x4);
+	ph_data   PT_LOAD FLAGS (0x6);
+	ph_dyn    PT_DYNAMIC;
 }
 
 SECTIONS {
+	PROVIDE (__payload_start = .);
 
-    PROVIDE (__payload_start = .);
+	.text : ALIGN(CONSTANT(MAXPAGESIZE)) {
+	    PROVIDE_HIDDEN (__text_start = .);
+	    *(.text .text.*)
+	    PROVIDE_HIDDEN (__text_stop = .);
+	    PROVIDE_HIDDEN (__text_end = .);
+	} : ph_text
 
-    .text : {
-		PROVIDE_HIDDEN(__text_start = .);
-        *(.text .text.*);
-		PROVIDE_HIDDEN(__text_stop = .);
-		PROVIDE_HIDDEN(__text_end = .);
-    } : phdr_text
+	.rodata : ALIGN(CONSTANT(MAXPAGESIZE)) {
+	    *(.rodata .rodata.*)
 
-    .init : {
-        *(.init)
-    } : phdr_text
+	    PROVIDE_HIDDEN(__init_array_start = .);
+	    KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
+	    KEEP(*(.init_array .ctors))
+	    PROVIDE_HIDDEN(__init_array_end = .);
 
-    .fini : {
-        *(.fini)
-    } : phdr_text
+	    PROVIDE_HIDDEN(__fini_array_start = .);
+	    KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
+	    KEEP(*(.fini_array .dtors))
+	    PROVIDE_HIDDEN(__fini_array_end = .);
+	} : ph_rodata
 
-    .plt : {
-        *(.plt)
-    } : phdr_text
+	.rela : { *(.rela *.rela.*) }
 
-	. = ALIGN(0x4000); /* move to a new page in memory */
+	.data : ALIGN(CONSTANT(MAXPAGESIZE)) {
+	    *(.data .data.*)
+	} : ph_data
 
-	.data : {
-        *(.data);
-		*(.data.*);
-    } : phdr_data
+	.dynamic : ALIGN(CONSTANT(MAXPAGESIZE)) {
+	    PROVIDE_HIDDEN (_DYNAMIC = .);
+	    *(.dynamic)
+	} : ph_data : ph_dyn
 
-    .bss (NOLOAD) : {
-		PROVIDE_HIDDEN (__bss_start = .);
-        *(.bss .bss.*);
-        *(COMMON)
-		PROVIDE_HIDDEN (__bss_end = .);
-    } : phdr_data
+	.bss (NOLOAD) : ALIGN(CONSTANT(MAXPAGESIZE)) {
+	    PROVIDE_HIDDEN (__bss_start = .);
+	    *(.bss .bss.*);
+	    *(COMMON)
+	    PROVIDE_HIDDEN (__bss_end = .);
+	} : ph_data
 
-	. = ALIGN(0x4000); /* move to a new page in memory */
-
-    .rodata : {
-        *(.rodata .rodata.*);
-    } : phdr_rodata
-
-	.gcc_except_table : {
-		*(.gcc_except_table*)
-	} : phdr_rodata
-
-	.hash : {
-		*(.hash);
-    } : phdr_rodata
-
-	. = ALIGN(0x4000); /* move to a new page in memory */
-
-	.eh_frame_hdr : ALIGN(0x4000) {
-		*(.eh_frame_hdr)
-	} : phdr_eh_frame
-
-	.eh_frame : ALIGN(0x10) {
-		*(.eh_frame)
-	} : phdr_eh_frame
-
-	. = ALIGN(0x4000); /* move to a new page in memory */
-
-    .data.rel.ro : {
-        *(.data.rel.ro .data.rel.ro.*);
-    } : phdr_relro
-
-	.preinit_array : {
-		PROVIDE_HIDDEN (__preinit_array_start = .);
-		KEEP (*(.preinit_array*))
-		PROVIDE_HIDDEN (__preinit_array_end = .);
-	} : phdr_relro
-
-    .init_array : {
-        PROVIDE_HIDDEN(__init_array_start = .);
-        KEEP (*(.init_array .init_array.*));
-        PROVIDE_HIDDEN(__init_array_stop = .);
-        PROVIDE_HIDDEN(__init_array_end = .);
-    } : phdr_relro
-
-    .fini_array : {
-        PROVIDE_HIDDEN(__fini_array_start = .);
-        KEEP (*(.fini_array .fini_array.*));
-        PROVIDE_HIDDEN(__fini_array_stop = .);
-        PROVIDE_HIDDEN(__fini_array_end = .);
-    } : phdr_relro
-
-    .got : {
-        *(.got);
-    } : phdr_relro
-
-    .got.plt : {
-        *(.got.plt);
-    } : phdr_relro
-
-	.rela.dyn : {
-        *(.rela.dyn) *(.rela);
-    } : phdr_relro
-
-    .rela.plt : {
-        *(rela.plt);
-    } : phdr_relro
-
-	/* dynamic sections - must be in a LOAD segment for elfldr to copy them */
-    .dynsym : {
-        *(.dynsym);
-    } : phdr_relro
-
-    .gnu.hash : {
-        *(.gnu.hash);
-    } : phdr_relro
-
-    .dynstr : {
-        *(.dynstr);
-    } : phdr_relro
-
-    .dynamic : ALIGN(0x10) {
-        PROVIDE_HIDDEN (_DYNAMIC = .);
-        *(.dynamic);
-    } : phdr_relro : phdr_dynamic
-
-    PROVIDE (__payload_end = .);
+	PROVIDE (__payload_end = .);
 }
