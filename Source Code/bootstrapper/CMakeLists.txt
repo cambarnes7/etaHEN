@@ -54,11 +54,14 @@ file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/*.cpp ${D_SRC}/../include/*.h ${D_SRC}/
 
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all")
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
+set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fexceptions -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}" "${D_SRC}/../Byepervisor/include" "${D_SRC}/../Byepervisor_DevKit/include" "${D_SRC}/../Byepervisor_DevKit/include/offsets")
+# Set include directories for inline asm .incbin resolution
+set_source_files_properties("${D_SRC}/daemon.c" PROPERTIES INCLUDE_DIRECTORIES "${D_CWD}")
+set_source_files_properties("${D_SRC}/../Byepervisor/src/main.cpp" PROPERTIES INCLUDE_DIRECTORIES "${D_CWD}/Byepervisor/src;${D_CWD}/include;${D_SRC}/../Byepervisor/include;${D_SRC}/../Byepervisor_DevKit/include;${D_SRC}/../Byepervisor_DevKit/include/offsets;${PS5_PAYLOAD_SDK};${PS5_PAYLOAD_SDK}/include;${CMAKE_SOURCE_DIR}/include")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
 target_link_libraries	(${PROJECT_NAME} PUBLIC NineS SceSystemService SceUserService kernel_sys elfldr sqlite3 SceNotification)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

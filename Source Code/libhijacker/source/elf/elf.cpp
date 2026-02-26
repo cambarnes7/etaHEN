@@ -687,7 +687,7 @@ static uintptr_t setupKernelRWInplace(const Hijacker& hijacker) {
 	rwpair[0] = _master_sock;
 	rwpair[1] = _victim_sock;
 	gResult.args = {
-		.sys_dynlib_dlsym = reinterpret_cast<dlsym_t*>(hijacker.getLibKernelFunctionAddress(nid::sceKernelDlsym)), // NOLINT(*)
+		.sceKernelDlsym = reinterpret_cast<dlsym_t*>(hijacker.getLibKernelFunctionAddress(nid::sceKernelDlsym)), // NOLINT(*)
 		.rwpipe = rwpipe,
 		.rwpair = rwpair,
 		.kpipe_addr = static_cast<intptr_t>(_pipe_addr),
@@ -751,7 +751,7 @@ uintptr_t Elf::setupKernelRW() noexcept {
 
 	// NOLINTBEGIN(performance-no-int-to-ptr)
 	struct payload_args result = {
-		.sys_dynlib_dlsym = reinterpret_cast<dlsym_t *>(hijacker->getLibKernelFunctionAddress(nid::sceKernelDlsym)),
+		.sceKernelDlsym = reinterpret_cast<dlsym_t *>(hijacker->getLibKernelFunctionAddress(nid::sceKernelDlsym)),
 		.rwpipe = reinterpret_cast<int *>(newFiles) + 2,
 		.rwpair = reinterpret_cast<int *>(newFiles),
 		.kpipe_addr = static_cast<intptr_t>(pipeaddr),

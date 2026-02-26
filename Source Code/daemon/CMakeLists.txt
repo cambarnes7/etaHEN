@@ -55,13 +55,13 @@ file(GLOB SrcFiles ${D_SRC}/*.c ${D_SRC}/*.cpp ${D_SRC}/../include/*.h ${D_SRC}/
 
 set(CMAKE_C_FLAGS "--target=x86_64-sie-ps5 -DPPR -DPS5 -DPS5_FW_VERSION=${V_FW} ")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-keyword-macro -fPIC -fPIE -march=znver2 -Wall -Werror -fstack-protector-all")
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
+set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fexceptions -DDEBUG -gfull -gdwarf-2 -O0 -pedantic -pedantic-errors")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 ")
 
 target_sources(${PROJECT_NAME} PRIVATE ${SrcFiles})
-target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include")
+target_include_directories(${PROJECT_NAME} PRIVATE "${D_CWD}/include" "${D_CWD}")
 target_link_directories	(${PROJECT_NAME} PUBLIC "${PROJECT_ROOT}/lib")
-add_dependencies(${PROJECT_NAME} NineS shellui hijacker SelfDecryptor elfldr)
+add_dependencies(${PROJECT_NAME} NineS shellui fps_elf hijacker SelfDecryptor elfldr)
 target_link_libraries	(${PROJECT_NAME} PUBLIC hijacker ScePad SceSystemService SceNotification SceNet SceRegMgr SceSysmodule SceUserService SceNetCtl SceSysCore kernel_sys SceAppInstUtil NineS elfldr SelfDecryptor)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Add post-build command
