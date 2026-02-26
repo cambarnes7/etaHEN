@@ -168,7 +168,7 @@ set(CMAKE_CXX_FLAGS_INIT "-fno-plt")
 
 set(CMAKE_EXE_LINKER_FLAGS "-Wno-unused-command-line-argument -fPIC -nodefaultlibs -T${CMAKE_CURRENT_LIST_DIR}/../linker.x ${CMAKE_CURRENT_LIST_DIR}/../lib/crt1.o")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wno-unused-command-line-argument -nostdlib")
-add_link_options("LINKER:SHELL:-pie --allow-shlib-undefined --unresolved-symbols=ignore-all --build-id=none -zmax-page-size=16384 -zcommon-page-size=16384 --hash-style=sysv")
+add_link_options("LINKER:SHELL:-pie --allow-shlib-undefined --unresolved-symbols=ignore-all -zmax-page-size=16384")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 set(CMAKE_C_LINKER_WRAPPER_FLAG "-Xlinker" " ")
