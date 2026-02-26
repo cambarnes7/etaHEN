@@ -61,10 +61,33 @@ cp -r "$PAYLOAD_SDK_DIR"/include_ps5/* "$SDK_DIR/include/ps5/"
 # Copy linker script from etaHEN source tree (not from ps5-payload-sdk which uses a different format)
 cp "$SCRIPT_DIR/Source Code/linker.x" "$SDK_DIR/linker.x"
 
+# Add ENTRY(_start) to linker script (required for proper ELF entry point)
+if ! grep -q 'ENTRY(_start)' "$SDK_DIR/linker.x"; then
+    sed -i '1i ENTRY(_start)\n' "$SDK_DIR/linker.x"
+fi
+
 # Add __text_end symbol to linker script (etaHEN's backtrace.cpp references it)
 if ! grep -q '__text_end' "$SDK_DIR/linker.x"; then
     sed -i 's/PROVIDE_HIDDEN(__text_stop = .);/PROVIDE_HIDDEN(__text_stop = .);\n\t\tPROVIDE_HIDDEN(__text_end = .);/' "$SDK_DIR/linker.x"
 fi
+
+# Add __init_array_end and __fini_array_end symbols (CRT expects these)
+if ! grep -q '__init_array_end' "$SDK_DIR/linker.x"; then
+    sed -i 's/PROVIDE_HIDDEN(__init_array_stop = .);/PROVIDE_HIDDEN(__init_array_stop = .);\n        PROVIDE_HIDDEN(__init_array_end = .);/' "$SDK_DIR/linker.x"
+fi
+if ! grep -q '__fini_array_end' "$SDK_DIR/linker.x"; then
+    sed -i 's/PROVIDE_HIDDEN(__fini_array_stop = .);/PROVIDE_HIDDEN(__fini_array_stop = .);\n        PROVIDE_HIDDEN(__fini_array_end = .);/' "$SDK_DIR/linker.x"
+fi
+
+# Build CRT (C Runtime startup code) from ps5-payload-sdk
+echo ">>> Building CRT (crt1.o)..."
+mkdir -p "$SDK_DIR/lib"
+CRT_DIR="$PAYLOAD_SDK_DIR/crt"
+CRT_CFLAGS="-ffreestanding -fno-builtin -nostdlib -fPIC -target x86_64-sie-ps5 -fno-plt -fno-stack-protector -Wall -Werror"
+for src in crt klog kernel rtld patch mdbg env; do
+    clang -c $CRT_CFLAGS -o "$CRT_DIR/$src.o" "$CRT_DIR/$src.c"
+done
+ld.lld -r -o "$SDK_DIR/lib/crt1.o" "$CRT_DIR"/crt.o "$CRT_DIR"/klog.o "$CRT_DIR"/kernel.o "$CRT_DIR"/rtld.o "$CRT_DIR"/patch.o "$CRT_DIR"/mdbg.o "$CRT_DIR"/env.o
 
 # Remove conflicting FreeBSD stdatomic.h (uses C-only _Bool, breaks C++ builds)
 if [ -f "$SDK_DIR/include/stdatomic.h" ]; then
@@ -160,7 +183,7 @@ set(CMAKE_C_FLAGS_INIT   "")
 
 set(CMAKE_CXX_FLAGS_INIT "")
 
-set(CMAKE_EXE_LINKER_FLAGS "-Wno-unused-command-line-argument -fPIC -nodefaultlibs -T${CMAKE_CURRENT_LIST_DIR}/../linker.x")
+set(CMAKE_EXE_LINKER_FLAGS "-Wno-unused-command-line-argument -fPIC -nodefaultlibs -T${CMAKE_CURRENT_LIST_DIR}/../linker.x ${CMAKE_CURRENT_LIST_DIR}/../lib/crt1.o")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wno-unused-command-line-argument -nostdlib")
 add_link_options("LINKER:SHELL:-shared --build-id=none -zmax-page-size=16384 -zcommon-page-size=16384 --hash-style=sysv")
 
