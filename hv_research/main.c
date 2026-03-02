@@ -106,7 +106,7 @@ __asm__ (
 extern const unsigned char KMOD_KO[];
 extern const uint64_t KMOD_KO_SZ;
 
-/* ─── Kmod shared data structures (must match kmod/hv_kmod.c) ─── */
+/* ─── Kmod shared data structures (must match kmod/hv_kld.c) ─── */
 
 #define KMOD_MAGIC          0xCAFEBABEDEAD1337ULL
 #define KMOD_MAX_RESULTS    64
@@ -114,11 +114,10 @@ extern const uint64_t KMOD_KO_SZ;
 #define KMOD_STATUS_RUNNING 1
 #define KMOD_STATUS_DONE    2
 
-#define KMOD_FLAG_VMMCALL_ENUM     (1 << 0)
-#define KMOD_FLAG_VMMCALL_IOMMU    (1 << 1)
-#define KMOD_FLAG_VMCB_PROBE       (1 << 2)
-#define KMOD_FLAG_MSR_RECON        (1 << 3)
-#define KMOD_FLAG_ALL              0xFFFFFFFF
+/* Sentinel value in hv_kld.c's hv_result_dest variable.
+ * We scan the .ko binary for this value and replace it with
+ * the kernel DMAP VA of our shared result buffer. */
+#define RESULT_DEST_SENTINEL 0xD5C0FFEED5C0FFEEULL
 
 struct vmmcall_result {
     uint64_t rax_in, rcx_in, rdx_in, rdi_in, rsi_in, r8_in;
@@ -956,22 +955,76 @@ static void campaign_iommu_recon(void) {
  * This is the core HV research campaign. It uses FreeBSD's native
  * kernel module loading (kldload) instead of sysent hijacking:
  *
- * 1. Write the embedded .ko file to disk
- * 2. Call kldload() to load it into the kernel
+ * 1. Allocate shared physical memory for result delivery
+ * 2. Patch the .ko with the kernel DMAP VA of that buffer
+ * 3. Write patched .ko to disk and kldload() it
  *    - The kernel linker allocates memory, handles relocations
  *    - SYSINIT callback runs our init code in ring 0
- *    - Init reads MSRs, CRs, and optionally executes VMMCALLs
- * 3. Use kldsym() to find the hv_results symbol
- * 4. kernel_copyout() the results to userland
+ *    - Init writes results to the shared DMAP buffer
+ * 4. Read results directly from our mapped VA (no kldsym needed)
  * 5. kldunload() to clean up
  *
- * Advantages over sysent hijacking:
- *   - No sysent table scanning (was failing)
- *   - No data cave hunting
- *   - No NX bit clearing
- *   - Kernel handles all memory management and relocation
- *   - Works on FW < 6.50 (GMET not enforced)
+ * The previous approach relied on kldsym() to locate the hv_results
+ * symbol in the loaded module. On PS5, kldsym returns symvalue=0
+ * despite reporting success, so we bypass it entirely by using
+ * shared physical memory via DMAP.
  */
+
+static void display_kmod_results(struct kmod_result_buf *results) {
+    printf("[+] Kmod status: %s\n",
+           results->status == KMOD_STATUS_DONE ? "COMPLETE" :
+           results->status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
+           "UNKNOWN");
+
+    /* Display MSR results */
+    if (results->num_msr_results > 0) {
+        printf("\n[+] MSR/CR Reconnaissance Results (%u entries):\n",
+               results->num_msr_results);
+        for (uint32_t i = 0; i < results->num_msr_results && i < 32; i++) {
+            uint32_t msr_id = results->msr_results[i].msr_id;
+            uint64_t value  = results->msr_results[i].value;
+            const char *name = "";
+
+            switch (msr_id) {
+                case 0xC0000080: name = "EFER"; break;
+                case 0xC0000081: name = "STAR"; break;
+                case 0xC0000082: name = "LSTAR"; break;
+                case 0xC0000084: name = "SFMASK"; break;
+                case 0xC0000100: name = "FS_BASE"; break;
+                case 0xC0000101: name = "GS_BASE"; break;
+                case 0xC0000102: name = "KGS_BASE"; break;
+                case 0xC0000103: name = "TSC_AUX"; break;
+                case 0xFFFF0000: name = "CR0"; break;
+                case 0xFFFF0003: name = "CR3"; break;
+                case 0xFFFF0004: name = "CR4"; break;
+                default: name = "???"; break;
+            }
+            printf("    %-10s (0x%08x) = 0x%016lx\n", name, msr_id, value);
+        }
+    }
+
+    /* Display VMMCALL results */
+    if (results->num_results > 0) {
+        printf("\n[+] VMMCALL Fuzzing Results (%u entries):\n", results->num_results);
+        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+               "RAX_in", "RAX_out", "RCX_out", "RDX_out", "Campaign", "OK");
+        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+               "------", "------------------", "------------------",
+               "------------------", "----------", "----");
+
+        for (uint32_t i = 0; i < results->num_results && i < KMOD_MAX_RESULTS; i++) {
+            struct vmmcall_result *r = &results->results[i];
+            printf("    0x%04lx 0x%016lx 0x%016lx 0x%016lx  camp=%u     %s\n",
+                   r->rax_in, r->rax_out, r->rcx_out, r->rdx_out,
+                   r->campaign_id, r->survived ? "YES" : "NO");
+        }
+    } else if (results->status == KMOD_STATUS_RUNNING) {
+        printf("\n[-] No VMMCALL results. Module init appears to have crashed during:\n");
+        printf("    Campaign %u, probe %u\n",
+               results->current_campaign, results->current_probe);
+    }
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -979,32 +1032,105 @@ static void campaign_kmod_kldload(void) {
 
     printf("[*] Kernel module (.ko) size: %lu bytes\n", KMOD_KO_SZ);
 
-    /* Step 1: Write .ko to disk */
-    printf("\n[*] Step 1: Writing hv_kmod.ko to disk...\n");
+    /* Step 1: Allocate shared physical memory for results */
+    printf("\n[*] Step 1: Allocating shared result buffer...\n");
 
+    off_t result_pa = 0;
+    void *result_va = NULL;
+    size_t result_sz = (sizeof(struct kmod_result_buf) + 0x3FFF) & ~0x3FFFUL;
+
+    int ret = sceKernelAllocateDirectMemory(0, 0x200000000ULL,
+                                            result_sz, 0x4000,
+                                            SCE_KERNEL_WB_ONION, &result_pa);
+    if (ret != 0) {
+        printf("[-] Failed to allocate result buffer: ret=%d\n", ret);
+        return;
+    }
+
+    ret = sceKernelMapDirectMemory(&result_va, result_sz,
+                                   SCE_KERNEL_PROT_CPU_RW, 0,
+                                   result_pa, 0x4000);
+    if (ret != 0) {
+        printf("[-] Failed to map result buffer: ret=%d\n", ret);
+        return;
+    }
+
+    /* Compute kernel DMAP VA for this physical address */
+    uint64_t result_kva = g_dmap_base + (uint64_t)result_pa;
+
+    printf("[+] Result buffer: PA=0x%lx VA=%p kernel_DMAP=0x%lx (size=0x%lx)\n",
+           (unsigned long)result_pa, result_va,
+           (unsigned long)result_kva, (unsigned long)result_sz);
+
+    /* Pre-zero the buffer so we can detect if kmod wrote to it */
+    memset(result_va, 0, result_sz);
+
+    /* Step 2: Patch .ko with shared buffer address and write to disk */
+    printf("\n[*] Step 2: Patching .ko with result buffer DMAP VA and writing to disk...\n");
+
+    /* Copy embedded .ko to mutable buffer */
+    size_t ko_sz = (size_t)KMOD_KO_SZ;
+    unsigned char *ko_buf = malloc(ko_sz);
+    if (!ko_buf) {
+        printf("[-] Failed to allocate .ko copy buffer\n");
+        return;
+    }
+    memcpy(ko_buf, KMOD_KO, ko_sz);
+
+    /* Scan for sentinel and replace with kernel DMAP VA.
+     * The sentinel may appear multiple times: once as an immediate
+     * operand in .text (comparison) and once in .data (the variable).
+     * We must patch only the .data copy (the last occurrence in the
+     * file, since .data comes after .text). */
+    int patched = 0;
+    size_t patch_offset = 0;
+    for (size_t i = 0; i + 8 <= ko_sz; i++) {
+        uint64_t val;
+        memcpy(&val, ko_buf + i, sizeof(val));
+        if (val == RESULT_DEST_SENTINEL) {
+            patch_offset = i;
+            patched++;
+        }
+    }
+    if (patched > 0) {
+        memcpy(ko_buf + patch_offset, &result_kva, sizeof(result_kva));
+        printf("[+] Patched sentinel at .ko offset 0x%zx -> 0x%lx (%d occurrence%s found)\n",
+               patch_offset, (unsigned long)result_kva,
+               patched, patched > 1 ? "s" : "");
+    }
+
+    if (!patched) {
+        printf("[-] WARNING: Sentinel 0x%llx not found in .ko!\n",
+               (unsigned long long)RESULT_DEST_SENTINEL);
+        printf("    The kmod will fall back to BSS buffer (requires kldsym).\n");
+    }
+
+    /* Write patched .ko to disk */
     FILE *ko = fopen("/data/etaHEN/hv_kmod.ko", "wb");
     if (!ko) {
         printf("[-] Failed to create /data/etaHEN/hv_kmod.ko: %s\n", strerror(errno));
+        free(ko_buf);
         return;
     }
 
-    size_t written = fwrite(KMOD_KO, 1, (size_t)KMOD_KO_SZ, ko);
+    size_t written = fwrite(ko_buf, 1, ko_sz, ko);
     fclose(ko);
+    free(ko_buf);
 
-    if (written != (size_t)KMOD_KO_SZ) {
-        printf("[-] Short write: %zu/%lu bytes\n", written, KMOD_KO_SZ);
+    if (written != ko_sz) {
+        printf("[-] Short write: %zu/%zu bytes\n", written, ko_sz);
         unlink("/data/etaHEN/hv_kmod.ko");
         return;
     }
-    printf("[+] Wrote hv_kmod.ko (%zu bytes)\n", written);
+    printf("[+] Wrote patched hv_kmod.ko (%zu bytes)\n", written);
 
-    /* Step 2: Load the kernel module via kldload */
-    printf("\n[*] Step 2: Loading kernel module via kldload(2)...\n");
+    /* Step 3: Load the kernel module via kldload */
+    printf("\n[*] Step 3: Loading kernel module via kldload(2)...\n");
     printf("    The kernel linker will:\n");
     printf("    - Parse the ET_REL ELF\n");
     printf("    - Allocate kernel memory\n");
     printf("    - Process relocations\n");
-    printf("    - Call SYSINIT (our init runs MSR/VMMCALL campaigns)\n");
+    printf("    - Call SYSINIT (our init writes results to shared DMAP buffer)\n");
 
     int kid = syscall(SYS_kldload, "/data/etaHEN/hv_kmod.ko");
     if (kid < 0) {
@@ -1027,90 +1153,50 @@ static void campaign_kmod_kldload(void) {
     printf("[+] Module loaded! kid=%d\n", kid);
     printf("    SYSINIT has already executed - campaigns complete.\n");
 
-    /* Step 3: Find hv_results symbol via kldsym */
-    printf("\n[*] Step 3: Looking up hv_results symbol via kldsym...\n");
+    /* Step 4: Read results from shared memory */
+    printf("\n[*] Step 4: Reading results from shared memory buffer...\n");
 
-    struct kld_sym_lookup sym;
-    memset(&sym, 0, sizeof(sym));
-    sym.version = sizeof(struct kld_sym_lookup);
-    sym.symname = "hv_results";
+    /* The kmod wrote directly to our shared buffer via DMAP */
+    struct kmod_result_buf *results = (struct kmod_result_buf *)result_va;
 
-    int ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
-    if (ret < 0) {
-        int err = errno;
-        printf("[-] kldsym failed: ret=%d, errno=%d (%s)\n", ret, err, strerror(err));
-        printf("    Symbol 'hv_results' not found in module.\n");
-        printf("    Attempting to unload module...\n");
-        syscall(SYS_kldunload, kid);
-        unlink("/data/etaHEN/hv_kmod.ko");
-        return;
-    }
-    printf("[+] hv_results at kernel VA 0x%lx (size=%lu)\n",
-           (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
+    if (results->magic != KMOD_MAGIC) {
+        printf("[-] Shared buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
+               (unsigned long long)KMOD_MAGIC, (unsigned long long)results->magic);
+        printf("    Possible causes:\n");
+        printf("    - SYSINIT dispatch didn't call hv_init\n");
+        printf("    - Sentinel patching didn't work (DMAP VA incorrect)\n");
 
-    /* Step 4: Read results via kernel_copyout */
-    printf("\n[*] Step 4: Reading results from kernel memory...\n");
+        /* Diagnostic: try kldsym as a fallback to check if it works */
+        printf("\n[*] Diagnostic: trying kldsym fallback...\n");
+        struct kld_sym_lookup sym;
+        memset(&sym, 0, sizeof(sym));
+        sym.version = sizeof(struct kld_sym_lookup);
+        sym.symname = "hv_results";
 
-    struct kmod_result_buf results;
-    kernel_copyout(sym.symvalue, &results, sizeof(results));
-
-    if (results.magic != KMOD_MAGIC) {
-        printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
-               (unsigned long long)KMOD_MAGIC, (unsigned long long)results.magic);
-        printf("    The module init may not have run or SYSINIT dispatch failed.\n");
-    } else {
-        printf("[+] Kmod status: %s\n",
-               results.status == KMOD_STATUS_DONE ? "COMPLETE" :
-               results.status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
-               "UNKNOWN");
-
-        /* Display MSR results */
-        if (results.num_msr_results > 0) {
-            printf("\n[+] MSR/CR Reconnaissance Results (%u entries):\n",
-                   results.num_msr_results);
-            for (uint32_t i = 0; i < results.num_msr_results; i++) {
-                uint32_t msr_id = results.msr_results[i].msr_id;
-                uint64_t value  = results.msr_results[i].value;
-                const char *name = "";
-
-                switch (msr_id) {
-                    case 0xC0000080: name = "EFER"; break;
-                    case 0xC0000081: name = "STAR"; break;
-                    case 0xC0000082: name = "LSTAR"; break;
-                    case 0xC0000084: name = "SFMASK"; break;
-                    case 0xC0000100: name = "FS_BASE"; break;
-                    case 0xC0000101: name = "GS_BASE"; break;
-                    case 0xC0000102: name = "KGS_BASE"; break;
-                    case 0xC0000103: name = "TSC_AUX"; break;
-                    case 0xFFFF0000: name = "CR0"; break;
-                    case 0xFFFF0003: name = "CR3"; break;
-                    case 0xFFFF0004: name = "CR4"; break;
-                    default: name = "???"; break;
+        ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
+        if (ret < 0) {
+            printf("    kldsym failed: errno=%d (%s)\n", errno, strerror(errno));
+        } else {
+            printf("    kldsym returned: VA=0x%lx size=%lu\n",
+                   (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
+            if (sym.symvalue != 0 && sym.symsize != 0) {
+                printf("    Attempting kernel_copyout from kldsym address...\n");
+                struct kmod_result_buf fallback;
+                kernel_copyout(sym.symvalue, &fallback, sizeof(fallback));
+                if (fallback.magic == KMOD_MAGIC) {
+                    printf("[+] kldsym fallback succeeded!\n");
+                    display_kmod_results(&fallback);
+                } else {
+                    printf("    kldsym address also has bad magic: 0x%llx\n",
+                           (unsigned long long)fallback.magic);
                 }
-                printf("    %-10s (0x%08x) = 0x%016lx\n", name, msr_id, value);
+            } else {
+                printf("    kldsym returned zero address (known PS5 issue).\n");
             }
         }
-
-        /* Display VMMCALL results */
-        if (results.num_results > 0) {
-            printf("\n[+] VMMCALL Fuzzing Results (%u entries):\n", results.num_results);
-            printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
-                   "RAX_in", "RAX_out", "RCX_out", "RDX_out", "Campaign", "OK");
-            printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
-                   "------", "------------------", "------------------",
-                   "------------------", "----------", "----");
-
-            for (uint32_t i = 0; i < results.num_results; i++) {
-                struct vmmcall_result *r = &results.results[i];
-                printf("    0x%04lx 0x%016lx 0x%016lx 0x%016lx  camp=%u     %s\n",
-                       r->rax_in, r->rax_out, r->rcx_out, r->rdx_out,
-                       r->campaign_id, r->survived ? "YES" : "NO");
-            }
-        } else if (results.status == KMOD_STATUS_RUNNING) {
-            printf("\n[-] No VMMCALL results. Module init appears to have crashed during:\n");
-            printf("    Campaign %u, probe %u\n",
-                   results.current_campaign, results.current_probe);
-        }
+    } else {
+        printf("[+] Shared memory result buffer valid!\n");
+        display_kmod_results(results);
     }
 
     /* Step 5: Unload the module */
