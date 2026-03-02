@@ -1321,8 +1321,16 @@ static void campaign_kmod_vmmcall(void) {
 /* ─── Main entry point ─── */
 
 int main(void) {
-    freopen("/data/etaHEN/hv_research.log", "w", stdout);
-    freopen("/data/etaHEN/hv_research.log", "a", stderr);
+    notify("[HV Research] main() entered");
+
+    FILE *f = fopen("/data/etaHEN/hv_research.log", "w");
+    if (f) {
+        fclose(f);
+        freopen("/data/etaHEN/hv_research.log", "w", stdout);
+        freopen("/data/etaHEN/hv_research.log", "a", stderr);
+    } else {
+        notify("[HV Research] ERROR: fopen log failed!");
+    }
 
     printf("\n");
     printf("==============================================\n");
