@@ -278,11 +278,23 @@ static int discover_dmap_base(void) {
 static int init_fw_offsets(void) {
     g_fw_version = kernel_get_fw_version() & 0xFFFF0000;
     g_kdata_base = KERNEL_ADDRESS_DATA_BASE;
-    g_ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+
+    /*
+     * Kernel text base: not exported by the ps5-payload-sdk.
+     * Derive from data base using known offsets per FW generation.
+     * (Ref: Byepervisor kdlsym.cpp - FW 1.x: 0x1B40000, FW 2.x: 0x1B80000)
+     * For FW 3.x+ we use a conservative 0x2000000 (32MB) estimate.
+     * This is only used for sysent entry validation (sanity check).
+     */
+    switch (g_fw_version >> 24) {
+    case 1:  g_ktext_base = g_kdata_base - 0x1B40000; break;
+    case 2:  g_ktext_base = g_kdata_base - 0x1B80000; break;
+    default: g_ktext_base = g_kdata_base - 0x2000000; break;
+    }
 
     printf("[*] FW version: 0x%lx\n", g_fw_version);
     printf("[*] Kernel data base: 0x%lx\n", g_kdata_base);
-    printf("[*] Kernel text base: 0x%lx\n", g_ktext_base);
+    printf("[*] Kernel text base: 0x%lx (estimated)\n", g_ktext_base);
 
     /*
      * SBL mailbox offsets (relative to kernel data base).
@@ -425,16 +437,74 @@ static int discover_sbl_offsets(void) {
  * This walks the 4-level page tables through DMAP.
  */
 static uint64_t kva_to_pa(uint64_t va) {
-    /* We need the kernel's PML4 (CR3). We can get it from the kernel pmap. */
-    /* For now, use a simplified approach via DMAP scanning */
-
     /* If the address is already in DMAP range, just subtract DMAP base */
     if (g_dmap_base && va >= g_dmap_base && va < g_dmap_base + 0x800000000ULL) {
         return va - g_dmap_base;
     }
 
-    /* Otherwise we need full page table walk - not implemented yet */
-    printf("[!] kva_to_pa: address 0x%lx is not in DMAP range\n", va);
+    /* Full 4-level page table walk through DMAP */
+    if (!g_cr3_phys || !g_dmap_base) {
+        printf("[!] kva_to_pa: no CR3/DMAP for VA 0x%lx\n", va);
+        return 0;
+    }
+
+    uint64_t pml4_pa = g_cr3_phys & ~0xFFFULL;
+
+    /* PML4 */
+    uint64_t pml4e_idx = (va >> 39) & 0x1FF;
+    uint64_t pml4e;
+    kernel_copyout(g_dmap_base + pml4_pa + pml4e_idx * 8, &pml4e, 8);
+    if (!(pml4e & 1)) return 0;
+
+    /* PDPT */
+    uint64_t pdpt_pa = pml4e & 0x000FFFFFFFFFF000ULL;
+    uint64_t pdpte_idx = (va >> 30) & 0x1FF;
+    uint64_t pdpte;
+    kernel_copyout(g_dmap_base + pdpt_pa + pdpte_idx * 8, &pdpte, 8);
+    if (!(pdpte & 1)) return 0;
+    if (pdpte & (1 << 7))  /* 1GB page */
+        return (pdpte & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFFULL);
+
+    /* PD */
+    uint64_t pd_pa = pdpte & 0x000FFFFFFFFFF000ULL;
+    uint64_t pde_idx = (va >> 21) & 0x1FF;
+    uint64_t pde;
+    kernel_copyout(g_dmap_base + pd_pa + pde_idx * 8, &pde, 8);
+    if (!(pde & 1)) return 0;
+    if (pde & (1 << 7))  /* 2MB page */
+        return (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL);
+
+    /* PT */
+    uint64_t pt_pa = pde & 0x000FFFFFFFFFF000ULL;
+    uint64_t pte_idx = (va >> 12) & 0x1FF;
+    uint64_t pte;
+    kernel_copyout(g_dmap_base + pt_pa + pte_idx * 8, &pte, 8);
+    if (!(pte & 1)) return 0;
+
+    return (pte & 0x000FFFFFFFFFF000ULL) | (va & 0xFFF);
+}
+
+/*
+ * Write to a kernel virtual address through the DMAP.
+ * This bypasses virtual memory page protections (e.g., read-only .rodata)
+ * by resolving the VA to a physical address and writing through the
+ * DMAP's always-RW mapping of physical memory.
+ *
+ * This is the same technique Byepervisor uses (via mirror pages) to
+ * modify the sysent table, which lives in read-only kernel memory.
+ */
+static int kernel_write_via_dmap(uint64_t kva, const void *data, size_t len) {
+    uint64_t pa = kva_to_pa(kva);
+    if (!pa) {
+        printf("[-] kernel_write_via_dmap: failed to resolve VA 0x%lx to PA\n", kva);
+        return -1;
+    }
+
+    uint64_t dmap_va = g_dmap_base + pa;
+    printf("[*] DMAP write: VA 0x%lx -> PA 0x%lx -> DMAP 0x%lx (%lu bytes)\n",
+           kva, pa, dmap_va, len);
+
+    kernel_copyin(data, dmap_va, len);
     return 0;
 }
 
@@ -1121,7 +1191,7 @@ static void campaign_kernel_recon(void) {
     printf("=============================================\n\n");
 
     /* Print kernel addresses */
-    printf("[*] KERNEL_ADDRESS_TEXT_BASE  = 0x%lx\n", KERNEL_ADDRESS_TEXT_BASE);
+    printf("[*] Kernel text base (est.)   = 0x%lx\n", g_ktext_base);
     printf("[*] KERNEL_ADDRESS_DATA_BASE = 0x%lx\n", KERNEL_ADDRESS_DATA_BASE);
     printf("[*] KERNEL_ADDRESS_ALLPROC   = 0x%lx\n", KERNEL_ADDRESS_ALLPROC);
     printf("[*] DMAP base                = 0x%lx\n", g_dmap_base);
@@ -1376,6 +1446,10 @@ static int clear_nx_for_range(uint64_t va, size_t len) {
  * Uses the dynamically discovered g_sysent_table to point
  * syscall N to the kmod's entry point.
  */
+/* Saved original sysent entry for restoration */
+static struct ps5_sysent g_orig_sysent;
+static int g_orig_sysent_saved = 0;
+
 static int install_kmod_syscall(uint64_t kmod_exec_va) {
     if (!g_sysent_table) {
         printf("[-] Sysent table not discovered\n");
@@ -1388,12 +1462,19 @@ static int install_kmod_syscall(uint64_t kmod_exec_va) {
     uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
     /* Save original sysent entry for restoration */
-    struct ps5_sysent orig_entry;
-    kernel_copyout(entry_addr, &orig_entry, sizeof(orig_entry));
+    kernel_copyout(entry_addr, &g_orig_sysent, sizeof(g_orig_sysent));
+    g_orig_sysent_saved = 1;
     printf("[*] Original sysent[%d]: sy_call=0x%lx n_arg=%u flags=0x%x\n",
-           KMOD_SYSCALL_NUM, orig_entry.sy_call, orig_entry.n_arg, orig_entry.sy_flags);
+           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call, g_orig_sysent.n_arg,
+           g_orig_sysent.sy_flags);
 
-    /* Install our kmod as the syscall handler */
+    /*
+     * Write the new sysent entry through the DMAP.
+     * The sysent table is in read-only kernel memory (.rodata / const),
+     * so direct kernel_copyin would trigger a page fault and panic.
+     * Writing through DMAP bypasses virtual page protections because
+     * the DMAP maps all physical memory as RW.
+     */
     struct ps5_sysent new_entry;
     memset(&new_entry, 0, sizeof(new_entry));
     new_entry.n_arg = 3;               /* td is implicit; we pass 3 user args */
@@ -1401,8 +1482,21 @@ static int install_kmod_syscall(uint64_t kmod_exec_va) {
     new_entry.sy_flags = 0;
     new_entry.sy_thrcnt = 1;            /* SY_THR_STATIC */
 
-    kernel_copyin(&new_entry, entry_addr, sizeof(new_entry));
-    printf("[+] Installed kmod at syscall %d (sy_call=0x%lx)\n",
+    if (kernel_write_via_dmap(entry_addr, &new_entry, sizeof(new_entry)) != 0) {
+        printf("[-] Failed to write sysent via DMAP\n");
+        return -1;
+    }
+
+    /* Verify the write took effect */
+    struct ps5_sysent verify;
+    kernel_copyout(entry_addr, &verify, sizeof(verify));
+    if (verify.sy_call != kmod_exec_va) {
+        printf("[-] Sysent write verification failed: sy_call=0x%lx expected 0x%lx\n",
+               verify.sy_call, kmod_exec_va);
+        return -1;
+    }
+
+    printf("[+] Installed kmod at syscall %d (sy_call=0x%lx, verified)\n",
            KMOD_SYSCALL_NUM, kmod_exec_va);
 
     return 0;
@@ -1412,16 +1506,17 @@ static int install_kmod_syscall(uint64_t kmod_exec_va) {
  * Restore the original sysent entry after kmod execution.
  */
 static void restore_syscall(void) {
-    if (!g_sysent_table) return;
+    if (!g_sysent_table || !g_orig_sysent_saved) return;
 
     uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
-    /* Set sy_call to 0 (nosys) and clear thrcnt */
-    struct ps5_sysent nosys_entry;
-    memset(&nosys_entry, 0, sizeof(nosys_entry));
-    nosys_entry.sy_thrcnt = 1;
-    kernel_copyin(&nosys_entry, entry_addr, sizeof(nosys_entry));
-    printf("[+] Restored syscall %d to nosys\n", KMOD_SYSCALL_NUM);
+    /* Restore the original entry through DMAP */
+    if (kernel_write_via_dmap(entry_addr, &g_orig_sysent, sizeof(g_orig_sysent)) != 0) {
+        printf("[-] WARNING: Failed to restore syscall %d via DMAP\n", KMOD_SYSCALL_NUM);
+        return;
+    }
+    printf("[+] Restored syscall %d to original (sy_call=0x%lx)\n",
+           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call);
 }
 
 /*
