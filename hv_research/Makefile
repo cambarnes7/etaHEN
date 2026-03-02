@@ -21,13 +21,26 @@ ELF := hv_research.elf
 
 CFLAGS := -Wall -Werror -Wno-unused-function -O1
 
-all: $(ELF)
+# Build the kernel module first, then the main ELF (which embeds it)
+all: kmod $(ELF)
 
-$(ELF): main.c
-	$(CC) $(CFLAGS) -o $@ $^
+# Build the kernel module (flat binary)
+kmod:
+	$(MAKE) -C kmod
+
+# Build the main payload ELF (embeds kmod/hv_kmod.bin via .incbin)
+$(ELF): main.c kmod/hv_kmod.bin
+	$(CC) $(CFLAGS) -o $@ main.c
+
+# Convenience target: ensure kmod binary exists
+kmod/hv_kmod.bin: kmod
+	@true
 
 clean:
 	rm -f $(ELF)
+	$(MAKE) -C kmod clean
 
 test: $(ELF)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
+
+.PHONY: all kmod clean test

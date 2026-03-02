@@ -85,6 +85,82 @@ struct sbl_msg_header {
 #define MAILBOX_SLOT_SIZE 0x800
 #define MAILBOX_NUM       0x0E  /* We use slot 14 like etaHEN */
 
+/* ─── Embedded kernel module binary ─── */
+
+__asm__ (
+    ".section .rodata\n"
+    ".global KMOD_BIN\n"
+    ".type KMOD_BIN, @object\n"
+    ".align 16\n"
+    "KMOD_BIN:\n"
+    ".incbin \"kmod/hv_kmod.bin\"\n"
+    "KMOD_BIN_END:\n"
+    ".global KMOD_BIN_SZ\n"
+    ".type KMOD_BIN_SZ, @object\n"
+    ".align 16\n"
+    "KMOD_BIN_SZ:\n"
+    ".quad KMOD_BIN_END - KMOD_BIN\n"
+);
+
+extern const unsigned char KMOD_BIN[];
+extern const uint64_t KMOD_BIN_SZ;
+
+/* ─── Kmod shared data structures (must match kmod/hv_kmod.c) ─── */
+
+#define KMOD_MAGIC          0xCAFEBABEDEAD1337ULL
+#define KMOD_MAX_RESULTS    64
+#define KMOD_STATUS_INIT    0
+#define KMOD_STATUS_RUNNING 1
+#define KMOD_STATUS_DONE    2
+
+#define KMOD_FLAG_VMMCALL_ENUM     (1 << 0)
+#define KMOD_FLAG_VMMCALL_IOMMU    (1 << 1)
+#define KMOD_FLAG_VMCB_PROBE       (1 << 2)
+#define KMOD_FLAG_MSR_RECON        (1 << 3)
+#define KMOD_FLAG_ALL              0xFFFFFFFF
+
+struct vmmcall_result {
+    uint64_t rax_in, rcx_in, rdx_in, rdi_in, rsi_in, r8_in;
+    uint64_t rax_out, rcx_out, rdx_out, rdi_out, rsi_out, r8_out;
+    uint32_t survived;
+    uint32_t campaign_id;
+};
+
+struct kmod_result_buf {
+    volatile uint64_t magic;
+    volatile uint32_t status;
+    volatile uint32_t current_campaign;
+    volatile uint32_t current_probe;
+    volatile uint32_t num_results;
+    volatile uint32_t num_msr_results;
+    volatile uint32_t pad;
+    struct {
+        uint32_t msr_id;
+        uint32_t valid;
+        uint64_t value;
+    } msr_results[32];
+    struct vmmcall_result results[KMOD_MAX_RESULTS];
+};
+
+/* Sysent entry layout (from Byepervisor) */
+struct ps5_sysent {
+    uint32_t n_arg;             /* 0x00 */
+    uint32_t pad_04h;           /* 0x04 */
+    uint64_t sy_call;           /* 0x08 */
+    uint64_t sy_auevent;        /* 0x10 */
+    uint64_t sy_systrace_args;  /* 0x18 */
+    uint32_t sy_entry;          /* 0x20 */
+    uint32_t sy_return;         /* 0x24 */
+    uint32_t sy_flags;          /* 0x28 */
+    uint32_t sy_thrcnt;         /* 0x2C */
+}; /* 0x30 bytes */
+
+/* Syscall number to hijack (unused high number) */
+#define KMOD_SYSCALL_NUM 510
+
+/* FW 4.03 sysentvec offset (PS5/Prospero sysentvec) */
+#define FW403_SYSENTVEC_OFFSET  0xd11bb8
+
 /* ─── Global state ─── */
 
 static uint64_t g_dmap_base = 0;
@@ -92,6 +168,7 @@ static uint64_t g_kdata_base = 0;
 static uint64_t g_ktext_base = 0;
 static uint64_t g_fw_version = 0;
 static uint64_t g_mmio_vaddr = 0;
+static uint64_t g_cr3_phys = 0;   /* Kernel PML4 physical address */
 
 /* Physical address of our message buffer */
 static off_t    g_msg_phys = 0;
@@ -164,6 +241,7 @@ static int discover_dmap_base(void) {
                 /* This should give us a PML4 entry, not necessarily pm_pml4 itself */
                 /* But if the read doesn't crash, the DMAP base is likely valid */
                 g_dmap_base = candidate_dmap;
+                g_cr3_phys = candidate_cr3;
                 printf("[+] DMAP base discovered: 0x%lx (cr3_offset=0x%x, cr3=0x%lx)\n",
                        g_dmap_base, cr3_offsets[i], candidate_cr3);
                 return 0;
@@ -877,6 +955,369 @@ static void campaign_iommu_recon(void) {
     }
 }
 
+/* ─── Kernel Module Loader ─── */
+
+/*
+ * Clear NX bit in guest page table entries for a DMAP address range.
+ * This makes the pages executable, enabling kernel code execution.
+ * Works on FW < 6.50 because GMET is not enforced.
+ *
+ * x86-64 page table walk:
+ *   PML4[bits 47:39] -> PDPT[bits 38:30] -> PD[bits 29:21] -> PT[bits 20:12]
+ *   NX bit = bit 63 of each entry
+ *   PS bit = bit 7 (indicates 2MB page in PDE, 1GB page in PDPTE)
+ */
+static int clear_nx_for_range(uint64_t va, size_t len) {
+    if (!g_cr3_phys || !g_dmap_base) {
+        printf("[-] Cannot clear NX: no CR3/DMAP\n");
+        return -1;
+    }
+
+    uint64_t pml4_pa = g_cr3_phys & ~0xFFFULL;
+    uint64_t end_va = va + len;
+
+    printf("[*] Clearing NX for VA range 0x%lx - 0x%lx\n", va, end_va);
+
+    /* Process each 2MB-aligned region */
+    for (uint64_t addr = va & ~0x1FFFFFULL; addr < end_va; addr += 0x200000) {
+        uint64_t pml4e_idx = (addr >> 39) & 0x1FF;
+        uint64_t pdpte_idx = (addr >> 30) & 0x1FF;
+        uint64_t pde_idx   = (addr >> 21) & 0x1FF;
+
+        /* Read PML4 entry */
+        uint64_t pml4e;
+        uint64_t pml4e_addr = g_dmap_base + pml4_pa + pml4e_idx * 8;
+        kernel_copyout(pml4e_addr, &pml4e, 8);
+
+        if (!(pml4e & 1)) {
+            printf("[-] PML4E[%lu] not present for VA 0x%lx\n", pml4e_idx, addr);
+            continue;
+        }
+
+        /* Clear NX on PML4E */
+        if (pml4e & (1ULL << 63)) {
+            pml4e &= ~(1ULL << 63);
+            kernel_copyin(&pml4e, pml4e_addr, 8);
+        }
+
+        /* Read PDPT entry */
+        uint64_t pdpt_pa = pml4e & 0x000FFFFFFFFFF000ULL;
+        uint64_t pdpte;
+        uint64_t pdpte_addr = g_dmap_base + pdpt_pa + pdpte_idx * 8;
+        kernel_copyout(pdpte_addr, &pdpte, 8);
+
+        if (!(pdpte & 1)) {
+            printf("[-] PDPTE[%lu] not present for VA 0x%lx\n", pdpte_idx, addr);
+            continue;
+        }
+
+        /* Clear NX on PDPTE */
+        if (pdpte & (1ULL << 63)) {
+            pdpte &= ~(1ULL << 63);
+            kernel_copyin(&pdpte, pdpte_addr, 8);
+        }
+
+        /* Check for 1GB page */
+        if (pdpte & (1 << 7)) {
+            printf("[+] 1GB page at PDPTE[%lu], NX cleared\n", pdpte_idx);
+            continue;
+        }
+
+        /* Read PD entry */
+        uint64_t pd_pa = pdpte & 0x000FFFFFFFFFF000ULL;
+        uint64_t pde;
+        uint64_t pde_addr = g_dmap_base + pd_pa + pde_idx * 8;
+        kernel_copyout(pde_addr, &pde, 8);
+
+        if (!(pde & 1)) {
+            printf("[-] PDE[%lu] not present for VA 0x%lx\n", pde_idx, addr);
+            continue;
+        }
+
+        /* Clear NX on PDE */
+        if (pde & (1ULL << 63)) {
+            pde &= ~(1ULL << 63);
+            kernel_copyin(&pde, pde_addr, 8);
+            printf("[+] Cleared NX on PDE[%lu] for VA 0x%lx (2MB page=%d)\n",
+                   pde_idx, addr, !!(pde & (1 << 7)));
+        }
+
+        /* If not a 2MB page, walk into 4K page table */
+        if (!(pde & (1 << 7))) {
+            uint64_t pt_pa = pde & 0x000FFFFFFFFFF000ULL;
+            uint64_t pte_start = (addr >> 12) & 0x1FF;
+            uint64_t pte_end = pte_start + ((0x200000 - 1) >> 12);
+            if (pte_end > 511) pte_end = 511;
+
+            for (uint64_t pi = pte_start; pi <= pte_end; pi++) {
+                uint64_t pte;
+                uint64_t pte_addr = g_dmap_base + pt_pa + pi * 8;
+                kernel_copyout(pte_addr, &pte, 8);
+                if ((pte & 1) && (pte & (1ULL << 63))) {
+                    pte &= ~(1ULL << 63);
+                    kernel_copyin(&pte, pte_addr, 8);
+                }
+            }
+            printf("[+] Cleared NX on 4K PTEs for VA 0x%lx range\n", addr);
+        }
+    }
+
+    /* Flush TLB by reloading CR3 - we do this indirectly */
+    printf("[+] NX bits cleared. TLB will flush on next context switch.\n");
+    return 0;
+}
+
+/*
+ * Install our kmod as a custom syscall handler.
+ * Modifies the PPR (Prospero) sysent table to point syscall N
+ * to the kmod's entry point in DMAP.
+ */
+static int install_kmod_syscall(uint64_t kmod_dmap_va) {
+    /* Read the sysent table address from the sysentvec structure */
+    uint64_t sysentvec_addr = g_kdata_base + FW403_SYSENTVEC_OFFSET;
+    uint64_t sysent_table;
+
+    /* sv_table is at offset 8 in struct sysentvec (after sv_size int + padding) */
+    kernel_copyout(sysentvec_addr + 8, &sysent_table, 8);
+    printf("[*] PPR sysent table at: 0x%lx\n", sysent_table);
+
+    if (sysent_table < g_kdata_base || sysent_table > g_kdata_base + 0x10000000ULL) {
+        printf("[-] Sysent table address looks invalid\n");
+        return -1;
+    }
+
+    /* Read the sv_size to verify */
+    uint32_t sv_size;
+    kernel_copyout(sysentvec_addr, &sv_size, 4);
+    printf("[*] PPR sysentvec sv_size = %u\n", sv_size);
+
+    if (KMOD_SYSCALL_NUM >= (int)sv_size) {
+        printf("[-] Syscall %d >= sv_size %u, cannot install\n", KMOD_SYSCALL_NUM, sv_size);
+        return -1;
+    }
+
+    /* Calculate the sysent entry address for our syscall */
+    uint64_t entry_addr = sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
+
+    /* Save original sysent entry for restoration */
+    struct ps5_sysent orig_entry;
+    kernel_copyout(entry_addr, &orig_entry, sizeof(orig_entry));
+    printf("[*] Original sysent[%d]: sy_call=0x%lx n_arg=%u flags=0x%x\n",
+           KMOD_SYSCALL_NUM, orig_entry.sy_call, orig_entry.n_arg, orig_entry.sy_flags);
+
+    /* Install our kmod as the syscall handler */
+    struct ps5_sysent new_entry;
+    memset(&new_entry, 0, sizeof(new_entry));
+    new_entry.n_arg = 3;               /* td is implicit; we pass 3 user args */
+    new_entry.sy_call = kmod_dmap_va;   /* Point directly to our kmod code */
+    new_entry.sy_flags = 0;
+    new_entry.sy_thrcnt = 1;            /* SY_THR_STATIC */
+
+    kernel_copyin(&new_entry, entry_addr, sizeof(new_entry));
+    printf("[+] Installed kmod at syscall %d (sy_call=0x%lx)\n",
+           KMOD_SYSCALL_NUM, kmod_dmap_va);
+
+    return 0;
+}
+
+/*
+ * Restore the original sysent entry after kmod execution.
+ */
+static void restore_syscall(void) {
+    uint64_t sysentvec_addr = g_kdata_base + FW403_SYSENTVEC_OFFSET;
+    uint64_t sysent_table;
+    kernel_copyout(sysentvec_addr + 8, &sysent_table, 8);
+
+    uint64_t entry_addr = sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
+
+    /* Set sy_call to 0 (nosys) and clear thrcnt */
+    struct ps5_sysent nosys_entry;
+    memset(&nosys_entry, 0, sizeof(nosys_entry));
+    nosys_entry.sy_thrcnt = 1;
+    kernel_copyin(&nosys_entry, entry_addr, sizeof(nosys_entry));
+    printf("[+] Restored syscall %d to nosys\n", KMOD_SYSCALL_NUM);
+}
+
+/*
+ * Campaign 7: Kernel Module VMMCALL Fuzzing
+ *
+ * This is the core HV research campaign. It:
+ * 1. Allocates physical memory for the kmod code + shared result buffer
+ * 2. Copies the embedded kmod binary to the physical memory
+ * 3. Computes the DMAP virtual address for the kmod
+ * 4. Clears NX bits in guest page tables (works because GMET is off on FW 4.03)
+ * 5. Installs the kmod as a custom syscall handler
+ * 6. Executes the syscall, which runs the kmod in ring 0
+ * 7. Reads results from the shared buffer
+ */
+static void campaign_kmod_vmmcall(void) {
+    printf("\n=============================================\n");
+    printf("  Campaign 7: Kernel Module VMMCALL Fuzzing\n");
+    printf("=============================================\n\n");
+
+    if (!g_dmap_base || !g_cr3_phys) {
+        printf("[-] DMAP/CR3 not available, cannot load kmod\n");
+        return;
+    }
+
+    printf("[*] Kmod binary size: %lu bytes\n", KMOD_BIN_SZ);
+
+    /* Allocate physical memory for:
+     * - kmod code (page-aligned, starting at offset 0)
+     * - result buffer (starting at next page after kmod)
+     */
+    size_t kmod_pages = (KMOD_BIN_SZ + 0x3FFF) & ~0x3FFFULL;  /* Round up to 16KB page */
+    size_t result_size = sizeof(struct kmod_result_buf);
+    size_t result_pages = (result_size + 0x3FFF) & ~0x3FFFULL;
+    size_t total_size = kmod_pages + result_pages;
+
+    /* Minimum allocation is 2 * 16KB pages */
+    if (total_size < 0x8000)
+        total_size = 0x8000;
+
+    off_t kmod_phys = 0;
+    int ret = sceKernelAllocateDirectMemory(
+        0, 0x180000000ULL,
+        total_size, 0x4000,
+        SCE_KERNEL_WB_ONION,
+        &kmod_phys
+    );
+    if (ret != 0) {
+        printf("[-] Failed to allocate kmod memory: 0x%x\n", ret);
+        return;
+    }
+
+    void *kmod_uva = NULL;
+    ret = sceKernelMapDirectMemory(
+        &kmod_uva, total_size,
+        SCE_KERNEL_PROT_CPU_RW,
+        0, kmod_phys, 0x4000
+    );
+    if (ret != 0) {
+        printf("[-] Failed to map kmod memory: 0x%x\n", ret);
+        return;
+    }
+
+    printf("[+] Kmod memory: PA=0x%lx VA=0x%lx size=0x%lx\n",
+           (uint64_t)kmod_phys, (uint64_t)kmod_uva, total_size);
+
+    /* Zero the entire allocation */
+    memset(kmod_uva, 0, total_size);
+
+    /* Copy kmod binary to the start of the allocation */
+    memcpy(kmod_uva, KMOD_BIN, KMOD_BIN_SZ);
+    printf("[+] Copied %lu bytes of kmod code\n", KMOD_BIN_SZ);
+
+    /* Result buffer is at the page after the kmod code */
+    off_t result_phys = kmod_phys + kmod_pages;
+    struct kmod_result_buf *result_uva =
+        (struct kmod_result_buf *)((uint8_t *)kmod_uva + kmod_pages);
+
+    printf("[+] Result buffer: PA=0x%lx userland_VA=0x%lx\n",
+           (uint64_t)result_phys, (uint64_t)result_uva);
+
+    /* Compute DMAP addresses */
+    uint64_t kmod_dmap_va = g_dmap_base + (uint64_t)kmod_phys;
+    printf("[+] Kmod DMAP VA: 0x%lx\n", kmod_dmap_va);
+
+    /* Step 1: Clear NX bits in guest page tables for the kmod pages */
+    printf("\n[*] Step 1: Clearing NX bits for kmod DMAP pages...\n");
+    if (clear_nx_for_range(kmod_dmap_va, kmod_pages) != 0) {
+        printf("[-] Failed to clear NX bits\n");
+        return;
+    }
+
+    /* Step 2: Install the kmod as a custom syscall */
+    printf("\n[*] Step 2: Installing kmod syscall...\n");
+    if (install_kmod_syscall(kmod_dmap_va) != 0) {
+        printf("[-] Failed to install kmod syscall\n");
+        return;
+    }
+
+    /* Step 3: Execute the kmod via syscall */
+    printf("\n[*] Step 3: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
+    printf("    This will execute VMMCALL instructions in kernel mode (ring 0).\n");
+    printf("    If the PS5 crashes, the HV rejected the VMMCALL.\n\n");
+
+    /* The syscall passes: dmap_base, result_pa, flags */
+    int kmod_ret = syscall(KMOD_SYSCALL_NUM,
+                           g_dmap_base,
+                           (uint64_t)result_phys,
+                           (uint64_t)(KMOD_FLAG_MSR_RECON | KMOD_FLAG_VMMCALL_ENUM));
+
+    printf("[*] Kmod syscall returned: %d\n", kmod_ret);
+
+    /* Step 4: Restore the original syscall */
+    printf("\n[*] Step 4: Restoring original syscall...\n");
+    restore_syscall();
+
+    /* Step 5: Read and display results */
+    printf("\n[*] Step 5: Reading results...\n");
+
+    if (result_uva->magic != KMOD_MAGIC) {
+        printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
+               (unsigned long long)KMOD_MAGIC, (unsigned long long)result_uva->magic);
+        printf("    The kmod may not have executed successfully.\n");
+        return;
+    }
+
+    printf("[+] Kmod status: %s\n",
+           result_uva->status == KMOD_STATUS_DONE ? "COMPLETE" :
+           result_uva->status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
+           "UNKNOWN");
+
+    /* Display MSR results */
+    if (result_uva->num_msr_results > 0) {
+        printf("\n[+] MSR/CR Reconnaissance Results (%u entries):\n", result_uva->num_msr_results);
+        for (uint32_t i = 0; i < result_uva->num_msr_results; i++) {
+            uint32_t msr_id = result_uva->msr_results[i].msr_id;
+            uint64_t value  = result_uva->msr_results[i].value;
+            const char *name = "";
+
+            switch (msr_id) {
+                case 0xC0000080: name = "EFER"; break;
+                case 0xC0000081: name = "STAR"; break;
+                case 0xC0000082: name = "LSTAR"; break;
+                case 0xC0000084: name = "SFMASK"; break;
+                case 0xC0000100: name = "FS_BASE"; break;
+                case 0xC0000101: name = "GS_BASE"; break;
+                case 0xC0000102: name = "KGS_BASE"; break;
+                case 0xC0000103: name = "TSC_AUX"; break;
+                case 0xFFFF0000: name = "CR0"; break;
+                case 0xFFFF0003: name = "CR3"; break;
+                case 0xFFFF0004: name = "CR4"; break;
+                default: name = "???"; break;
+            }
+            printf("    %-10s (0x%08x) = 0x%016lx\n", name, msr_id, value);
+        }
+    }
+
+    /* Display VMMCALL results */
+    if (result_uva->num_results > 0) {
+        printf("\n[+] VMMCALL Fuzzing Results (%u entries):\n", result_uva->num_results);
+        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+               "RAX_in", "RAX_out", "RCX_out", "RDX_out", "Campaign", "OK");
+        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+               "------", "------------------", "------------------",
+               "------------------", "----------", "----");
+
+        for (uint32_t i = 0; i < result_uva->num_results; i++) {
+            struct vmmcall_result *r = &result_uva->results[i];
+            printf("    0x%04lx 0x%016lx 0x%016lx 0x%016lx  camp=%u     %s\n",
+                   r->rax_in, r->rax_out, r->rcx_out, r->rdx_out,
+                   r->campaign_id, r->survived ? "YES" : "NO");
+        }
+    } else if (result_uva->status == KMOD_STATUS_RUNNING) {
+        printf("\n[-] No VMMCALL results. Kmod appears to have crashed during:\n");
+        printf("    Campaign %u, probe %u\n",
+               result_uva->current_campaign, result_uva->current_probe);
+        printf("    This means the HV killed the guest at VMMCALL with RAX=0x%x\n",
+               result_uva->current_probe);
+    }
+
+    notify("[HV Research] Kmod VMMCALL campaign complete!");
+}
+
 /* ─── Main entry point ─── */
 
 int main(void) {
@@ -915,6 +1356,13 @@ int main(void) {
 
     /* Run research campaigns */
     campaign_kernel_recon();
+
+    /* Campaign 7: Kernel module VMMCALL fuzzing (highest priority) */
+    if (g_dmap_base && g_cr3_phys) {
+        campaign_kmod_vmmcall();
+    } else {
+        printf("[!] Skipping kmod campaign (no DMAP/CR3)\n");
+    }
 
     if (g_dmap_base) {
         campaign_iommu_recon();
