@@ -490,8 +490,10 @@ bool load_plugin(const char *path)
       return false;
     }
 
+    // For raw ELF files, use the filename as the identifier instead of
+    // header->titleID which would read garbage from the ELF header bytes
     char pbuf[256];
-    snprintf(pbuf, sizeof(pbuf), "/system_tmp/%s.PID", header->titleID);
+    snprintf(pbuf, sizeof(pbuf), "/system_tmp/%s.PID", filename);
 
     pid_t pid = -1;
     int f = open(pbuf, O_RDONLY);
@@ -512,7 +514,7 @@ bool load_plugin(const char *path)
       char name[32];
       if (sceKernelGetProcessName(pid, name) < 0)
       {
-        etaHEN_log("Stale plugin PID file detected for %s, removing", header->titleID);
+        etaHEN_log("Stale plugin PID file detected for %s, removing", filename);
         unlink(pbuf);
         pid = -1;
       }
@@ -520,13 +522,13 @@ bool load_plugin(const char *path)
 
     if (pid > 0)
     {
-      etaHEN_log("killing pid %d (plugin: %s)", pid, header->titleID);
+      etaHEN_log("killing pid %d (plugin: %s)", pid, filename);
       kill(pid, SIGKILL);
       unlink(pbuf);
     }
 
     etaHEN_log("loading elf %s", filename);
-    pid = elfldr_spawn("/", STDOUT_FILENO, buf, header->titleID);
+    pid = elfldr_spawn("/", STDOUT_FILENO, buf, filename);
 
     if (pid >= 0)
       etaHEN_log("  Launched!");
