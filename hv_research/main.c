@@ -1321,11 +1321,15 @@ static void campaign_kmod_vmmcall(void) {
 /* ─── Main entry point ─── */
 
 int main(void) {
+    freopen("/data/etaHEN/hv_research.log", "w", stdout);
+    freopen("/data/etaHEN/hv_research.log", "a", stderr);
+
     printf("\n");
     printf("==============================================\n");
     printf("  PS5 Hypervisor Research Tool\n");
     printf("  Target: FW 4.03 (educational/personal use)\n");
     printf("==============================================\n\n");
+    fflush(stdout);
 
     notify("[HV Research] Starting...");
 
@@ -1379,7 +1383,10 @@ int main(void) {
     printf("  All campaigns complete.\n");
     printf("==============================================\n");
 
-    notify("[HV Research] Done! Check logs.");
+    fflush(stdout);
+    fflush(stderr);
+
+    notify("[HV Research] Done! Check /data/etaHEN/hv_research.log");
 
     return 0;
 }
