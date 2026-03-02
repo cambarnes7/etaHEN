@@ -6,7 +6,8 @@
  *
  * Build: produces hv_kmod.ko (ET_REL ELF, loaded by kernel linker)
  * Load:  syscall(304, "/data/etaHEN/hv_kmod.ko")
- * Read:  kldsym() to find hv_results, kernel_copyout() to read
+ * Read:  Results written to shared buffer via DMAP (address patched
+ *        into g_output_kva by userland before loading)
  * Unload: syscall(305, kid)
  *
  * The kernel linker handles all memory allocation, relocation, and
@@ -82,21 +83,22 @@ struct kmod_result_buf {
 };
 
 /* ============================================================
- * Global result buffer - exported for kldsym lookup
+ * Shared output KVA - patched by userland before loading
  *
- * Non-static so the kernel linker includes it in the symbol
- * table. Userland finds it via:
- *   kldsym(kid, KLDSYM_LOOKUP, { .symname = "hv_results" })
- * then reads it with kernel_copyout().
+ * Userland patches this sentinel with a DMAP-mapped kernel VA
+ * pointing to a physically-contiguous buffer. After running
+ * campaigns, the kmod copies hv_results to this address so
+ * userland can read results directly from its mapped buffer.
  *
- * IMPORTANT: Initialized with a placeholder value so the
- * compiler places it in .data instead of .bss. The FreeBSD 11
- * kernel linker has a bug where .bss symbols (high section
- * index) don't get relocated properly via kldsym because
- * st_shndx >= nprogtab. Placing in .data (lower section index)
- * fixes the kldsym address lookup.
+ * This bypasses kldsym/kldstat entirely - the PS5's kernel
+ * linker doesn't update st_value for KLD symbols and kldstat
+ * returns all zeros (likely Sony modifications).
  * ============================================================ */
 
+#define OUTPUT_KVA_SENTINEL 0xDEAD000000000000ULL
+volatile uint64_t g_output_kva = OUTPUT_KVA_SENTINEL;
+
+/* Local result buffer - filled by campaigns, then copied out */
 struct kmod_result_buf hv_results = { .magic = 0x1 };
 
 /* ============================================================
@@ -337,6 +339,19 @@ static void hv_init(const void *arg __attribute__((unused))) {
     memory_barrier();
     hv_results.status = KMOD_STATUS_DONE;
     memory_barrier();
+
+    /* Copy results to shared output buffer via DMAP.
+     * g_output_kva was patched by userland with a kernel VA
+     * (DMAP base + physical address) before the .ko was loaded.
+     * Writing here lets userland read results directly from its
+     * mapped buffer without needing kldsym or kernel_copyout. */
+    if (g_output_kva != OUTPUT_KVA_SENTINEL && g_output_kva != 0) {
+        volatile uint8_t *dst = (volatile uint8_t *)g_output_kva;
+        volatile uint8_t *src = (volatile uint8_t *)&hv_results;
+        for (unsigned int i = 0; i < sizeof(hv_results); i++)
+            dst[i] = src[i];
+        memory_barrier();
+    }
 }
 
 /* ============================================================
