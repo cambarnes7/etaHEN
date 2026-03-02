@@ -158,8 +158,8 @@ struct ps5_sysent {
 /* Syscall number to hijack (unused high number) */
 #define KMOD_SYSCALL_NUM 510
 
-/* FW 4.03 sysentvec offset (PS5/Prospero sysentvec) */
-#define FW403_SYSENTVEC_OFFSET  0xd11bb8
+/* Code cave offset from ktext (same on all FW versions, from Byepervisor) */
+#define CODE_CAVE_OFFSET  0x44000
 
 /* ─── Global state ─── */
 
@@ -169,6 +169,7 @@ static uint64_t g_ktext_base = 0;
 static uint64_t g_fw_version = 0;
 static uint64_t g_mmio_vaddr = 0;
 static uint64_t g_cr3_phys = 0;   /* Kernel PML4 physical address */
+static uint64_t g_sysent_table = 0;  /* PPR sysent table address (discovered) */
 
 /* Physical address of our message buffer */
 static off_t    g_msg_phys = 0;
@@ -559,6 +560,77 @@ static int init_sbl_direct(void) {
     printf("[+] SBL MMIO VA: 0x%lx\n", g_mmio_vaddr);
 
     return 0;
+}
+
+/*
+ * Discover the PPR sysent table by scanning the first process's
+ * proc structure for the p_sysent pointer (sysentvec), then
+ * reading sv_table from it.
+ *
+ * This is more robust than hardcoding offsets that vary per FW.
+ */
+static int discover_sysent_table(void) {
+    /* Read first proc from allproc linked list */
+    uint64_t first_proc;
+    kernel_copyout(KERNEL_ADDRESS_ALLPROC, &first_proc, 8);
+
+    if (first_proc < g_kdata_base || first_proc > g_kdata_base + 0x80000000ULL) {
+        printf("[-] allproc first entry looks invalid: 0x%lx\n", first_proc);
+        return -1;
+    }
+
+    printf("[*] Scanning proc 0x%lx for p_sysent...\n", first_proc);
+
+    /*
+     * Scan the proc structure for a pointer to the sysentvec.
+     * The sysentvec is in kernel rodata/data and has:
+     *   - sv_size (int32 at offset 0): 500-700 (number of syscalls)
+     *   - sv_table (ptr at offset 8): points to the sysent array
+     * The sysent array entries have sy_call (ptr at offset 8) in kernel text.
+     */
+    for (int off = 0x50; off < 0x600; off += 8) {
+        uint64_t candidate;
+        kernel_copyout(first_proc + off, &candidate, 8);
+
+        /* Must be a kernel address */
+        if (candidate < g_ktext_base || candidate > g_kdata_base + 0x80000000ULL)
+            continue;
+
+        /* Read sv_size (offset 0 in sysentvec) */
+        uint32_t sv_size;
+        kernel_copyout(candidate, &sv_size, 4);
+
+        /* PS5 Prospero has ~678 syscalls; PS4 compat has ~700 */
+        if (sv_size < 400 || sv_size > 800)
+            continue;
+
+        /* Read sv_table (offset 8 in sysentvec) */
+        uint64_t sv_table;
+        kernel_copyout(candidate + 8, &sv_table, 8);
+
+        /* sv_table must be in kernel text/rodata range */
+        if (sv_table < g_ktext_base || sv_table > g_kdata_base + 0x10000000ULL)
+            continue;
+
+        /* Validate: read sysent[0].sy_call (offset 8 in first entry)
+         * and sysent[1].sy_call - both should be in kernel text */
+        uint64_t sy_call_0, sy_call_1;
+        kernel_copyout(sv_table + 0x08, &sy_call_0, 8);
+        kernel_copyout(sv_table + 0x30 + 0x08, &sy_call_1, 8);
+
+        if (sy_call_0 >= g_ktext_base && sy_call_0 < g_kdata_base &&
+            sy_call_1 >= g_ktext_base && sy_call_1 < g_kdata_base) {
+            printf("[+] Found sysentvec at proc+0x%x: 0x%lx\n", off, candidate);
+            printf("[+] PPR sysent table: 0x%lx (sv_size=%u)\n", sv_table, sv_size);
+            printf("[+] sysent[0].sy_call=0x%lx sysent[1].sy_call=0x%lx\n",
+                   sy_call_0, sy_call_1);
+            g_sysent_table = sv_table;
+            return 0;
+        }
+    }
+
+    printf("[-] Could not discover PPR sysent table\n");
+    return -1;
 }
 
 /* ─── Research campaigns ─── */
@@ -1069,35 +1141,19 @@ static int clear_nx_for_range(uint64_t va, size_t len) {
 
 /*
  * Install our kmod as a custom syscall handler.
- * Modifies the PPR (Prospero) sysent table to point syscall N
- * to the kmod's entry point in DMAP.
+ * Uses the dynamically discovered g_sysent_table to point
+ * syscall N to the kmod's entry point.
  */
-static int install_kmod_syscall(uint64_t kmod_dmap_va) {
-    /* Read the sysent table address from the sysentvec structure */
-    uint64_t sysentvec_addr = g_kdata_base + FW403_SYSENTVEC_OFFSET;
-    uint64_t sysent_table;
-
-    /* sv_table is at offset 8 in struct sysentvec (after sv_size int + padding) */
-    kernel_copyout(sysentvec_addr + 8, &sysent_table, 8);
-    printf("[*] PPR sysent table at: 0x%lx\n", sysent_table);
-
-    if (sysent_table < g_kdata_base || sysent_table > g_kdata_base + 0x10000000ULL) {
-        printf("[-] Sysent table address looks invalid\n");
+static int install_kmod_syscall(uint64_t kmod_exec_va) {
+    if (!g_sysent_table) {
+        printf("[-] Sysent table not discovered\n");
         return -1;
     }
 
-    /* Read the sv_size to verify */
-    uint32_t sv_size;
-    kernel_copyout(sysentvec_addr, &sv_size, 4);
-    printf("[*] PPR sysentvec sv_size = %u\n", sv_size);
-
-    if (KMOD_SYSCALL_NUM >= (int)sv_size) {
-        printf("[-] Syscall %d >= sv_size %u, cannot install\n", KMOD_SYSCALL_NUM, sv_size);
-        return -1;
-    }
+    printf("[*] PPR sysent table at: 0x%lx\n", g_sysent_table);
 
     /* Calculate the sysent entry address for our syscall */
-    uint64_t entry_addr = sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
+    uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
     /* Save original sysent entry for restoration */
     struct ps5_sysent orig_entry;
@@ -1109,13 +1165,13 @@ static int install_kmod_syscall(uint64_t kmod_dmap_va) {
     struct ps5_sysent new_entry;
     memset(&new_entry, 0, sizeof(new_entry));
     new_entry.n_arg = 3;               /* td is implicit; we pass 3 user args */
-    new_entry.sy_call = kmod_dmap_va;   /* Point directly to our kmod code */
+    new_entry.sy_call = kmod_exec_va;   /* Point to kmod code */
     new_entry.sy_flags = 0;
     new_entry.sy_thrcnt = 1;            /* SY_THR_STATIC */
 
     kernel_copyin(&new_entry, entry_addr, sizeof(new_entry));
     printf("[+] Installed kmod at syscall %d (sy_call=0x%lx)\n",
-           KMOD_SYSCALL_NUM, kmod_dmap_va);
+           KMOD_SYSCALL_NUM, kmod_exec_va);
 
     return 0;
 }
@@ -1124,11 +1180,9 @@ static int install_kmod_syscall(uint64_t kmod_dmap_va) {
  * Restore the original sysent entry after kmod execution.
  */
 static void restore_syscall(void) {
-    uint64_t sysentvec_addr = g_kdata_base + FW403_SYSENTVEC_OFFSET;
-    uint64_t sysent_table;
-    kernel_copyout(sysentvec_addr + 8, &sysent_table, 8);
+    if (!g_sysent_table) return;
 
-    uint64_t entry_addr = sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
+    uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
     /* Set sy_call to 0 (nosys) and clear thrcnt */
     struct ps5_sysent nosys_entry;
@@ -1155,87 +1209,91 @@ static void campaign_kmod_vmmcall(void) {
     printf("  Campaign 7: Kernel Module VMMCALL Fuzzing\n");
     printf("=============================================\n\n");
 
-    if (!g_dmap_base || !g_cr3_phys) {
-        printf("[-] DMAP/CR3 not available, cannot load kmod\n");
+    if (!g_dmap_base) {
+        printf("[-] DMAP not available, cannot load kmod\n");
         return;
     }
 
     printf("[*] Kmod binary size: %lu bytes\n", KMOD_BIN_SZ);
 
-    /* Allocate physical memory for:
-     * - kmod code (page-aligned, starting at offset 0)
-     * - result buffer (starting at next page after kmod)
-     */
-    size_t kmod_pages = (KMOD_BIN_SZ + 0x3FFF) & ~0x3FFFULL;  /* Round up to 16KB page */
+    /* Allocate userland memory for the result buffer only.
+     * The kmod code will be copied to a kernel code cave. */
     size_t result_size = sizeof(struct kmod_result_buf);
     size_t result_pages = (result_size + 0x3FFF) & ~0x3FFFULL;
-    size_t total_size = kmod_pages + result_pages;
+    if (result_pages < 0x4000)
+        result_pages = 0x4000;
 
-    /* Minimum allocation is 2 * 16KB pages */
-    if (total_size < 0x8000)
-        total_size = 0x8000;
-
-    off_t kmod_phys = 0;
+    off_t result_phys = 0;
     int ret = sceKernelAllocateDirectMemory(
         0, 0x180000000ULL,
-        total_size, 0x4000,
+        result_pages, 0x4000,
         SCE_KERNEL_WB_ONION,
-        &kmod_phys
+        &result_phys
     );
     if (ret != 0) {
-        printf("[-] Failed to allocate kmod memory: 0x%x\n", ret);
+        printf("[-] Failed to allocate result buffer: 0x%x\n", ret);
         return;
     }
 
-    void *kmod_uva = NULL;
+    void *result_uva_raw = NULL;
     ret = sceKernelMapDirectMemory(
-        &kmod_uva, total_size,
+        &result_uva_raw, result_pages,
         SCE_KERNEL_PROT_CPU_RW,
-        0, kmod_phys, 0x4000
+        0, result_phys, 0x4000
     );
     if (ret != 0) {
-        printf("[-] Failed to map kmod memory: 0x%x\n", ret);
+        printf("[-] Failed to map result buffer: 0x%x\n", ret);
         return;
     }
 
-    printf("[+] Kmod memory: PA=0x%lx VA=0x%lx size=0x%lx\n",
-           (uint64_t)kmod_phys, (uint64_t)kmod_uva, total_size);
-
-    /* Zero the entire allocation */
-    memset(kmod_uva, 0, total_size);
-
-    /* Copy kmod binary to the start of the allocation */
-    memcpy(kmod_uva, KMOD_BIN, KMOD_BIN_SZ);
-    printf("[+] Copied %lu bytes of kmod code\n", KMOD_BIN_SZ);
-
-    /* Result buffer is at the page after the kmod code */
-    off_t result_phys = kmod_phys + kmod_pages;
-    struct kmod_result_buf *result_uva =
-        (struct kmod_result_buf *)((uint8_t *)kmod_uva + kmod_pages);
+    struct kmod_result_buf *result_uva = (struct kmod_result_buf *)result_uva_raw;
+    memset(result_uva, 0, result_pages);
 
     printf("[+] Result buffer: PA=0x%lx userland_VA=0x%lx\n",
            (uint64_t)result_phys, (uint64_t)result_uva);
 
-    /* Compute DMAP addresses */
-    uint64_t kmod_dmap_va = g_dmap_base + (uint64_t)kmod_phys;
-    printf("[+] Kmod DMAP VA: 0x%lx\n", kmod_dmap_va);
+    /*
+     * Use kernel code cave (ktext + 0x44000) to host the kmod.
+     * This is the same approach Byepervisor uses — the code cave
+     * is in kernel text which is already executable, avoiding the
+     * DMAP NX/PDPTE issues entirely.
+     */
+    uint64_t code_cave_va = g_ktext_base + CODE_CAVE_OFFSET;
+    printf("[+] Code cave VA: 0x%lx\n", code_cave_va);
 
-    /* Step 1: Clear NX bits in guest page tables for the kmod pages */
-    printf("\n[*] Step 1: Clearing NX bits for kmod DMAP pages...\n");
-    if (clear_nx_for_range(kmod_dmap_va, kmod_pages) != 0) {
-        printf("[-] Failed to clear NX bits\n");
+    /* Step 1: Copy kmod code to the kernel code cave */
+    printf("\n[*] Step 1: Copying kmod to kernel code cave...\n");
+    kernel_copyin((void *)KMOD_BIN, code_cave_va, KMOD_BIN_SZ);
+    printf("[+] Copied %lu bytes to code cave at 0x%lx\n", KMOD_BIN_SZ, code_cave_va);
+
+    /* Verify the copy by reading back first 8 bytes */
+    uint64_t verify;
+    kernel_copyout(code_cave_va, &verify, 8);
+    uint64_t expected;
+    memcpy(&expected, KMOD_BIN, 8);
+    if (verify != expected) {
+        printf("[-] Code cave verification failed: got 0x%lx, expected 0x%lx\n",
+               verify, expected);
+        return;
+    }
+    printf("[+] Code cave verification passed\n");
+
+    /* Step 2: Discover the sysent table */
+    printf("\n[*] Step 2: Discovering sysent table...\n");
+    if (!g_sysent_table && discover_sysent_table() != 0) {
+        printf("[-] Failed to discover sysent table\n");
         return;
     }
 
-    /* Step 2: Install the kmod as a custom syscall */
-    printf("\n[*] Step 2: Installing kmod syscall...\n");
-    if (install_kmod_syscall(kmod_dmap_va) != 0) {
+    /* Step 3: Install the kmod as a custom syscall */
+    printf("\n[*] Step 3: Installing kmod syscall...\n");
+    if (install_kmod_syscall(code_cave_va) != 0) {
         printf("[-] Failed to install kmod syscall\n");
         return;
     }
 
-    /* Step 3: Execute the kmod via syscall */
-    printf("\n[*] Step 3: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
+    /* Step 4: Execute the kmod via syscall */
+    printf("\n[*] Step 4: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
     printf("    This will execute VMMCALL instructions in kernel mode (ring 0).\n");
     printf("    If the PS5 crashes, the HV rejected the VMMCALL.\n\n");
 
@@ -1247,12 +1305,12 @@ static void campaign_kmod_vmmcall(void) {
 
     printf("[*] Kmod syscall returned: %d\n", kmod_ret);
 
-    /* Step 4: Restore the original syscall */
-    printf("\n[*] Step 4: Restoring original syscall...\n");
+    /* Step 5: Restore the original syscall */
+    printf("\n[*] Step 5: Restoring original syscall...\n");
     restore_syscall();
 
     /* Step 5: Read and display results */
-    printf("\n[*] Step 5: Reading results...\n");
+    printf("\n[*] Step 6: Reading results...\n");
 
     if (result_uva->magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
@@ -1370,10 +1428,10 @@ int main(void) {
     campaign_kernel_recon();
 
     /* Campaign 7: Kernel module VMMCALL fuzzing (highest priority) */
-    if (g_dmap_base && g_cr3_phys) {
+    if (g_dmap_base) {
         campaign_kmod_vmmcall();
     } else {
-        printf("[!] Skipping kmod campaign (no DMAP/CR3)\n");
+        printf("[!] Skipping kmod campaign (no DMAP)\n");
     }
 
     if (g_dmap_base) {
