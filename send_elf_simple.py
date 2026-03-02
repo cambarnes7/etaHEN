@@ -3,6 +3,7 @@
 import argparse
 import socket
 import struct
+import time
 from pathlib import Path
 
 ELF_PORT = 9027
@@ -21,7 +22,16 @@ def send_elf(host: str, elf_path: Path, name: str, game: bool = False):
     else:
         name_bytes += b'\x00' * (MAX_NAME_LEN - len(name_bytes))
 
-    with socket.create_connection((host, ELF_PORT), timeout=10) as sock:
+    # retry connection until the port is ready (matches original send_elf.py behavior)
+    while True:
+        try:
+            sock = socket.create_connection((host, ELF_PORT), timeout=10)
+            break
+        except OSError:
+            print('Waiting for port to be ready...')
+            time.sleep(1)
+
+    with sock:
         sock.sendall(GAME_TYPE if game else DAEMON_TYPE)
         sock.sendall(name_bytes)
         sock.sendall(struct.pack('<Q', len(data)))
