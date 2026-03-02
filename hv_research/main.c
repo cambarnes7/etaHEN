@@ -563,94 +563,253 @@ static int init_sbl_direct(void) {
 }
 
 /*
- * Discover the PPR sysent table by directly scanning kernel memory
- * for the sysent array's distinctive pattern.
+ * Validate that an address looks like a valid sysent table.
+ * Checks that multiple entries have sy_call pointers in kernel text,
+ * and that the nosys function appears frequently (many unimplemented syscalls).
+ * Returns the nosys address on success, 0 on failure.
+ */
+static uint64_t validate_sysent_table(uint64_t candidate) {
+    /* Read the first 4 entries (0x30 bytes each = 0xC0 total) */
+    uint8_t buf[0xC0];
+    if (kernel_copyout(candidate, buf, sizeof(buf)) != 0)
+        return 0;
+
+    /* Check sysent[0..3].sy_call are all in kernel text range */
+    for (int e = 0; e < 4; e++) {
+        uint64_t sy;
+        memcpy(&sy, buf + e * 0x30 + 0x08, 8);
+        if (sy < g_ktext_base || sy >= g_kdata_base)
+            return 0;
+    }
+
+    /* Get nosys candidate (sysent[0].sy_call) */
+    uint64_t nosys;
+    memcpy(&nosys, buf + 0x08, 8);
+
+    /* Verify nosys appears frequently in first 20 entries */
+    int nosys_count = 0;
+    for (int e = 0; e < 20; e++) {
+        uint64_t sy;
+        kernel_copyout(candidate + e * 0x30 + 0x08, &sy, 8);
+        if (sy == nosys) nosys_count++;
+    }
+
+    if (nosys_count < 5)
+        return 0;
+
+    /* Verify entry at our target syscall number is also valid */
+    uint64_t target_sy;
+    kernel_copyout(candidate + (KMOD_SYSCALL_NUM * 0x30) + 0x08, &target_sy, 8);
+    if (target_sy < g_ktext_base || target_sy >= g_kdata_base)
+        return 0;
+
+    return nosys;
+}
+
+/*
+ * Get the PPR sysentvec address for the current firmware.
+ * These offsets are taken from etaHEN's own codebase (msg.cpp / HookFunctions.cpp).
+ * The sysentvec struct contains sv_table (pointer to the sysent array).
+ */
+static uint64_t get_ppr_sysentvec_addr(void) {
+    switch (g_fw_version) {
+    case 0x3000000: case 0x3100000: case 0x3200000: case 0x3210000:
+        return g_kdata_base + 0xca0cd8;
+    case 0x4000000: case 0x4020000: case 0x4030000:
+    case 0x4500000: case 0x4510000:
+        return g_kdata_base + 0xd11bb8;
+    case 0x5000000: case 0x5020000: case 0x5100000: case 0x5500000:
+        return g_kdata_base + 0xe00be8;
+    case 0x6000000: case 0x6020000: case 0x6500000:
+        return g_kdata_base + 0xe210a8;
+    case 0x7000000: case 0x7010000:
+        return g_kdata_base + 0xe21ab8;
+    case 0x7200000: case 0x7400000: case 0x7600000: case 0x7610000:
+        return g_kdata_base + 0xe21b78;
+    case 0x8000000: case 0x8200000: case 0x8400000: case 0x8600000:
+        return g_kdata_base + 0xe21ca8;
+    case 0x9000000: case 0x9050000: case 0x9200000:
+    case 0x9400000: case 0x9600000:
+        return g_kdata_base + 0xdba648;
+    case 0x10000000: case 0x10010000: case 0x10200000:
+    case 0x10400000: case 0x10600000:
+        return g_kdata_base + 0xdba6d8;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Discover the PPR sysent table.
  *
- * The sysent table is an array of 0x30-byte entries. Each entry has
- * sy_call at offset 0x08 pointing to a kernel text function. Many
- * entries (unimplemented syscalls) point to the same nosys function.
+ * Strategy 1 (primary): Use the known sysentvec address for this FW version.
+ *   The struct sysentvec has sv_table (pointer to sysent array) at offset 0x08
+ *   on standard FreeBSD amd64. We try several candidate offsets in case PS5
+ *   has a slightly different layout.
  *
- * We scan kernel rodata for a region where multiple consecutive
- * 0x30-spaced entries have sy_call values in kernel text range.
+ * Strategy 2 (fallback): Scan the proc structure for p_sysent. Each process
+ *   has a pointer to its sysentvec, which contains sv_table.
+ *
+ * Strategy 3 (last resort): Pattern-scan kernel data for the sysent array's
+ *   distinctive pattern (0x30-byte entries with sy_call in kernel text).
  */
 static int discover_sysent_table(void) {
     /*
-     * On Byepervisor FW 2.x, PPR_SYSENT is at kdata + ~0x166E00.
-     * On FW 4.03, it should be in a similar relative position.
-     * Scan a broad range of kernel data for the sysent pattern.
+     * Strategy 1: Dereference sv_table from the known sysentvec.
      */
+    uint64_t sysentvec_addr = get_ppr_sysentvec_addr();
+    if (sysentvec_addr) {
+        printf("[*] Using known PPR sysentvec at 0x%lx (FW 0x%lx)\n",
+               sysentvec_addr, g_fw_version);
+
+        /* Dump the first 32 bytes of sysentvec for diagnostics */
+        uint8_t svec_dump[32];
+        kernel_copyout(sysentvec_addr, svec_dump, sizeof(svec_dump));
+        printf("[*] sysentvec dump: ");
+        for (int i = 0; i < 32; i++)
+            printf("%02x", svec_dump[i]);
+        printf("\n");
+
+        /* Read sv_size at offset 0x00 */
+        uint32_t sv_size;
+        memcpy(&sv_size, svec_dump, 4);
+        printf("[*] sv_size (offset 0x00) = %u\n", sv_size);
+
+        /*
+         * Try candidate offsets for sv_table within sysentvec.
+         * Standard FreeBSD amd64 puts it at +0x08 (after int + padding).
+         * PS5 may differ, so we try multiple offsets and validate each.
+         */
+        static const int sv_table_offsets[] = {0x08, 0x10, 0x04, 0x18};
+        for (int i = 0; i < 4; i++) {
+            uint64_t sv_table;
+            kernel_copyout(sysentvec_addr + sv_table_offsets[i], &sv_table, 8);
+
+            /* sv_table should be a valid kernel address */
+            if ((sv_table >> 47) == 0 || sv_table < 0xFFFF800000000000ULL)
+                continue;
+            if (sv_table == 0xFFFFFFFFFFFFFFFFULL)
+                continue;
+
+            printf("[*] Trying sv_table at sysentvec+0x%02x = 0x%lx\n",
+                   sv_table_offsets[i], sv_table);
+
+            uint64_t nosys = validate_sysent_table(sv_table);
+            if (nosys) {
+                printf("[+] PPR sysent table found at 0x%lx (via sysentvec+0x%02x)\n",
+                       sv_table, sv_table_offsets[i]);
+                printf("[+] nosys function at 0x%lx\n", nosys);
+                g_sysent_table = sv_table;
+                return 0;
+            }
+        }
+
+        printf("[!] sv_table dereference failed, trying proc-based discovery...\n");
+    } else {
+        printf("[!] No known sysentvec offset for FW 0x%lx\n", g_fw_version);
+    }
+
+    /*
+     * Strategy 2: Find sysent via proc->p_sysent.
+     * Get our process, then scan for a pointer within the proc structure
+     * that leads to a valid sysentvec (which contains sv_table).
+     */
+    uint64_t proc = kernel_get_proc(getpid());
+    if (proc) {
+        printf("[*] Scanning proc 0x%lx for p_sysent...\n", proc);
+
+        /*
+         * p_sysent is typically in the range offset 0x100-0x500 in proc.
+         * We scan qword-aligned for a pointer that, when dereferenced,
+         * contains a further pointer to a valid sysent table.
+         */
+        for (int off = 0x100; off < 0x500; off += 8) {
+            uint64_t p_sysent;
+            kernel_copyout(proc + off, &p_sysent, 8);
+
+            /* p_sysent should point to a sysentvec in kernel data range */
+            if (p_sysent < g_kdata_base || p_sysent >= g_kdata_base + 0x10000000ULL)
+                continue;
+
+            /* If we have a known sysentvec addr, check if it matches */
+            if (sysentvec_addr && p_sysent != sysentvec_addr)
+                continue;
+
+            /* Try to read sv_table from this sysentvec candidate */
+            for (int sv_off = 0x04; sv_off <= 0x18; sv_off += 4) {
+                uint64_t sv_table;
+                kernel_copyout(p_sysent + sv_off, &sv_table, 8);
+
+                if ((sv_table >> 47) == 0 || sv_table < 0xFFFF800000000000ULL)
+                    continue;
+                if (sv_table == 0xFFFFFFFFFFFFFFFFULL)
+                    continue;
+
+                uint64_t nosys = validate_sysent_table(sv_table);
+                if (nosys) {
+                    printf("[+] PPR sysent table found at 0x%lx (via proc+0x%x -> +0x%x)\n",
+                           sv_table, off, sv_off);
+                    printf("[+] nosys function at 0x%lx\n", nosys);
+                    g_sysent_table = sv_table;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /*
+     * Strategy 3 (last resort): Pattern-scan kernel data.
+     * Scan for the sysent array itself by looking for consecutive
+     * 0x30-byte entries with sy_call pointers in kernel text range.
+     * Read 2 pages at a time to handle cross-page boundaries.
+     */
+    printf("[*] Falling back to kernel memory pattern scan...\n");
     uint64_t scan_start = g_kdata_base;
     uint64_t scan_end = g_kdata_base + 0x4000000ULL;  /* First 64MB of kdata */
-    uint8_t buf[4096];
+    uint8_t buf[8192];  /* 2 pages to handle boundary cases */
 
-    printf("[*] Scanning kernel memory for sysent table...\n");
     printf("[*] Scan range: 0x%lx - 0x%lx\n", scan_start, scan_end);
 
-    for (uint64_t page = scan_start; page + 4096 <= scan_end; page += 4096) {
-        kernel_copyout(page, buf, 4096);
+    for (uint64_t page = scan_start; page + 8192 <= scan_end; page += 4096) {
+        kernel_copyout(page, buf, 8192);
 
-        /* Check each qword in this page as a potential sysent[0].sy_call.
-         * The sysent table starts with n_arg(4) + pad(4) + sy_call(8).
-         * So sysent[0] starts at the table base, sy_call at offset 8.
-         * We look for the table base (where offset +8 is a ktext ptr). */
-        for (int i = 0; i + 0x30 * 4 < 4096; i += 8) {
-            /* Read what would be sysent[0].sy_call at this+0x08 */
+        for (int i = 0; i + 0x30 * 4 < 8192 - 0x30; i += 8) {
             uint64_t sy0;
-            if (i + 8 + 8 > 4096) break;
-            memcpy(&sy0, buf + i + 8, 8);
-
-            /* Must be in kernel text range */
+            memcpy(&sy0, buf + i + 0x08, 8);
             if (sy0 < g_ktext_base || sy0 >= g_kdata_base)
                 continue;
 
-            /* Check sysent[1].sy_call at this+0x30+0x08 */
             uint64_t sy1;
-            if (i + 0x30 + 8 + 8 > 4096) continue;
-            memcpy(&sy1, buf + i + 0x30 + 8, 8);
+            memcpy(&sy1, buf + i + 0x30 + 0x08, 8);
             if (sy1 < g_ktext_base || sy1 >= g_kdata_base)
                 continue;
 
-            /* Check sysent[2].sy_call */
             uint64_t sy2;
-            if (i + 0x60 + 8 + 8 > 4096) continue;
-            memcpy(&sy2, buf + i + 0x60 + 8, 8);
+            memcpy(&sy2, buf + i + 0x60 + 0x08, 8);
             if (sy2 < g_ktext_base || sy2 >= g_kdata_base)
                 continue;
 
-            /* Strong signal: check that nosys (sy0) appears in
-             * multiple entries (many syscalls are unimplemented) */
+            /* Count nosys appearances */
             int nosys_count = 0;
-            for (int e = 0; e < 20 && i + e * 0x30 + 8 + 8 <= 4096; e++) {
+            for (int e = 0; e < 20 && i + e * 0x30 + 0x10 <= 8192; e++) {
                 uint64_t sy;
-                memcpy(&sy, buf + i + e * 0x30 + 8, 8);
+                memcpy(&sy, buf + i + e * 0x30 + 0x08, 8);
                 if (sy == sy0) nosys_count++;
             }
-
-            /* nosys should appear in at least 5 of the first 20 entries */
             if (nosys_count < 5)
                 continue;
 
             uint64_t table_addr = page + i;
 
-            /* Final validation: read sysent[510] to confirm table is big enough.
-             * Read from kernel memory (might span pages). */
-            uint64_t target_sy_call;
-            kernel_copyout(table_addr + (KMOD_SYSCALL_NUM * 0x30) + 0x08,
-                          &target_sy_call, 8);
-
-            if (target_sy_call < g_ktext_base || target_sy_call >= g_kdata_base) {
-                /* Entry 510 doesn't look valid, might be PS4 compat table
-                 * (smaller). Skip and keep looking. */
+            /* Validate entry 510 (spans well beyond our buffer, read directly) */
+            uint64_t target_sy;
+            kernel_copyout(table_addr + (KMOD_SYSCALL_NUM * 0x30) + 0x08, &target_sy, 8);
+            if (target_sy < g_ktext_base || target_sy >= g_kdata_base)
                 continue;
-            }
 
-            printf("[+] PPR sysent table found at 0x%lx\n", table_addr);
-            printf("[+] sysent[0].sy_call=0x%lx (nosys, appears %d/20 times)\n",
-                   sy0, nosys_count);
-            printf("[+] sysent[1].sy_call=0x%lx sysent[2].sy_call=0x%lx\n", sy1, sy2);
-            printf("[+] sysent[%d].sy_call=0x%lx (nosys=%s)\n",
-                   KMOD_SYSCALL_NUM, target_sy_call,
-                   target_sy_call == sy0 ? "yes" : "no");
+            printf("[+] PPR sysent table found at 0x%lx (pattern scan)\n", table_addr);
+            printf("[+] sysent[0].sy_call=0x%lx (nosys, %d/20 times)\n", sy0, nosys_count);
+            printf("[+] sysent[%d].sy_call=0x%lx\n", KMOD_SYSCALL_NUM, target_sy);
             g_sysent_table = table_addr;
             return 0;
         }
