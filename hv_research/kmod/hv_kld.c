@@ -88,9 +88,16 @@ struct kmod_result_buf {
  * table. Userland finds it via:
  *   kldsym(kid, KLDSYM_LOOKUP, { .symname = "hv_results" })
  * then reads it with kernel_copyout().
+ *
+ * IMPORTANT: Initialized with a placeholder value so the
+ * compiler places it in .data instead of .bss. The FreeBSD 11
+ * kernel linker has a bug where .bss symbols (high section
+ * index) don't get relocated properly via kldsym because
+ * st_shndx >= nprogtab. Placing in .data (lower section index)
+ * fixes the kldsym address lookup.
  * ============================================================ */
 
-struct kmod_result_buf hv_results;
+struct kmod_result_buf hv_results = { .magic = 0x1 };
 
 /* ============================================================
  * Inline assembly helpers - ring 0 hardware access

@@ -153,8 +153,19 @@ struct kld_sym_lookup {
 
 #define SYS_kldload     304
 #define SYS_kldunload   305
+#define SYS_kldstat     306
 #define SYS_kldsym      337
 #define KLDSYM_LOOKUP   1
+
+/* kldstat file info structure (matches FreeBSD sys/kld.h) */
+struct kld_file_stat {
+    int         version;        /* sizeof(struct kld_file_stat) */
+    char        name[1024];     /* MAXPATHLEN */
+    int         refs;
+    int         id;
+    uint64_t    address;        /* caddr_t - module base address in kernel */
+    uint64_t    size;           /* module size in bytes */
+};
 
 /* ─── Global state ─── */
 
@@ -1027,9 +1038,13 @@ static void campaign_kmod_kldload(void) {
     printf("[+] Module loaded! kid=%d\n", kid);
     printf("    SYSINIT has already executed - campaigns complete.\n");
 
-    /* Step 3: Find hv_results symbol via kldsym */
-    printf("\n[*] Step 3: Looking up hv_results symbol via kldsym...\n");
+    /* Step 3: Find hv_results in kernel memory */
+    printf("\n[*] Step 3: Locating hv_results in kernel memory...\n");
 
+    uint64_t results_kva = 0;
+
+    /* Method A: Try kldsym first */
+    printf("[*] Method A: kldsym lookup...\n");
     struct kld_sym_lookup sym;
     memset(&sym, 0, sizeof(sym));
     sym.version = sizeof(struct kld_sym_lookup);
@@ -1037,27 +1052,141 @@ static void campaign_kmod_kldload(void) {
 
     int ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
     if (ret < 0) {
-        int err = errno;
-        printf("[-] kldsym failed: ret=%d, errno=%d (%s)\n", ret, err, strerror(err));
-        printf("    Symbol 'hv_results' not found in module.\n");
-        printf("    Attempting to unload module...\n");
-        syscall(SYS_kldunload, kid);
-        unlink("/data/etaHEN/hv_kmod.ko");
-        return;
+        printf("    kldsym failed: errno=%d (%s)\n", errno, strerror(errno));
+    } else {
+        printf("    kldsym returned: symvalue=0x%lx, symsize=%lu\n",
+               (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
+        /* Dump raw struct bytes for diagnostics */
+        uint8_t *raw = (uint8_t *)&sym;
+        printf("    Raw kld_sym_lookup (%zu bytes):", sizeof(sym));
+        for (size_t i = 0; i < sizeof(sym); i++) {
+            if (i % 16 == 0) printf("\n      %02zx: ", i);
+            printf("%02x ", raw[i]);
+        }
+        printf("\n");
     }
-    printf("[+] hv_results at kernel VA 0x%lx (size=%lu)\n",
-           (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
+
+    if (ret == 0 && sym.symvalue != 0) {
+        results_kva = sym.symvalue;
+        printf("[+] hv_results at kernel VA 0x%lx (via kldsym)\n",
+               (unsigned long)results_kva);
+    }
+
+    /* Method B: kldstat + KMOD_MAGIC scan fallback */
+    if (results_kva == 0) {
+        printf("\n[*] Method B: kldstat + KMOD_MAGIC scan fallback...\n");
+        printf("    (kldsym returned address 0 - likely FreeBSD kernel linker\n");
+        printf("     .bss section index vs progtab count mismatch)\n");
+
+        struct kld_file_stat fstat;
+        memset(&fstat, 0, sizeof(fstat));
+        fstat.version = sizeof(struct kld_file_stat);
+
+        ret = syscall(SYS_kldstat, kid, &fstat);
+        if (ret < 0) {
+            printf("[-] kldstat failed: errno=%d (%s)\n", errno, strerror(errno));
+            printf("    Cannot determine module memory location.\n");
+            syscall(SYS_kldunload, kid);
+            unlink("/data/etaHEN/hv_kmod.ko");
+            return;
+        }
+
+        printf("    Module '%s': id=%d, refs=%d\n", fstat.name, fstat.id, fstat.refs);
+        printf("    Kernel address: 0x%lx, size: %lu bytes\n",
+               (unsigned long)fstat.address, (unsigned long)fstat.size);
+
+        if (fstat.address == 0 || fstat.size == 0) {
+            printf("[-] kldstat returned invalid address/size.\n");
+            syscall(SYS_kldunload, kid);
+            unlink("/data/etaHEN/hv_kmod.ko");
+            return;
+        }
+
+        /*
+         * Scan module memory for KMOD_MAGIC.
+         * The kernel allocated memory for .text, .data, .bss etc.
+         * hv_results is in .bss, which the kernel linker zeroes.
+         * Our SYSINIT writes KMOD_MAGIC to it during init.
+         * Scan in 8-byte steps (magic is uint64_t at offset 0 of struct).
+         */
+        printf("    Scanning %lu bytes for KMOD_MAGIC 0x%llx...\n",
+               (unsigned long)fstat.size,
+               (unsigned long long)KMOD_MAGIC);
+
+        /* Read in chunks to avoid huge single copyout */
+        #define SCAN_CHUNK 4096
+        uint8_t scan_buf[SCAN_CHUNK];
+        uint64_t scan_base = fstat.address;
+        uint64_t scan_end = fstat.address + fstat.size;
+        int found = 0;
+
+        for (uint64_t addr = scan_base; addr < scan_end; addr += SCAN_CHUNK) {
+            uint64_t chunk_sz = scan_end - addr;
+            if (chunk_sz > SCAN_CHUNK) chunk_sz = SCAN_CHUNK;
+
+            kernel_copyout(addr, scan_buf, (size_t)chunk_sz);
+
+            /* Scan for 8-byte magic value at 8-byte aligned offsets */
+            for (uint64_t off = 0; off + 8 <= chunk_sz; off += 8) {
+                uint64_t val;
+                memcpy(&val, &scan_buf[off], 8);
+                if (val == KMOD_MAGIC) {
+                    results_kva = addr + off;
+                    printf("[+] Found KMOD_MAGIC at kernel VA 0x%lx (offset 0x%lx from module base)\n",
+                           (unsigned long)results_kva,
+                           (unsigned long)(results_kva - scan_base));
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        #undef SCAN_CHUNK
+
+        if (!found) {
+            printf("[-] KMOD_MAGIC not found in module memory range.\n");
+            printf("    Possible causes:\n");
+            printf("    - SYSINIT init function did not execute\n");
+            printf("    - Module memory layout differs from expected\n");
+            printf("    - .bss was allocated outside the reported module range\n");
+
+            /* Dump first 256 bytes of module memory for diagnostics */
+            printf("\n    First 256 bytes of module memory at 0x%lx:\n",
+                   (unsigned long)scan_base);
+            uint8_t dump[256];
+            kernel_copyout(scan_base, dump, sizeof(dump));
+            for (int i = 0; i < 256; i++) {
+                if (i % 16 == 0) printf("      %04x: ", i);
+                printf("%02x ", dump[i]);
+                if (i % 16 == 15) printf("\n");
+            }
+
+            syscall(SYS_kldunload, kid);
+            unlink("/data/etaHEN/hv_kmod.ko");
+            return;
+        }
+    }
 
     /* Step 4: Read results via kernel_copyout */
-    printf("\n[*] Step 4: Reading results from kernel memory...\n");
+    printf("\n[*] Step 4: Reading results from kernel memory (VA 0x%lx)...\n",
+           (unsigned long)results_kva);
 
     struct kmod_result_buf results;
-    kernel_copyout(sym.symvalue, &results, sizeof(results));
+    kernel_copyout(results_kva, &results, sizeof(results));
 
     if (results.magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
                (unsigned long long)KMOD_MAGIC, (unsigned long long)results.magic);
         printf("    The module init may not have run or SYSINIT dispatch failed.\n");
+
+        /* Dump raw first 64 bytes for diagnostics */
+        printf("    Raw bytes at results address:\n      ");
+        uint8_t *rp = (uint8_t *)&results;
+        for (int i = 0; i < 64; i++) {
+            printf("%02x ", rp[i]);
+            if (i % 16 == 15) printf("\n      ");
+        }
+        printf("\n");
     } else {
         printf("[+] Kmod status: %s\n",
                results.status == KMOD_STATUS_DONE ? "COMPLETE" :
