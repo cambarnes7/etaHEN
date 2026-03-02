@@ -170,6 +170,8 @@ static uint64_t g_fw_version = 0;
 static uint64_t g_mmio_vaddr = 0;
 static uint64_t g_cr3_phys = 0;   /* Kernel PML4 physical address */
 static uint64_t g_sysent_table = 0;  /* PPR sysent table address (discovered) */
+static struct ps5_sysent g_orig_sysent;  /* Original sysent entry for restoration */
+static int g_orig_sysent_saved = 0;
 
 /* Physical address of our message buffer */
 static off_t    g_msg_phys = 0;
@@ -579,8 +581,13 @@ static int discover_sysent_table(void) {
      * On FW 4.03, it should be in a similar relative position.
      * Scan a broad range of kernel data for the sysent pattern.
      */
-    uint64_t scan_start = g_kdata_base;
-    uint64_t scan_end = g_kdata_base + 0x4000000ULL;  /* First 64MB of kdata */
+    /* The sysent table could be in:
+     * - kernel rodata (between ktext and kdata) if it's const
+     * - kernel data (kdata + offset)
+     * On FW 4.03, the ktext-kdata gap is 12MB.
+     * Start scanning from kdata - 0x800000 (covers late rodata). */
+    uint64_t scan_start = g_kdata_base - 0x800000ULL;
+    uint64_t scan_end = g_kdata_base + 0x4000000ULL;  /* Through 64MB of kdata */
     uint8_t buf[4096];
 
     printf("[*] Scanning kernel memory for sysent table...\n");
@@ -1229,10 +1236,10 @@ static int install_kmod_syscall(uint64_t kmod_exec_va) {
     uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
     /* Save original sysent entry for restoration */
-    struct ps5_sysent orig_entry;
-    kernel_copyout(entry_addr, &orig_entry, sizeof(orig_entry));
+    kernel_copyout(entry_addr, &g_orig_sysent, sizeof(g_orig_sysent));
+    g_orig_sysent_saved = 1;
     printf("[*] Original sysent[%d]: sy_call=0x%lx n_arg=%u flags=0x%x\n",
-           KMOD_SYSCALL_NUM, orig_entry.sy_call, orig_entry.n_arg, orig_entry.sy_flags);
+           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call, g_orig_sysent.n_arg, g_orig_sysent.sy_flags);
 
     /* Install our kmod as the syscall handler */
     struct ps5_sysent new_entry;
@@ -1253,16 +1260,14 @@ static int install_kmod_syscall(uint64_t kmod_exec_va) {
  * Restore the original sysent entry after kmod execution.
  */
 static void restore_syscall(void) {
-    if (!g_sysent_table) return;
+    if (!g_sysent_table || !g_orig_sysent_saved) return;
 
     uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
 
-    /* Set sy_call to 0 (nosys) and clear thrcnt */
-    struct ps5_sysent nosys_entry;
-    memset(&nosys_entry, 0, sizeof(nosys_entry));
-    nosys_entry.sy_thrcnt = 1;
-    kernel_copyin(&nosys_entry, entry_addr, sizeof(nosys_entry));
-    printf("[+] Restored syscall %d to nosys\n", KMOD_SYSCALL_NUM);
+    /* Restore the original sysent entry (with proper nosys address) */
+    kernel_copyin(&g_orig_sysent, entry_addr, sizeof(g_orig_sysent));
+    printf("[+] Restored syscall %d (sy_call=0x%lx)\n",
+           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call);
 }
 
 /*
