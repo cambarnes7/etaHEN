@@ -158,8 +158,8 @@ struct ps5_sysent {
 /* Syscall number to hijack (unused high number) */
 #define KMOD_SYSCALL_NUM 510
 
-/* Code cave offset from ktext (same on all FW versions, from Byepervisor) */
-#define CODE_CAVE_OFFSET  0x44000
+/* Code cave: dynamically found safe region in kernel text */
+/* No hardcoded offset — we scan for a page of zeros at runtime */
 
 /* ─── Global state ─── */
 
@@ -631,6 +631,48 @@ static int discover_sysent_table(void) {
 
     printf("[-] Could not discover PPR sysent table\n");
     return -1;
+}
+
+/*
+ * Find a safe code cave in kernel text by scanning for a region
+ * of consecutive zero bytes large enough for the kmod binary.
+ *
+ * Kernel text has alignment padding between sections that's
+ * typically filled with zeros. We scan for this.
+ */
+static uint64_t find_code_cave(size_t needed) {
+    uint8_t buf[4096];
+    /* Start after first 256KB (ELF headers, early code) and scan
+     * up to the text-data gap. For FW 4.03, gap is 0xC00000. */
+    uint64_t scan_start = g_ktext_base + 0x40000;
+    uint64_t scan_end = g_kdata_base;
+
+    printf("[*] Scanning ktext for code cave (%lu bytes needed)...\n", needed);
+    printf("[*] Scan range: 0x%lx - 0x%lx\n", scan_start, scan_end);
+
+    for (uint64_t addr = scan_start; addr + 4096 <= scan_end; addr += 4096) {
+        kernel_copyout(addr, buf, 4096);
+
+        /* Check for a run of zeros long enough */
+        int run = 0;
+        for (int i = 0; i < 4096; i++) {
+            if (buf[i] == 0x00 || buf[i] == 0xCC) {
+                run++;
+                if ((size_t)run >= needed + 64) { /* 64 bytes margin */
+                    uint64_t cave = addr + i - run + 33; /* 32-byte aligned */
+                    cave = (cave + 31) & ~31ULL;
+                    printf("[+] Code cave found at 0x%lx (run of %d bytes at page 0x%lx)\n",
+                           cave, run, addr);
+                    return cave;
+                }
+            } else {
+                run = 0;
+            }
+        }
+    }
+
+    printf("[-] No suitable code cave found in kernel text\n");
+    return 0;
 }
 
 /* ─── Research campaigns ─── */
@@ -1253,18 +1295,22 @@ static void campaign_kmod_vmmcall(void) {
            (uint64_t)result_phys, (uint64_t)result_uva);
 
     /*
-     * Use kernel code cave (ktext + 0x44000) to host the kmod.
-     * This is the same approach Byepervisor uses — the code cave
-     * is in kernel text which is already executable, avoiding the
-     * DMAP NX/PDPTE issues entirely.
+     * Find a safe code cave in kernel text by scanning for a
+     * region of zero bytes. Unlike Byepervisor's hardcoded
+     * offset (0x44000), which is FW-specific, this works on
+     * any FW by finding genuinely unused space.
      */
-    uint64_t code_cave_va = g_ktext_base + CODE_CAVE_OFFSET;
-    printf("[+] Code cave VA: 0x%lx\n", code_cave_va);
+    printf("\n[*] Step 1: Finding kernel code cave...\n");
+    uint64_t code_cave_va = find_code_cave(KMOD_BIN_SZ);
+    if (!code_cave_va) {
+        printf("[-] No safe code cave found\n");
+        return;
+    }
 
-    /* Step 1: Copy kmod code to the kernel code cave */
-    printf("\n[*] Step 1: Copying kmod to kernel code cave...\n");
+    /* Step 2: Copy kmod code to the code cave */
+    printf("\n[*] Step 2: Copying kmod to code cave...\n");
     kernel_copyin((void *)KMOD_BIN, code_cave_va, KMOD_BIN_SZ);
-    printf("[+] Copied %lu bytes to code cave at 0x%lx\n", KMOD_BIN_SZ, code_cave_va);
+    printf("[+] Copied %lu bytes to 0x%lx\n", KMOD_BIN_SZ, code_cave_va);
 
     /* Verify the copy by reading back first 8 bytes */
     uint64_t verify;
@@ -1278,39 +1324,41 @@ static void campaign_kmod_vmmcall(void) {
     }
     printf("[+] Code cave verification passed\n");
 
-    /* Step 2: Discover the sysent table */
-    printf("\n[*] Step 2: Discovering sysent table...\n");
+    /* Step 3: Discover the sysent table */
+    printf("\n[*] Step 3: Discovering sysent table...\n");
     if (!g_sysent_table && discover_sysent_table() != 0) {
         printf("[-] Failed to discover sysent table\n");
         return;
     }
 
-    /* Step 3: Install the kmod as a custom syscall */
-    printf("\n[*] Step 3: Installing kmod syscall...\n");
+    /* Step 4: Install the kmod as a custom syscall */
+    printf("\n[*] Step 4: Installing kmod syscall...\n");
     if (install_kmod_syscall(code_cave_va) != 0) {
         printf("[-] Failed to install kmod syscall\n");
         return;
     }
 
-    /* Step 4: Execute the kmod via syscall */
-    printf("\n[*] Step 4: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
-    printf("    This will execute VMMCALL instructions in kernel mode (ring 0).\n");
-    printf("    If the PS5 crashes, the HV rejected the VMMCALL.\n\n");
+    /* Step 5: Execute the kmod via syscall
+     * Start with MSR recon only (safe, no VMMCALL).
+     * The kmod uses STAC/CLAC to access the result buffer
+     * at its userland VA, avoiding DMAP PA range issues. */
+    printf("\n[*] Step 5: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
+    printf("    Running MSR reconnaissance (safe, no VMMCALL).\n\n");
 
-    /* The syscall passes: dmap_base, result_pa, flags */
+    /* Pass: dmap_base, result_uva (userland VA), flags (MSR only first) */
     int kmod_ret = syscall(KMOD_SYSCALL_NUM,
                            g_dmap_base,
-                           (uint64_t)result_phys,
-                           (uint64_t)(KMOD_FLAG_MSR_RECON | KMOD_FLAG_VMMCALL_ENUM));
+                           (uint64_t)result_uva,
+                           (uint64_t)KMOD_FLAG_MSR_RECON);
 
     printf("[*] Kmod syscall returned: %d\n", kmod_ret);
 
-    /* Step 5: Restore the original syscall */
-    printf("\n[*] Step 5: Restoring original syscall...\n");
+    /* Step 6: Restore the original syscall */
+    printf("\n[*] Step 6: Restoring original syscall...\n");
     restore_syscall();
 
     /* Step 5: Read and display results */
-    printf("\n[*] Step 6: Reading results...\n");
+    printf("\n[*] Step 7: Reading results...\n");
 
     if (result_uva->magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",

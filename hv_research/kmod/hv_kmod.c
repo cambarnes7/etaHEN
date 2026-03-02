@@ -72,7 +72,7 @@ struct kmod_result_buf {
 /* Syscall args passed from userland */
 struct kmod_args {
     uint64_t dmap_base;
-    uint64_t result_pa;
+    uint64_t result_va;   /* Userland VA of result buffer */
     uint64_t flags;
 };
 
@@ -112,6 +112,14 @@ static inline uint64_t read_cr4(void) {
 
 static inline void memory_barrier(void) {
     __asm__ volatile("mfence" ::: "memory");
+}
+
+/* SMAP control: allow/deny supervisor access to user-mode pages */
+static inline void stac(void) {
+    __asm__ volatile("stac" ::: "cc");
+}
+static inline void clac(void) {
+    __asm__ volatile("clac" ::: "cc");
 }
 
 /*
@@ -322,9 +330,14 @@ static void campaign_msr_recon(struct kmod_result_buf *buf) {
  * ============================================================ */
 
 int kmod_main(void *td, struct kmod_args *args) {
-    /* Compute result buffer virtual address via DMAP */
-    struct kmod_result_buf *buf = (struct kmod_result_buf *)
-        (args->dmap_base + args->result_pa);
+    /*
+     * Access the result buffer at its userland VA.
+     * Use STAC/CLAC to temporarily allow supervisor access
+     * to user-mode pages (bypass SMAP). This avoids the DMAP
+     * issue where ONION memory PAs are above the DMAP range.
+     */
+    stac();
+    struct kmod_result_buf *buf = (struct kmod_result_buf *)args->result_va;
 
     /* Initialize result buffer */
     buf->status = KMOD_STATUS_RUNNING;
@@ -358,5 +371,6 @@ int kmod_main(void *td, struct kmod_args *args) {
     buf->status = KMOD_STATUS_DONE;
     memory_barrier();
 
+    clac();  /* Restore SMAP protection */
     return 0;
 }
