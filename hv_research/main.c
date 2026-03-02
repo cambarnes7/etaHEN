@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/types.h>
 
 #include <ps5/kernel.h>
@@ -85,25 +86,25 @@ struct sbl_msg_header {
 #define MAILBOX_SLOT_SIZE 0x800
 #define MAILBOX_NUM       0x0E  /* We use slot 14 like etaHEN */
 
-/* ─── Embedded kernel module binary ─── */
+/* ─── Embedded kernel module (.ko) ─── */
 
 __asm__ (
     ".section .rodata\n"
-    ".global KMOD_BIN\n"
-    ".type KMOD_BIN, @object\n"
+    ".global KMOD_KO\n"
+    ".type KMOD_KO, @object\n"
     ".align 16\n"
-    "KMOD_BIN:\n"
-    ".incbin \"kmod/hv_kmod.bin\"\n"
-    "KMOD_BIN_END:\n"
-    ".global KMOD_BIN_SZ\n"
-    ".type KMOD_BIN_SZ, @object\n"
+    "KMOD_KO:\n"
+    ".incbin \"kmod/hv_kmod.ko\"\n"
+    "KMOD_KO_END:\n"
+    ".global KMOD_KO_SZ\n"
+    ".type KMOD_KO_SZ, @object\n"
     ".align 16\n"
-    "KMOD_BIN_SZ:\n"
-    ".quad KMOD_BIN_END - KMOD_BIN\n"
+    "KMOD_KO_SZ:\n"
+    ".quad KMOD_KO_END - KMOD_KO\n"
 );
 
-extern const unsigned char KMOD_BIN[];
-extern const uint64_t KMOD_BIN_SZ;
+extern const unsigned char KMOD_KO[];
+extern const uint64_t KMOD_KO_SZ;
 
 /* ─── Kmod shared data structures (must match kmod/hv_kmod.c) ─── */
 
@@ -142,24 +143,18 @@ struct kmod_result_buf {
     struct vmmcall_result results[KMOD_MAX_RESULTS];
 };
 
-/* Sysent entry layout (from Byepervisor) */
-struct ps5_sysent {
-    uint32_t n_arg;             /* 0x00 */
-    uint32_t pad_04h;           /* 0x04 */
-    uint64_t sy_call;           /* 0x08 */
-    uint64_t sy_auevent;        /* 0x10 */
-    uint64_t sy_systrace_args;  /* 0x18 */
-    uint32_t sy_entry;          /* 0x20 */
-    uint32_t sy_return;         /* 0x24 */
-    uint32_t sy_flags;          /* 0x28 */
-    uint32_t sy_thrcnt;         /* 0x2C */
-}; /* 0x30 bytes */
+/* kldsym lookup structure (matches FreeBSD sys/kld.h) */
+struct kld_sym_lookup {
+    int         version;    /* sizeof(struct kld_sym_lookup) */
+    char       *symname;    /* Symbol name to look up */
+    uint64_t    symvalue;   /* Returned: kernel VA of symbol */
+    uint64_t    symsize;    /* Returned: size of symbol */
+};
 
-/* Syscall number to hijack (unused high number) */
-#define KMOD_SYSCALL_NUM 510
-
-/* Code cave: dynamically found safe region in kernel text */
-/* No hardcoded offset — we scan for a page of zeros at runtime */
+#define SYS_kldload     304
+#define SYS_kldunload   305
+#define SYS_kldsym      337
+#define KLDSYM_LOOKUP   1
 
 /* ─── Global state ─── */
 
@@ -169,9 +164,6 @@ static uint64_t g_ktext_base = 0;
 static uint64_t g_fw_version = 0;
 static uint64_t g_mmio_vaddr = 0;
 static uint64_t g_cr3_phys = 0;   /* Kernel PML4 physical address */
-static uint64_t g_sysent_table = 0;  /* PPR sysent table address (discovered) */
-static struct ps5_sysent g_orig_sysent;  /* Original sysent entry for restoration */
-static int g_orig_sysent_saved = 0;
 
 /* Physical address of our message buffer */
 static off_t    g_msg_phys = 0;
@@ -561,155 +553,6 @@ static int init_sbl_direct(void) {
     g_mmio_vaddr = g_dmap_base + SBL_MMIO_PHYS_BASE;
     printf("[+] SBL MMIO VA: 0x%lx\n", g_mmio_vaddr);
 
-    return 0;
-}
-
-/*
- * Discover the PPR sysent table by directly scanning kernel memory
- * for the sysent array's distinctive pattern.
- *
- * The sysent table is an array of 0x30-byte entries. Each entry has
- * sy_call at offset 0x08 pointing to a kernel text function. Many
- * entries (unimplemented syscalls) point to the same nosys function.
- *
- * We scan kernel rodata for a region where multiple consecutive
- * 0x30-spaced entries have sy_call values in kernel text range.
- */
-static int discover_sysent_table(void) {
-    /*
-     * On Byepervisor FW 2.x, PPR_SYSENT is at kdata + ~0x166E00.
-     * On FW 4.03, it should be in a similar relative position.
-     * Scan a broad range of kernel data for the sysent pattern.
-     */
-    /* The sysent table could be in:
-     * - kernel rodata (between ktext and kdata) if it's const
-     * - kernel data (kdata + offset)
-     * On FW 4.03, the ktext-kdata gap is 12MB.
-     * Start scanning from kdata - 0x800000 (covers late rodata). */
-    uint64_t scan_start = g_kdata_base - 0x800000ULL;
-    uint64_t scan_end = g_kdata_base + 0x4000000ULL;  /* Through 64MB of kdata */
-    uint8_t buf[4096];
-
-    printf("[*] Scanning kernel memory for sysent table...\n");
-    printf("[*] Scan range: 0x%lx - 0x%lx\n", scan_start, scan_end);
-
-    for (uint64_t page = scan_start; page + 4096 <= scan_end; page += 4096) {
-        kernel_copyout(page, buf, 4096);
-
-        /* Check each qword in this page as a potential sysent[0].sy_call.
-         * The sysent table starts with n_arg(4) + pad(4) + sy_call(8).
-         * So sysent[0] starts at the table base, sy_call at offset 8.
-         * We look for the table base (where offset +8 is a ktext ptr). */
-        for (int i = 0; i + 0x30 * 4 < 4096; i += 8) {
-            /* Read what would be sysent[0].sy_call at this+0x08 */
-            uint64_t sy0;
-            if (i + 8 + 8 > 4096) break;
-            memcpy(&sy0, buf + i + 8, 8);
-
-            /* Must be in kernel text range */
-            if (sy0 < g_ktext_base || sy0 >= g_kdata_base)
-                continue;
-
-            /* Check sysent[1].sy_call at this+0x30+0x08 */
-            uint64_t sy1;
-            if (i + 0x30 + 8 + 8 > 4096) continue;
-            memcpy(&sy1, buf + i + 0x30 + 8, 8);
-            if (sy1 < g_ktext_base || sy1 >= g_kdata_base)
-                continue;
-
-            /* Check sysent[2].sy_call */
-            uint64_t sy2;
-            if (i + 0x60 + 8 + 8 > 4096) continue;
-            memcpy(&sy2, buf + i + 0x60 + 8, 8);
-            if (sy2 < g_ktext_base || sy2 >= g_kdata_base)
-                continue;
-
-            /* Strong signal: check that nosys (sy0) appears in
-             * multiple entries (many syscalls are unimplemented) */
-            int nosys_count = 0;
-            for (int e = 0; e < 20 && i + e * 0x30 + 8 + 8 <= 4096; e++) {
-                uint64_t sy;
-                memcpy(&sy, buf + i + e * 0x30 + 8, 8);
-                if (sy == sy0) nosys_count++;
-            }
-
-            /* nosys should appear in at least 5 of the first 20 entries */
-            if (nosys_count < 5)
-                continue;
-
-            uint64_t table_addr = page + i;
-
-            /* Final validation: read sysent[510] to confirm table is big enough.
-             * Read from kernel memory (might span pages). */
-            uint64_t target_sy_call;
-            kernel_copyout(table_addr + (KMOD_SYSCALL_NUM * 0x30) + 0x08,
-                          &target_sy_call, 8);
-
-            if (target_sy_call < g_ktext_base || target_sy_call >= g_kdata_base) {
-                /* Entry 510 doesn't look valid, might be PS4 compat table
-                 * (smaller). Skip and keep looking. */
-                continue;
-            }
-
-            printf("[+] PPR sysent table found at 0x%lx\n", table_addr);
-            printf("[+] sysent[0].sy_call=0x%lx (nosys, appears %d/20 times)\n",
-                   sy0, nosys_count);
-            printf("[+] sysent[1].sy_call=0x%lx sysent[2].sy_call=0x%lx\n", sy1, sy2);
-            printf("[+] sysent[%d].sy_call=0x%lx (nosys=%s)\n",
-                   KMOD_SYSCALL_NUM, target_sy_call,
-                   target_sy_call == sy0 ? "yes" : "no");
-            g_sysent_table = table_addr;
-            return 0;
-        }
-    }
-
-    printf("[-] Could not discover PPR sysent table\n");
-    return -1;
-}
-
-/*
- * Find a safe data cave in kernel BSS/data by scanning for a
- * page-aligned region of consecutive zero bytes. We then clear
- * NX on it to make it executable.
- *
- * Unlike kernel text, kernel data has PAs in the low range that
- * are covered by the DMAP, so clear_nx_for_range will work.
- *
- * We start scanning deep into kernel data (past critical structures)
- * to avoid clobbering anything important. Byepervisor's DATA_CAVE
- * is around kdata + 0x60C0000 on FW 2.x, so we search a similar range.
- */
-static uint64_t find_data_cave(size_t needed) {
-    uint8_t buf[4096];
-    /* Scan deep in kernel data where BSS zeros are likely.
-     * Start at kdata + 0x4000000 (~64MB in), end well before
-     * the known structures at kdata + 0x66E74C0 (ROOTVNODE). */
-    uint64_t scan_start = g_kdata_base + 0x4000000;
-    uint64_t scan_end   = g_kdata_base + 0x6400000;
-
-    printf("[*] Scanning kernel data for data cave (%lu bytes needed)...\n", needed);
-    printf("[*] Scan range: 0x%lx - 0x%lx\n", scan_start, scan_end);
-
-    for (uint64_t addr = scan_start; addr + 4096 <= scan_end; addr += 4096) {
-        kernel_copyout(addr, buf, 4096);
-
-        /* Look for a full page of zeros — safest to use an entire
-         * zero page rather than a partial run */
-        int all_zero = 1;
-        for (int i = 0; i < 4096; i++) {
-            if (buf[i] != 0x00) {
-                all_zero = 0;
-                break;
-            }
-        }
-
-        if (all_zero) {
-            printf("[+] Data cave found: full zero page at 0x%lx\n", addr);
-            return addr;
-        }
-    }
-
-    printf("[-] No suitable data cave found in kernel data\n");
     return 0;
 }
 
@@ -1107,365 +950,183 @@ static void campaign_iommu_recon(void) {
     }
 }
 
-/* ─── Kernel Module Loader ─── */
-
 /*
- * Clear NX bit in guest page table entries for a DMAP address range.
- * This makes the pages executable, enabling kernel code execution.
- * Works on FW < 6.50 because GMET is not enforced.
+ * Campaign 7: Kernel Module via kldload
  *
- * x86-64 page table walk:
- *   PML4[bits 47:39] -> PDPT[bits 38:30] -> PD[bits 29:21] -> PT[bits 20:12]
- *   NX bit = bit 63 of each entry
- *   PS bit = bit 7 (indicates 2MB page in PDE, 1GB page in PDPTE)
- */
-static int clear_nx_for_range(uint64_t va, size_t len) {
-    if (!g_cr3_phys || !g_dmap_base) {
-        printf("[-] Cannot clear NX: no CR3/DMAP\n");
-        return -1;
-    }
-
-    uint64_t pml4_pa = g_cr3_phys & ~0xFFFULL;
-    uint64_t end_va = va + len;
-
-    printf("[*] Clearing NX for VA range 0x%lx - 0x%lx\n", va, end_va);
-
-    /* Process each 2MB-aligned region */
-    for (uint64_t addr = va & ~0x1FFFFFULL; addr < end_va; addr += 0x200000) {
-        uint64_t pml4e_idx = (addr >> 39) & 0x1FF;
-        uint64_t pdpte_idx = (addr >> 30) & 0x1FF;
-        uint64_t pde_idx   = (addr >> 21) & 0x1FF;
-
-        /* Read PML4 entry */
-        uint64_t pml4e;
-        uint64_t pml4e_addr = g_dmap_base + pml4_pa + pml4e_idx * 8;
-        kernel_copyout(pml4e_addr, &pml4e, 8);
-
-        if (!(pml4e & 1)) {
-            printf("[-] PML4E[%lu] not present for VA 0x%lx\n", pml4e_idx, addr);
-            continue;
-        }
-
-        /* Clear NX on PML4E */
-        if (pml4e & (1ULL << 63)) {
-            pml4e &= ~(1ULL << 63);
-            kernel_copyin(&pml4e, pml4e_addr, 8);
-        }
-
-        /* Read PDPT entry */
-        uint64_t pdpt_pa = pml4e & 0x000FFFFFFFFFF000ULL;
-        uint64_t pdpte;
-        uint64_t pdpte_addr = g_dmap_base + pdpt_pa + pdpte_idx * 8;
-        kernel_copyout(pdpte_addr, &pdpte, 8);
-
-        if (!(pdpte & 1)) {
-            printf("[-] PDPTE[%lu] not present for VA 0x%lx\n", pdpte_idx, addr);
-            continue;
-        }
-
-        /* Clear NX on PDPTE */
-        if (pdpte & (1ULL << 63)) {
-            pdpte &= ~(1ULL << 63);
-            kernel_copyin(&pdpte, pdpte_addr, 8);
-        }
-
-        /* Check for 1GB page */
-        if (pdpte & (1 << 7)) {
-            printf("[+] 1GB page at PDPTE[%lu], NX cleared\n", pdpte_idx);
-            continue;
-        }
-
-        /* Read PD entry */
-        uint64_t pd_pa = pdpte & 0x000FFFFFFFFFF000ULL;
-        uint64_t pde;
-        uint64_t pde_addr = g_dmap_base + pd_pa + pde_idx * 8;
-        kernel_copyout(pde_addr, &pde, 8);
-
-        if (!(pde & 1)) {
-            printf("[-] PDE[%lu] not present for VA 0x%lx\n", pde_idx, addr);
-            continue;
-        }
-
-        /* Clear NX on PDE */
-        if (pde & (1ULL << 63)) {
-            pde &= ~(1ULL << 63);
-            kernel_copyin(&pde, pde_addr, 8);
-            printf("[+] Cleared NX on PDE[%lu] for VA 0x%lx (2MB page=%d)\n",
-                   pde_idx, addr, !!(pde & (1 << 7)));
-        }
-
-        /* If not a 2MB page, walk into 4K page table */
-        if (!(pde & (1 << 7))) {
-            uint64_t pt_pa = pde & 0x000FFFFFFFFFF000ULL;
-            uint64_t pte_start = (addr >> 12) & 0x1FF;
-            uint64_t pte_end = pte_start + ((0x200000 - 1) >> 12);
-            if (pte_end > 511) pte_end = 511;
-
-            for (uint64_t pi = pte_start; pi <= pte_end; pi++) {
-                uint64_t pte;
-                uint64_t pte_addr = g_dmap_base + pt_pa + pi * 8;
-                kernel_copyout(pte_addr, &pte, 8);
-                if ((pte & 1) && (pte & (1ULL << 63))) {
-                    pte &= ~(1ULL << 63);
-                    kernel_copyin(&pte, pte_addr, 8);
-                }
-            }
-            printf("[+] Cleared NX on 4K PTEs for VA 0x%lx range\n", addr);
-        }
-    }
-
-    /* Flush TLB by reloading CR3 - we do this indirectly */
-    printf("[+] NX bits cleared. TLB will flush on next context switch.\n");
-    return 0;
-}
-
-/*
- * Install our kmod as a custom syscall handler.
- * Uses the dynamically discovered g_sysent_table to point
- * syscall N to the kmod's entry point.
- */
-static int install_kmod_syscall(uint64_t kmod_exec_va) {
-    if (!g_sysent_table) {
-        printf("[-] Sysent table not discovered\n");
-        return -1;
-    }
-
-    printf("[*] PPR sysent table at: 0x%lx\n", g_sysent_table);
-
-    /* Calculate the sysent entry address for our syscall */
-    uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
-
-    /* Save original sysent entry for restoration */
-    kernel_copyout(entry_addr, &g_orig_sysent, sizeof(g_orig_sysent));
-    g_orig_sysent_saved = 1;
-    printf("[*] Original sysent[%d]: sy_call=0x%lx n_arg=%u flags=0x%x\n",
-           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call, g_orig_sysent.n_arg, g_orig_sysent.sy_flags);
-
-    /* Install our kmod as the syscall handler */
-    struct ps5_sysent new_entry;
-    memset(&new_entry, 0, sizeof(new_entry));
-    new_entry.n_arg = 3;               /* td is implicit; we pass 3 user args */
-    new_entry.sy_call = kmod_exec_va;   /* Point to kmod code */
-    new_entry.sy_flags = 0;
-    new_entry.sy_thrcnt = 1;            /* SY_THR_STATIC */
-
-    kernel_copyin(&new_entry, entry_addr, sizeof(new_entry));
-    printf("[+] Installed kmod at syscall %d (sy_call=0x%lx)\n",
-           KMOD_SYSCALL_NUM, kmod_exec_va);
-
-    return 0;
-}
-
-/*
- * Restore the original sysent entry after kmod execution.
- */
-static void restore_syscall(void) {
-    if (!g_sysent_table || !g_orig_sysent_saved) return;
-
-    uint64_t entry_addr = g_sysent_table + (KMOD_SYSCALL_NUM * sizeof(struct ps5_sysent));
-
-    /* Restore the original sysent entry (with proper nosys address) */
-    kernel_copyin(&g_orig_sysent, entry_addr, sizeof(g_orig_sysent));
-    printf("[+] Restored syscall %d (sy_call=0x%lx)\n",
-           KMOD_SYSCALL_NUM, g_orig_sysent.sy_call);
-}
-
-/*
- * Campaign 7: Kernel Module VMMCALL Fuzzing
+ * This is the core HV research campaign. It uses FreeBSD's native
+ * kernel module loading (kldload) instead of sysent hijacking:
  *
- * This is the core HV research campaign. It:
- * 1. Allocates physical memory for the kmod code + shared result buffer
- * 2. Copies the embedded kmod binary to the physical memory
- * 3. Computes the DMAP virtual address for the kmod
- * 4. Clears NX bits in guest page tables (works because GMET is off on FW 4.03)
- * 5. Installs the kmod as a custom syscall handler
- * 6. Executes the syscall, which runs the kmod in ring 0
- * 7. Reads results from the shared buffer
+ * 1. Write the embedded .ko file to disk
+ * 2. Call kldload() to load it into the kernel
+ *    - The kernel linker allocates memory, handles relocations
+ *    - SYSINIT callback runs our init code in ring 0
+ *    - Init reads MSRs, CRs, and optionally executes VMMCALLs
+ * 3. Use kldsym() to find the hv_results symbol
+ * 4. kernel_copyout() the results to userland
+ * 5. kldunload() to clean up
+ *
+ * Advantages over sysent hijacking:
+ *   - No sysent table scanning (was failing)
+ *   - No data cave hunting
+ *   - No NX bit clearing
+ *   - Kernel handles all memory management and relocation
+ *   - Works on FW < 6.50 (GMET not enforced)
  */
-static void campaign_kmod_vmmcall(void) {
+static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
-    printf("  Campaign 7: Kernel Module VMMCALL Fuzzing\n");
+    printf("  Campaign 7: Kernel Module (kldload)\n");
     printf("=============================================\n\n");
 
-    if (!g_dmap_base || !g_cr3_phys) {
-        printf("[-] DMAP/CR3 not available, cannot load kmod\n");
+    printf("[*] Kernel module (.ko) size: %lu bytes\n", KMOD_KO_SZ);
+
+    /* Step 1: Write .ko to disk */
+    printf("\n[*] Step 1: Writing hv_kmod.ko to disk...\n");
+
+    FILE *ko = fopen("/data/etaHEN/hv_kmod.ko", "wb");
+    if (!ko) {
+        printf("[-] Failed to create /data/etaHEN/hv_kmod.ko: %s\n", strerror(errno));
         return;
     }
 
-    printf("[*] Kmod binary size: %lu bytes\n", KMOD_BIN_SZ);
+    size_t written = fwrite(KMOD_KO, 1, (size_t)KMOD_KO_SZ, ko);
+    fclose(ko);
 
-    /* Allocate userland memory for the result buffer.
-     * The kmod code will be copied to a kernel data cave. */
-    size_t result_size = sizeof(struct kmod_result_buf);
-    size_t result_pages = (result_size + 0x3FFF) & ~0x3FFFULL;
-    if (result_pages < 0x4000)
-        result_pages = 0x4000;
-
-    off_t result_phys = 0;
-    int ret = sceKernelAllocateDirectMemory(
-        0, 0x180000000ULL,
-        result_pages, 0x4000,
-        SCE_KERNEL_WB_ONION,
-        &result_phys
-    );
-    if (ret != 0) {
-        printf("[-] Failed to allocate result buffer: 0x%x\n", ret);
+    if (written != (size_t)KMOD_KO_SZ) {
+        printf("[-] Short write: %zu/%lu bytes\n", written, KMOD_KO_SZ);
+        unlink("/data/etaHEN/hv_kmod.ko");
         return;
     }
+    printf("[+] Wrote hv_kmod.ko (%zu bytes)\n", written);
 
-    void *result_uva_raw = NULL;
-    ret = sceKernelMapDirectMemory(
-        &result_uva_raw, result_pages,
-        SCE_KERNEL_PROT_CPU_RW,
-        0, result_phys, 0x4000
-    );
-    if (ret != 0) {
-        printf("[-] Failed to map result buffer: 0x%x\n", ret);
+    /* Step 2: Load the kernel module via kldload */
+    printf("\n[*] Step 2: Loading kernel module via kldload(2)...\n");
+    printf("    The kernel linker will:\n");
+    printf("    - Parse the ET_REL ELF\n");
+    printf("    - Allocate kernel memory\n");
+    printf("    - Process relocations\n");
+    printf("    - Call SYSINIT (our init runs MSR/VMMCALL campaigns)\n");
+
+    int kid = syscall(SYS_kldload, "/data/etaHEN/hv_kmod.ko");
+    if (kid < 0) {
+        int err = errno;
+        printf("[-] kldload failed: kid=%d, errno=%d (%s)\n", kid, err, strerror(err));
+
+        if (err == 1 /* EPERM */) {
+            printf("    EPERM: securelevel or priv_check rejected the load.\n");
+            printf("    May need to patch securelevel or use kernel R/W to bypass.\n");
+        } else if (err == 2 /* ENOENT */) {
+            printf("    ENOENT: file not found. Check /data/etaHEN/ exists.\n");
+        } else if (err == 8 /* ENOEXEC */) {
+            printf("    ENOEXEC: kernel rejected the ELF format.\n");
+            printf("    Check OSABI (should be FreeBSD) and ELF type (should be ET_REL).\n");
+        }
+
+        unlink("/data/etaHEN/hv_kmod.ko");
         return;
     }
+    printf("[+] Module loaded! kid=%d\n", kid);
+    printf("    SYSINIT has already executed - campaigns complete.\n");
 
-    struct kmod_result_buf *result_uva = (struct kmod_result_buf *)result_uva_raw;
-    memset(result_uva, 0, result_pages);
+    /* Step 3: Find hv_results symbol via kldsym */
+    printf("\n[*] Step 3: Looking up hv_results symbol via kldsym...\n");
 
-    printf("[+] Result buffer: PA=0x%lx userland_VA=0x%lx\n",
-           (uint64_t)result_phys, (uint64_t)result_uva);
+    struct kld_sym_lookup sym;
+    memset(&sym, 0, sizeof(sym));
+    sym.version = sizeof(struct kld_sym_lookup);
+    sym.symname = "hv_results";
 
-    /*
-     * Find a data cave in kernel BSS (page of zeros deep in kdata).
-     * Unlike kernel text, kernel data has PAs in the low range
-     * that the DMAP covers, so we can clear NX on it.
-     */
-    printf("\n[*] Step 1: Finding kernel data cave...\n");
-    uint64_t cave_va = find_data_cave(KMOD_BIN_SZ);
-    if (!cave_va) {
-        printf("[-] No safe data cave found\n");
+    int ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
+    if (ret < 0) {
+        int err = errno;
+        printf("[-] kldsym failed: ret=%d, errno=%d (%s)\n", ret, err, strerror(err));
+        printf("    Symbol 'hv_results' not found in module.\n");
+        printf("    Attempting to unload module...\n");
+        syscall(SYS_kldunload, kid);
+        unlink("/data/etaHEN/hv_kmod.ko");
         return;
     }
+    printf("[+] hv_results at kernel VA 0x%lx (size=%lu)\n",
+           (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
 
-    /* Step 2: Clear NX on the data cave page to make it executable.
-     * This works because kernel data PAs are in the low range
-     * covered by the DMAP (unlike ONION memory PAs at ~0x2000000000). */
-    printf("\n[*] Step 2: Clearing NX on data cave page...\n");
-    if (clear_nx_for_range(cave_va, 4096) != 0) {
-        printf("[-] Failed to clear NX on data cave\n");
-        return;
-    }
+    /* Step 4: Read results via kernel_copyout */
+    printf("\n[*] Step 4: Reading results from kernel memory...\n");
 
-    /* Step 3: Copy kmod code to the data cave */
-    printf("\n[*] Step 3: Copying kmod to data cave...\n");
-    kernel_copyin((void *)KMOD_BIN, cave_va, KMOD_BIN_SZ);
-    printf("[+] Copied %lu bytes to 0x%lx\n", KMOD_BIN_SZ, cave_va);
+    struct kmod_result_buf results;
+    kernel_copyout(sym.symvalue, &results, sizeof(results));
 
-    /* Verify the copy */
-    uint64_t verify;
-    kernel_copyout(cave_va, &verify, 8);
-    uint64_t expected;
-    memcpy(&expected, KMOD_BIN, 8);
-    if (verify != expected) {
-        printf("[-] Data cave verification failed: got 0x%lx, expected 0x%lx\n",
-               verify, expected);
-        return;
-    }
-    printf("[+] Data cave verification passed\n");
-
-    /* Step 4: Discover the sysent table */
-    printf("\n[*] Step 4: Discovering sysent table...\n");
-    if (!g_sysent_table && discover_sysent_table() != 0) {
-        printf("[-] Failed to discover sysent table\n");
-        return;
-    }
-
-    /* Step 5: Install the kmod as a custom syscall */
-    printf("\n[*] Step 5: Installing kmod syscall...\n");
-    if (install_kmod_syscall(cave_va) != 0) {
-        printf("[-] Failed to install kmod syscall\n");
-        return;
-    }
-
-    /* Step 6: Execute the kmod via syscall
-     * Start with MSR recon only (safe, no VMMCALL).
-     * The kmod uses STAC/CLAC to access the result buffer
-     * at its userland VA, avoiding DMAP PA range issues. */
-    printf("\n[*] Step 6: Executing kmod via syscall %d...\n", KMOD_SYSCALL_NUM);
-    printf("    Running MSR reconnaissance (safe, no VMMCALL).\n\n");
-
-    /* Pass: dmap_base, result_uva (userland VA), flags (MSR only first) */
-    int kmod_ret = syscall(KMOD_SYSCALL_NUM,
-                           g_dmap_base,
-                           (uint64_t)result_uva,
-                           (uint64_t)KMOD_FLAG_MSR_RECON);
-
-    printf("[*] Kmod syscall returned: %d\n", kmod_ret);
-
-    /* Step 7: Restore the original syscall */
-    printf("\n[*] Step 7: Restoring original syscall...\n");
-    restore_syscall();
-
-    /* Step 5: Read and display results */
-    printf("\n[*] Step 8: Reading results...\n");
-
-    if (result_uva->magic != KMOD_MAGIC) {
+    if (results.magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
-               (unsigned long long)KMOD_MAGIC, (unsigned long long)result_uva->magic);
-        printf("    The kmod may not have executed successfully.\n");
-        return;
-    }
+               (unsigned long long)KMOD_MAGIC, (unsigned long long)results.magic);
+        printf("    The module init may not have run or SYSINIT dispatch failed.\n");
+    } else {
+        printf("[+] Kmod status: %s\n",
+               results.status == KMOD_STATUS_DONE ? "COMPLETE" :
+               results.status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
+               "UNKNOWN");
 
-    printf("[+] Kmod status: %s\n",
-           result_uva->status == KMOD_STATUS_DONE ? "COMPLETE" :
-           result_uva->status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
-           "UNKNOWN");
+        /* Display MSR results */
+        if (results.num_msr_results > 0) {
+            printf("\n[+] MSR/CR Reconnaissance Results (%u entries):\n",
+                   results.num_msr_results);
+            for (uint32_t i = 0; i < results.num_msr_results; i++) {
+                uint32_t msr_id = results.msr_results[i].msr_id;
+                uint64_t value  = results.msr_results[i].value;
+                const char *name = "";
 
-    /* Display MSR results */
-    if (result_uva->num_msr_results > 0) {
-        printf("\n[+] MSR/CR Reconnaissance Results (%u entries):\n", result_uva->num_msr_results);
-        for (uint32_t i = 0; i < result_uva->num_msr_results; i++) {
-            uint32_t msr_id = result_uva->msr_results[i].msr_id;
-            uint64_t value  = result_uva->msr_results[i].value;
-            const char *name = "";
-
-            switch (msr_id) {
-                case 0xC0000080: name = "EFER"; break;
-                case 0xC0000081: name = "STAR"; break;
-                case 0xC0000082: name = "LSTAR"; break;
-                case 0xC0000084: name = "SFMASK"; break;
-                case 0xC0000100: name = "FS_BASE"; break;
-                case 0xC0000101: name = "GS_BASE"; break;
-                case 0xC0000102: name = "KGS_BASE"; break;
-                case 0xC0000103: name = "TSC_AUX"; break;
-                case 0xFFFF0000: name = "CR0"; break;
-                case 0xFFFF0003: name = "CR3"; break;
-                case 0xFFFF0004: name = "CR4"; break;
-                default: name = "???"; break;
+                switch (msr_id) {
+                    case 0xC0000080: name = "EFER"; break;
+                    case 0xC0000081: name = "STAR"; break;
+                    case 0xC0000082: name = "LSTAR"; break;
+                    case 0xC0000084: name = "SFMASK"; break;
+                    case 0xC0000100: name = "FS_BASE"; break;
+                    case 0xC0000101: name = "GS_BASE"; break;
+                    case 0xC0000102: name = "KGS_BASE"; break;
+                    case 0xC0000103: name = "TSC_AUX"; break;
+                    case 0xFFFF0000: name = "CR0"; break;
+                    case 0xFFFF0003: name = "CR3"; break;
+                    case 0xFFFF0004: name = "CR4"; break;
+                    default: name = "???"; break;
+                }
+                printf("    %-10s (0x%08x) = 0x%016lx\n", name, msr_id, value);
             }
-            printf("    %-10s (0x%08x) = 0x%016lx\n", name, msr_id, value);
+        }
+
+        /* Display VMMCALL results */
+        if (results.num_results > 0) {
+            printf("\n[+] VMMCALL Fuzzing Results (%u entries):\n", results.num_results);
+            printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+                   "RAX_in", "RAX_out", "RCX_out", "RDX_out", "Campaign", "OK");
+            printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
+                   "------", "------------------", "------------------",
+                   "------------------", "----------", "----");
+
+            for (uint32_t i = 0; i < results.num_results; i++) {
+                struct vmmcall_result *r = &results.results[i];
+                printf("    0x%04lx 0x%016lx 0x%016lx 0x%016lx  camp=%u     %s\n",
+                       r->rax_in, r->rax_out, r->rcx_out, r->rdx_out,
+                       r->campaign_id, r->survived ? "YES" : "NO");
+            }
+        } else if (results.status == KMOD_STATUS_RUNNING) {
+            printf("\n[-] No VMMCALL results. Module init appears to have crashed during:\n");
+            printf("    Campaign %u, probe %u\n",
+                   results.current_campaign, results.current_probe);
         }
     }
 
-    /* Display VMMCALL results */
-    if (result_uva->num_results > 0) {
-        printf("\n[+] VMMCALL Fuzzing Results (%u entries):\n", result_uva->num_results);
-        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
-               "RAX_in", "RAX_out", "RCX_out", "RDX_out", "Campaign", "OK");
-        printf("    %-6s %-18s %-18s %-18s %-10s %-4s\n",
-               "------", "------------------", "------------------",
-               "------------------", "----------", "----");
-
-        for (uint32_t i = 0; i < result_uva->num_results; i++) {
-            struct vmmcall_result *r = &result_uva->results[i];
-            printf("    0x%04lx 0x%016lx 0x%016lx 0x%016lx  camp=%u     %s\n",
-                   r->rax_in, r->rax_out, r->rcx_out, r->rdx_out,
-                   r->campaign_id, r->survived ? "YES" : "NO");
-        }
-    } else if (result_uva->status == KMOD_STATUS_RUNNING) {
-        printf("\n[-] No VMMCALL results. Kmod appears to have crashed during:\n");
-        printf("    Campaign %u, probe %u\n",
-               result_uva->current_campaign, result_uva->current_probe);
-        printf("    This means the HV killed the guest at VMMCALL with RAX=0x%x\n",
-               result_uva->current_probe);
+    /* Step 5: Unload the module */
+    printf("\n[*] Step 5: Unloading kernel module...\n");
+    ret = syscall(SYS_kldunload, kid);
+    if (ret < 0) {
+        printf("[!] kldunload failed: errno=%d (%s)\n", errno, strerror(errno));
+        printf("    Module may still be loaded in kernel memory.\n");
+    } else {
+        printf("[+] Module unloaded successfully.\n");
     }
 
-    notify("[HV Research] Kmod VMMCALL campaign complete!");
+    /* Clean up the .ko file */
+    unlink("/data/etaHEN/hv_kmod.ko");
+
+    notify("[HV Research] Kmod kldload campaign complete!");
 }
 
 /* ─── Main entry point ─── */
@@ -1519,12 +1180,8 @@ int main(void) {
     /* Run research campaigns */
     campaign_kernel_recon();
 
-    /* Campaign 7: Kernel module VMMCALL fuzzing (highest priority) */
-    if (g_dmap_base && g_cr3_phys) {
-        campaign_kmod_vmmcall();
-    } else {
-        printf("[!] Skipping kmod campaign (no DMAP/CR3)\n");
-    }
+    /* Campaign 7: Kernel module via kldload (highest priority) */
+    campaign_kmod_kldload();
 
     if (g_dmap_base) {
         campaign_iommu_recon();

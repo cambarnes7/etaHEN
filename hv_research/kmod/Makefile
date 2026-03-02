@@ -1,19 +1,22 @@
 #
-# PS5 HV Research - Kernel Module Build
+# PS5 HV Research - Kernel Module Build (KLD)
 #
-# Builds a flat binary (.bin) for loading into PS5 kernel memory.
-# Uses system clang with bare-metal target (no OS dependencies).
+# Builds a FreeBSD kernel loadable module (.ko) for loading via kldload(2).
+# The .ko is an ET_REL ELF object file - the kernel linker handles
+# relocation, memory allocation, and SYSINIT dispatch.
 #
 
 CC := clang
-LD := ld.lld
-OBJCOPY := llvm-objcopy
 
-ELF := hv_kmod.elf
-BIN := hv_kmod.bin
+KO := hv_kmod.ko
 
-# Kernel-mode compilation flags (matches ps5-kld-sdk approach)
-CFLAGS := --target=x86_64-unknown-none-elf \
+# Kernel-mode compilation flags for FreeBSD KLD
+# - target: FreeBSD x86_64 (sets ELF OSABI correctly)
+# - mcmodel=kernel: negative 2GB addressing (kernel VA space)
+# - mno-red-zone: kernel code must not use red zone
+# - msoft-float: no FPU in kernel context
+# - -c: produce ET_REL object (the .ko format)
+CFLAGS := --target=x86_64-unknown-freebsd \
           -D_KERNEL \
           -std=c11 \
           -Os \
@@ -24,33 +27,24 @@ CFLAGS := --target=x86_64-unknown-none-elf \
           -nostdlib \
           -fno-stack-protector \
           -fno-plt \
-          -fPIC \
-          -mcmodel=small \
+          -fno-pic \
+          -fno-common \
+          -mcmodel=kernel \
           -march=znver2 \
           -mno-red-zone \
           -mno-mmx \
           -mno-sse \
-          -msoft-float \
-          -ffunction-sections \
-          -fdata-sections
+          -msoft-float
 
-LDFLAGS := -T linker.x \
-           --gc-sections \
-           --build-id=none
+all: $(KO)
 
-all: $(BIN)
-
-$(ELF): hv_kmod.o
-	$(LD) $(LDFLAGS) -o $@ $^
-
-hv_kmod.o: hv_kmod.c
+# Compile directly to .ko (ET_REL ELF with relocations intact)
+# No linking step - the kernel linker handles everything
+$(KO): hv_kld.c
 	$(CC) $(CFLAGS) -c -o $@ $<
-
-$(BIN): $(ELF)
-	$(OBJCOPY) -S -O binary $< $@
-	@echo "Kernel module built: $(BIN) ($$(stat -c %s $(BIN)) bytes)"
+	@echo "Kernel module built: $(KO) ($$(stat -c %s $(KO)) bytes)"
 
 clean:
-	rm -f *.o $(ELF) $(BIN)
+	rm -f *.o $(KO)
 
 .PHONY: all clean
