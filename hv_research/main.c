@@ -574,7 +574,9 @@ static int discover_sysent_table(void) {
     uint64_t first_proc;
     kernel_copyout(KERNEL_ADDRESS_ALLPROC, &first_proc, 8);
 
-    if (first_proc < g_kdata_base || first_proc > g_kdata_base + 0x80000000ULL) {
+    /* Proc pointers can be in DMAP space (kernel heap via physical memory)
+     * or in kernel data space. Accept any high-canonical address. */
+    if ((first_proc >> 47) != 0x1FFFF) {
         printf("[-] allproc first entry looks invalid: 0x%lx\n", first_proc);
         return -1;
     }
@@ -592,8 +594,8 @@ static int discover_sysent_table(void) {
         uint64_t candidate;
         kernel_copyout(first_proc + off, &candidate, 8);
 
-        /* Must be a kernel address */
-        if (candidate < g_ktext_base || candidate > g_kdata_base + 0x80000000ULL)
+        /* Must be a kernel text/data address (sysentvec is in kernel rodata) */
+        if (candidate < g_ktext_base || candidate > g_kdata_base + 0x10000000ULL)
             continue;
 
         /* Read sv_size (offset 0 in sysentvec) */
