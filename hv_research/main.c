@@ -429,21 +429,82 @@ static int discover_sbl_offsets(void) {
 /* ─── Physical address resolution via page tables ─── */
 
 /*
- * Get the physical address of a kernel virtual address.
- * This walks the 4-level page tables through DMAP.
+ * Walk AMD64 4-level page tables to resolve a virtual address to
+ * its CPU physical address. Uses DMAP + CR3 to read page table entries.
+ *
+ * This is critical because sceKernelAllocateDirectMemory returns
+ * PS5 direct memory bus addresses (e.g., 0x2000xxxxxxxx) which are
+ * NOT CPU physical addresses. Only a page table walk gives the real
+ * CPU PA that DMAP maps.
+ *
+ * Handles 4KB, 2MB (huge), and 1GB (giant) pages.
  */
-static uint64_t kva_to_pa(uint64_t va) {
-    /* We need the kernel's PML4 (CR3). We can get it from the kernel pmap. */
-    /* For now, use a simplified approach via DMAP scanning */
+#define PTE_PRESENT   (1ULL << 0)
+#define PTE_PS        (1ULL << 7)   /* Page Size bit (huge/giant page) */
+#define PTE_PA_MASK   0x000FFFFFFFFFF000ULL
 
-    /* If the address is already in DMAP range, just subtract DMAP base */
+static uint64_t va_to_cpu_pa(uint64_t va) {
+    if (!g_cr3_phys || !g_dmap_base) {
+        printf("[!] va_to_cpu_pa: no CR3 or DMAP base available\n");
+        return 0;
+    }
+
+    uint64_t pml4_idx = (va >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (va >> 30) & 0x1FF;
+    uint64_t pd_idx   = (va >> 21) & 0x1FF;
+    uint64_t pt_idx   = (va >> 12) & 0x1FF;
+
+    /* Level 4: PML4 */
+    uint64_t pml4e;
+    kernel_copyout(g_dmap_base + g_cr3_phys + pml4_idx * 8, &pml4e, 8);
+    if (!(pml4e & PTE_PRESENT)) {
+        printf("[!] PML4E[%lu] not present for VA 0x%lx\n", (unsigned long)pml4_idx, va);
+        return 0;
+    }
+
+    /* Level 3: PDPT */
+    uint64_t pdpte;
+    kernel_copyout(g_dmap_base + (pml4e & PTE_PA_MASK) + pdpt_idx * 8, &pdpte, 8);
+    if (!(pdpte & PTE_PRESENT)) {
+        printf("[!] PDPTE[%lu] not present for VA 0x%lx\n", (unsigned long)pdpt_idx, va);
+        return 0;
+    }
+    if (pdpte & PTE_PS) {
+        /* 1GB giant page */
+        return (pdpte & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
+    }
+
+    /* Level 2: PD */
+    uint64_t pde;
+    kernel_copyout(g_dmap_base + (pdpte & PTE_PA_MASK) + pd_idx * 8, &pde, 8);
+    if (!(pde & PTE_PRESENT)) {
+        printf("[!] PDE[%lu] not present for VA 0x%lx\n", (unsigned long)pd_idx, va);
+        return 0;
+    }
+    if (pde & PTE_PS) {
+        /* 2MB huge page */
+        return (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+    }
+
+    /* Level 1: PT */
+    uint64_t pte;
+    kernel_copyout(g_dmap_base + (pde & PTE_PA_MASK) + pt_idx * 8, &pte, 8);
+    if (!(pte & PTE_PRESENT)) {
+        printf("[!] PTE[%lu] not present for VA 0x%lx\n", (unsigned long)pt_idx, va);
+        return 0;
+    }
+
+    /* 4KB page */
+    return (pte & PTE_PA_MASK) | (va & 0xFFF);
+}
+
+static uint64_t kva_to_pa(uint64_t va) {
+    /* DMAP addresses: just subtract DMAP base */
     if (g_dmap_base && va >= g_dmap_base && va < g_dmap_base + 0x800000000ULL) {
         return va - g_dmap_base;
     }
-
-    /* Otherwise we need full page table walk - not implemented yet */
-    printf("[!] kva_to_pa: address 0x%lx is not in DMAP range\n", va);
-    return 0;
+    /* Otherwise, full page table walk */
+    return va_to_cpu_pa(va);
 }
 
 /* ─── Direct MMIO SBL communication ─── */
@@ -1030,10 +1091,39 @@ static void campaign_kmod_kldload(void) {
 
     memset(result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
 
-    uint64_t result_kva = g_dmap_base + (uint64_t)result_phys;
-    printf("[+] Result buffer: userland VA=0x%lx, PA=0x%lx, kernel VA=0x%lx\n",
-           (unsigned long)result_vaddr, (unsigned long)result_phys,
-           (unsigned long)result_kva);
+    /*
+     * The PA from sceKernelAllocateDirectMemory is a PS5 bus address,
+     * NOT a CPU physical address. DMAP maps CPU physical addresses.
+     * Walk the page tables to find the actual CPU PA backing our mapping.
+     */
+    uint64_t cpu_pa = va_to_cpu_pa((uint64_t)result_vaddr);
+    printf("[+] Result buffer: userland VA=0x%lx\n", (unsigned long)result_vaddr);
+    printf("    Direct memory PA: 0x%lx (PS5 bus address)\n", (unsigned long)result_phys);
+    printf("    CPU physical PA:  0x%lx (from page table walk)\n", (unsigned long)cpu_pa);
+
+    if (cpu_pa == 0) {
+        printf("[-] Page table walk failed - cannot resolve CPU physical address.\n");
+        return;
+    }
+
+    uint64_t result_kva = g_dmap_base + cpu_pa;
+    printf("    DMAP kernel VA:   0x%lx\n", (unsigned long)result_kva);
+
+    /* Verify: write a test pattern via userland, read via kernel_copyout */
+    volatile uint64_t *test_ptr = (volatile uint64_t *)result_vaddr;
+    *test_ptr = 0xBEEFCAFE12345678ULL;
+    uint64_t verify;
+    kernel_copyout(result_kva, &verify, sizeof(verify));
+    printf("[*] DMAP verify: wrote 0xbeefcafe12345678, read back 0x%lx %s\n",
+           (unsigned long)verify,
+           verify == 0xBEEFCAFE12345678ULL ? "[OK]" : "[MISMATCH]");
+    *test_ptr = 0; /* Clear test pattern */
+
+    if (verify != 0xBEEFCAFE12345678ULL) {
+        printf("[-] DMAP address verification failed!\n");
+        printf("    The page table walk may have returned an incorrect PA.\n");
+        return;
+    }
 
     /* Step 2: Patch .ko with the DMAP output address and write to disk.
      * Find the sentinel value (OUTPUT_KVA_SENTINEL) in the .ko binary
