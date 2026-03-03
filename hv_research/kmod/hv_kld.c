@@ -126,6 +126,9 @@ struct kmod_result_buf {
         uint64_t value;
     } msr_results[32];
     struct vmmcall_result results[KMOD_MAX_RESULTS];
+    /* Phase 7: trampoline addresses for apic_ops hook */
+    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
+    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
 };
 
 /* ============================================================
@@ -146,6 +149,37 @@ volatile uint64_t g_output_kva = OUTPUT_KVA_SENTINEL;
 
 /* Local result buffer - filled by campaigns, then copied out */
 struct kmod_result_buf hv_results = { .magic = 0x1 };
+
+/* ============================================================
+ * Phase 7: apic_ops trampoline
+ *
+ * This function lives in the module's .text section, which the
+ * kernel linker loads into natively executable memory (RWX on
+ * FW 4.03 — GMET not enforced until FW 6.50).
+ *
+ * Userland writes the original xapic_mode address to
+ * g_trampoline_target via DMAP, then hooks apic_ops[2] to
+ * point to trampoline_xapic_mode.  No PTE NX clearing needed.
+ *
+ * The trampoline transparently calls the original function,
+ * preserving normal APIC operation.  On resume, the PS5 calls
+ * xapic_mode via apic_ops[2] → our trampoline → original.
+ * ============================================================ */
+
+/* Target address — patched by userland via DMAP before arming.
+ * Volatile so the compiler always re-reads from memory. */
+volatile uint64_t g_trampoline_target = 0;
+
+/* Trampoline function — callable as int (*)(void).
+ * noinline prevents the compiler from inlining this into hv_init.
+ * The function pointer cast matches lapic_xapic_mode's prototype. */
+__attribute__((noinline, used))
+int trampoline_xapic_mode(void) {
+    uint64_t target = g_trampoline_target;
+    if (target)
+        return ((int (*)(void))target)();
+    return 0;  /* fallback: xAPIC mode = 0 */
+}
 
 /* ============================================================
  * Inline assembly helpers - ring 0 hardware access
@@ -399,6 +433,10 @@ static void hv_init(const void *arg __attribute__((unused))) {
 #if RUN_VMMCALL_IOMMU
     campaign_vmmcall_iommu();
 #endif
+
+    /* Record trampoline addresses for Phase 7 */
+    hv_results.trampoline_func_kva = (uint64_t)&trampoline_xapic_mode;
+    hv_results.trampoline_target_kva = (uint64_t)&g_trampoline_target;
 
     /* Mark completion */
     memory_barrier();
