@@ -3635,25 +3635,45 @@ ring3_fallback:
                 printf("=============================================\n");
                 printf("  Ring-0 Phase 3: APIC Ops Discovery\n");
                 printf("=============================================\n\n");
+
+                /*
+                 * Use the actual ktext→kdata gap as the ktext size.
+                 * On PS5, ktext and kdata are in the same PML4 entry;
+                 * the gap between them is 2MB (guard page).  The ktext
+                 * section itself can be 10-12MB+.
+                 */
+                uint64_t ktext_size = g_kdata_base - g_ktext_base;
+                if (ktext_size > 0x2000000) ktext_size = 0x2000000; /* cap 32MB */
+
                 printf("[*] Scanning kdata for function pointer tables (apic_ops)...\n");
                 printf("[*] Looking for clusters of 4+ consecutive ktext pointers.\n");
-                printf("    ktext range: 0x%lx — 0x%lx\n",
+                printf("    ktext range: 0x%lx — 0x%lx (%luMB)\n",
                        (unsigned long)g_ktext_base,
-                       (unsigned long)(g_ktext_base + 0xA00000));
-                printf("    kdata range: 0x%lx — 0x%lx\n",
+                       (unsigned long)(g_ktext_base + ktext_size),
+                       (unsigned long)(ktext_size >> 20));
+
+                /*
+                 * Scan 8MB of kdata.  ALLPROC is at kdata+0x27EDCB8 (~40MB)
+                 * in BSS; .data (where apic_ops lives) is before BSS.  8MB
+                 * should cover the initialized .data section.
+                 */
+                #define APIC_SCAN_SIZE   0x800000  /* 8MB of kdata */
+                #define APIC_SCAN_CHUNK  0x1000    /* 4KB at a time */
+                #define APIC_MIN_RUN     4         /* Minimum consecutive ptrs */
+
+                printf("    kdata scan: 0x%lx — 0x%lx (%dMB)\n",
                        (unsigned long)g_kdata_base,
-                       (unsigned long)(g_kdata_base + 0x200000));
+                       (unsigned long)(g_kdata_base + APIC_SCAN_SIZE),
+                       APIC_SCAN_SIZE >> 20);
                 fflush(stdout);
 
                 /*
                  * Strategy: Read kdata in 4KB chunks via kernel_copyout.
                  * For each 8-byte-aligned qword, check if it's in ktext range.
                  * Track runs of consecutive ktext pointers.
-                 * apic_ops should have ~20+ function pointers.
+                 * apic_ops has 31 entries on stock FreeBSD; Sony may have
+                 * trimmed it, so look for tables with 10+ entries too.
                  */
-                #define APIC_SCAN_SIZE   0x200000  /* 2MB of kdata */
-                #define APIC_SCAN_CHUNK  0x1000    /* 4KB at a time */
-                #define APIC_MIN_RUN     4         /* Minimum consecutive ptrs */
 
                 int apic_found_tables = 0;
                 int apic_run_len = 0;
@@ -3665,6 +3685,12 @@ ring3_fallback:
 
                 for (uint64_t off = 0; off < APIC_SCAN_SIZE;
                      off += APIC_SCAN_CHUNK) {
+                    if ((off & 0xFFFFF) == 0 && off > 0) {
+                        printf("    ...scanning kdata+0x%lx (%luMB/%dMB)\r",
+                               (unsigned long)off, (unsigned long)(off >> 20),
+                               APIC_SCAN_SIZE >> 20);
+                        fflush(stdout);
+                    }
                     uint64_t scan_kva = g_kdata_base + off;
                     uint64_t scan_pa = va_to_pa_quiet(scan_kva);
                     if (scan_pa == 0 || scan_pa >= MAX_SAFE_PA) {
@@ -3692,8 +3718,8 @@ ring3_fallback:
 
                         int is_ktext_ptr =
                             (qval >= g_ktext_base &&
-                             qval < g_ktext_base + 0xA00000 &&
-                             (qval & 0xF) == 0);  /* aligned */
+                             qval < g_ktext_base + ktext_size &&
+                             (qval & 0x3) == 0);  /* 4-byte aligned */
 
                         if (is_ktext_ptr) {
                             if (apic_run_len == 0)
@@ -3738,8 +3764,8 @@ ring3_fallback:
                     uint64_t dump_pa = va_to_pa_quiet(apic_best_addr);
                     if (dump_pa) {
                         int dump_cnt = apic_best_len;
-                        if (dump_cnt > 32) dump_cnt = 32;
-                        uint64_t dump_buf[32];
+                        if (dump_cnt > 40) dump_cnt = 40;
+                        uint64_t dump_buf[40];
                         kernel_copyout(g_dmap_base + dump_pa,
                                        dump_buf, dump_cnt * 8);
                         for (int di = 0; di < dump_cnt; di++) {
@@ -3752,7 +3778,7 @@ ring3_fallback:
 
                 /* Look specifically for tables with ~20-30 entries (apic_ops size) */
                 if (apic_found_tables > 0) {
-                    printf("\n[*] Candidate apic_ops tables (15-40 entries):\n");
+                    printf("\n[*] Candidate apic_ops tables (10-40 entries):\n");
                     int apic_cand = 0;
                     apic_run_len = 0;
                     apic_run_start = 0;
@@ -3762,7 +3788,7 @@ ring3_fallback:
                         uint64_t scan_kva = g_kdata_base + off;
                         uint64_t scan_pa = va_to_pa_quiet(scan_kva);
                         if (scan_pa == 0) {
-                            if (apic_run_len >= 15 && apic_run_len <= 40) {
+                            if (apic_run_len >= 10 && apic_run_len <= 40) {
                                 printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
                                        (unsigned long)(apic_run_start - g_kdata_base),
                                        apic_run_len);
@@ -3785,7 +3811,7 @@ ring3_fallback:
                                     apic_run_start = scan_kva + qi;
                                 apic_run_len++;
                             } else {
-                                if (apic_run_len >= 15 && apic_run_len <= 40) {
+                                if (apic_run_len >= 10 && apic_run_len <= 40) {
                                     printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
                                            (unsigned long)(apic_run_start - g_kdata_base),
                                            apic_run_len);
