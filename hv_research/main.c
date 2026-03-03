@@ -2075,8 +2075,58 @@ static void campaign_kmod_kldload(void) {
             printf("[+] FOUND trampoline at VA 0x%lx!\n",
                    (unsigned long)trampoline_kva);
             printf("    bytes: ");
-            for (int b = 0; b < 35; b++) printf("%02x ", hdr[b]);
+            for (int b = 0; b < 58; b++) printf("%02x ", hdr[b]);
             printf("\n");
+
+            /* Compute trampoline_xapic_mode and g_trampoline_target
+             * addresses directly from the loaded machine code.
+             *
+             * This bypasses R_X86_64_32S relocations in hv_init (which
+             * the PS5 kernel linker doesn't resolve for these symbols).
+             * Instead we use:
+             *   - Known .text layout: trampoline_xapic_mode is at +0x23
+             *     (right after hv_idt_trampoline's 35-byte naked asm)
+             *   - The R_X86_64_PC32 relocation in the mov instruction,
+             *     which the kernel linker DOES resolve, to find
+             *     g_trampoline_target's actual KVA.
+             *
+             * Layout (from objdump -d hv_kmod.ko):
+             *   0x00: hv_idt_trampoline  (35 bytes)
+             *   0x23: trampoline_xapic_mode:
+             *         55              push rbp
+             *         48 8b 05 XX..   mov disp32(%rip), %rax  ← g_trampoline_target
+             *         ...
+             * The 4-byte displacement at hdr[0x27..0x2a] is RIP-relative
+             * from offset 0x2b (end of the 7-byte mov instruction). */
+            #define KMOD_XAPIC_OFFSET  0x23
+            #define KMOD_DISP_OFFSET   0x27
+            #define KMOD_DISP_RIP      0x2B  /* RIP after mov instruction */
+
+            if (hdr[KMOD_XAPIC_OFFSET]   == 0x55 &&  /* push rbp */
+                hdr[KMOD_XAPIC_OFFSET+1]  == 0x48 &&  /* REX.W */
+                hdr[KMOD_XAPIC_OFFSET+2]  == 0x8b &&  /* MOV r64, r/m64 */
+                hdr[KMOD_XAPIC_OFFSET+3]  == 0x05) {  /* ModR/M: [RIP+disp32] → RAX */
+
+                int32_t disp;
+                memcpy(&disp, &hdr[KMOD_DISP_OFFSET], 4);
+
+                g_kmod_trampoline_func   = trampoline_kva + KMOD_XAPIC_OFFSET;
+                g_kmod_trampoline_target = trampoline_kva + KMOD_DISP_RIP + (int64_t)disp;
+                g_kmod_kid = kid;
+
+                printf("[+] Phase 7: Computed trampoline addresses from machine code:\n");
+                printf("    trampoline_xapic_mode() = 0x%016lx (page + 0x%x)\n",
+                       (unsigned long)g_kmod_trampoline_func, KMOD_XAPIC_OFFSET);
+                printf("    g_trampoline_target     = 0x%016lx (RIP+disp32, disp=%d)\n",
+                       (unsigned long)g_kmod_trampoline_target, (int)disp);
+            } else {
+                printf("[!] trampoline_xapic_mode signature mismatch at +0x%x:\n",
+                       KMOD_XAPIC_OFFSET);
+                printf("    Expected: 55 48 8b 05\n");
+                printf("    Got:      %02x %02x %02x %02x\n",
+                       hdr[KMOD_XAPIC_OFFSET], hdr[KMOD_XAPIC_OFFSET+1],
+                       hdr[KMOD_XAPIC_OFFSET+2], hdr[KMOD_XAPIC_OFFSET+3]);
+            }
         }
 
         /* Fallback: sentinel scan (also hierarchical + DMAP) */
@@ -2414,15 +2464,14 @@ static void campaign_kmod_kldload(void) {
         else
             printf("[-] Buffer still zero after INT invocation.\n");
 
-        /* Extract trampoline addresses NOW, before Phase 5 clears the buffer.
-         * Phase 5's ring-0 shellcode zeroes the entire shared buffer before
-         * writing its own results, which would overwrite hv_init's trampoline
-         * addresses. */
-        if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
+        /* Fallback: extract trampoline addresses from result buffer
+         * (only if scanner-based computation didn't already set them). */
+        if (!g_kmod_trampoline_func &&
+            results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
             g_kmod_trampoline_func = results->trampoline_func_kva;
             g_kmod_trampoline_target = results->trampoline_target_kva;
             g_kmod_kid = kid;
-            printf("[+] Phase 7 trampoline addresses (saved before Phase 5):\n");
+            printf("[+] Phase 7 trampoline addresses (from result buffer):\n");
             printf("    trampoline_xapic_mode() = 0x%016lx\n",
                    (unsigned long)g_kmod_trampoline_func);
             printf("    g_trampoline_target     = 0x%016lx\n",
@@ -4542,33 +4591,30 @@ idt_skip: ;
         }
     }
 
-    /* Extract trampoline addresses for Phase 7 */
-    printf("\n[*] Checking for Phase 7 trampoline addresses in result buffer...\n");
-    printf("    sizeof(struct kmod_result_buf) = %zu\n", sizeof(struct kmod_result_buf));
-    {
-        /* Dump raw bytes at the trampoline field offsets for diagnostics */
-        uint8_t *raw = (uint8_t *)result_vaddr;
-        /* trampoline fields are the last 16 bytes of the struct */
-        size_t base_off = sizeof(struct kmod_result_buf) - 16;
-        printf("    Raw bytes at offset 0x%zx (last 16 bytes of struct):\n      ", base_off);
-        for (size_t i = 0; i < 16; i++)
-            printf("%02x ", raw[base_off + i]);
-        printf("\n");
-        printf("    results->trampoline_func_kva  = 0x%lx\n",
-               (unsigned long)results->trampoline_func_kva);
-        printf("    results->trampoline_target_kva = 0x%lx\n",
-               (unsigned long)results->trampoline_target_kva);
-    }
-    if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
-        g_kmod_trampoline_func = results->trampoline_func_kva;
-        g_kmod_trampoline_target = results->trampoline_target_kva;
-        g_kmod_kid = kid;
-        printf("\n[+] Phase 7 trampoline addresses from kmod:\n");
+    /* Check Phase 7 trampoline status */
+    printf("\n[*] Phase 7 trampoline address status:\n");
+    if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
+        printf("    [OK] Addresses computed from scanner (machine code decode).\n");
         printf("    trampoline_xapic_mode() = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_func);
         printf("    g_trampoline_target     = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_target);
-        printf("    Keeping module loaded for Phase 7 hook.\n");
+    } else {
+        /* Last-resort fallback: try result buffer (R_X86_64_32S relocs) */
+        printf("    Scanner-based computation didn't set addresses.\n");
+        printf("    Trying result buffer fallback...\n");
+        printf("    results->trampoline_func_kva  = 0x%lx\n",
+               (unsigned long)results->trampoline_func_kva);
+        printf("    results->trampoline_target_kva = 0x%lx\n",
+               (unsigned long)results->trampoline_target_kva);
+        if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
+            g_kmod_trampoline_func = results->trampoline_func_kva;
+            g_kmod_trampoline_target = results->trampoline_target_kva;
+            g_kmod_kid = kid;
+            printf("    [OK] Got addresses from result buffer.\n");
+        } else {
+            printf("    [-] Result buffer also has zeros.\n");
+        }
     }
 
     /* Step 5: Unload the module (skip if Phase 7 needs it) */
