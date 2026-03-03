@@ -2093,31 +2093,32 @@ ring3_fallback:
 
         /* 4d-3: IDT handler addresses
          * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
-         * the process.  Find IDT by scanning kdata instead.
-         * IDT entries are 16-byte gate descriptors:
-         *   offset 0: uint16 offset_lo
-         *   offset 2: uint16 selector  (kernel CS = 0x10 on FreeBSD)
-         *   offset 4: uint8  ist
-         *   offset 5: uint8  type_attr (present | DPL | type)
-         *              interrupt gate = 0x8E, trap gate = 0x8F
-         *   offset 6: uint16 offset_mid
-         *   offset 8: uint32 offset_hi
-         *   offset 12: uint32 reserved (0)
-         * We match: handler in ktext, type_attr = 0x8E or 0x8F,
-         *           selector is valid kernel CS (non-zero, ≤0x40, aligned to 8),
-         *           and reserved == 0. */
+         * the process.  Find IDT by scanning kdata via DMAP instead.
+         * (Direct kernel_copyout from KVA fails on many kdata pages;
+         *  DMAP reads after page table walk always succeed.)
+         *
+         * IDT = 256 × 16-byte gate descriptors:
+         *   +0: uint16 offset_lo   +2: uint16 selector (kernel CS)
+         *   +4: uint8 ist          +5: uint8 type_attr (0x8E=int, 0x8F=trap)
+         *   +6: uint16 offset_mid  +8: uint32 offset_hi  +12: uint32 reserved(0) */
         {
-            printf("[*] Searching kdata for IDT (SIDT is HV-intercepted)...\n");
+            printf("[*] Searching kdata for IDT via DMAP (SIDT is HV-intercepted)...\n");
             fflush(stdout);
 
             uint64_t idt_kva = 0;
             uint16_t idt_sel = 0;
             uint8_t idt_pg[4096];
+            int pages_ok = 0, pages_fail = 0;
 
-            /* Scan first 64MB of kdata (IDT may be in BSS, which extends ~40MB+) */
+            /* Scan first 64MB of kdata via DMAP */
             for (uint64_t off = 0; off < 0x4000000 && !idt_kva; off += 4096) {
                 uint64_t kva = g_kdata_base + off;
-                if (kernel_copyout(kva, idt_pg, 4096) != 0) continue;
+                uint64_t pa = va_to_pa_quiet(kva);
+                if (!pa) { pages_fail++; continue; }
+                if (kernel_copyout(g_dmap_base + pa, idt_pg, 4096) != 0) {
+                    pages_fail++; continue;
+                }
+                pages_ok++;
 
                 for (int boff = 0; boff <= 4096 - 16*8 && !idt_kva; boff += 16) {
                     int good = 0;
@@ -2135,7 +2136,6 @@ ring3_fallback:
                         memcpy(&rsv, g + 12, 4);
                         uint64_t h = (uint64_t)lo | ((uint64_t)mid << 16) |
                                      ((uint64_t)hi << 32);
-                        /* Check: handler in ktext, valid gate type, valid selector, reserved=0 */
                         if (h >= g_ktext_base && h < g_ktext_base + 0x2000000 &&
                             (type_attr == 0x8E || type_attr == 0x8F) &&
                             sel != 0 && sel <= 0x40 && (sel & 7) == 0 &&
@@ -2151,6 +2151,8 @@ ring3_fallback:
                 }
             }
 
+            printf("    (scanned %d pages, %d unmapped)\n", pages_ok, pages_fail);
+
             if (idt_kva) {
                 printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
                        (unsigned long)(idt_kva - g_kdata_base),
@@ -2163,8 +2165,13 @@ ring3_fallback:
                 };
                 for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
                     int v = idt_vecs[i].vec;
+                    uint64_t gate_kva = idt_kva + v * 16;
+                    uint64_t gate_pa = va_to_pa_quiet(gate_kva);
                     uint8_t g[16];
-                    kernel_copyout(idt_kva + v * 16, g, 16);
+                    if (!gate_pa || kernel_copyout(g_dmap_base + gate_pa, g, 16) != 0) {
+                        printf("    IDT[%3d] %-6s — read failed\n", v, idt_vecs[i].name);
+                        continue;
+                    }
                     uint16_t lo, sel, mid;
                     uint32_t hi;
                     memcpy(&lo,  g + 0, 2);
@@ -2185,66 +2192,101 @@ ring3_fallback:
 
         /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
         {
-            /* On FreeBSD amd64, struct sysent layout:
-             *   offset 0:  int32_t sy_narg           (4 bytes)
-             *   offset 4:  padding                   (4 bytes)
-             *   offset 8:  sy_call_t *sy_call        (8 bytes)
-             *   offset 16: au_event_t sy_auevent     (2 bytes + 6 pad)
-             *   offset 24: systrace_args_func_t      (8 bytes)
-             *   offset 32: u_int32_t sy_entry        (4 bytes)
-             *   offset 36: u_int32_t sy_return       (4 bytes)
-             *   offset 40: u_int32_t sy_flags        (4 bytes)
-             *   offset 44: u_int32_t sy_thrcnt       (4 bytes)
-             * Total: 48 bytes.  But Sony may have modified this.
-             * Try strides 16, 32, 48 to auto-detect. */
-            printf("[*] Scanning kdata for sysent table...\n");
+            /* struct sysent (0x30 = 48 bytes, confirmed via etaHEN kexec.h):
+             *   0x00: uint32_t n_arg
+             *   0x04: uint32_t pad
+             *   0x08: uint64_t sy_call       (function pointer in ktext)
+             *   0x10: uint64_t sy_auevent
+             *   0x18: uint64_t sy_systrace_args
+             *   0x20: uint32_t sy_entry
+             *   0x24: uint32_t sy_return
+             *   0x28: uint32_t sy_flags
+             *   0x2C: uint32_t sy_thrcnt
+             *
+             * sysentvec for FW 4.03 is at kdata+0xd11bb8 (from etaHEN offsets).
+             * sysentvec.sv_table (offset +8) points to the sysent[] array. */
+            printf("[*] Looking up sysent via known sysentvec offset...\n");
             fflush(stdout);
 
-            static const int expected_nargs[] = {0, 1, 0, 3, 3, 1, 3, 0, 3};
+            #define SYSENT_STRIDE 0x30  /* 48 bytes per entry */
+
+            /* Read sysentvec at known offset via DMAP (direct KVA reads may fail) */
+            uint64_t sysentvec_kva = g_kdata_base + 0xd11bb8;
+            uint64_t sysentvec_pa = va_to_pa_quiet(sysentvec_kva);
+
             int sysent_found = 0;
             uint64_t sysent_kva = 0;
-            int sysent_stride = 0;
 
-            /* Try common entry sizes: 48 (standard FreeBSD), 32, 16 */
-            static const int strides[] = {48, 32, 16};
-            uint8_t blk[4096];
+            if (sysentvec_pa) {
+                uint8_t svec[16];
+                kernel_copyout(g_dmap_base + sysentvec_pa, svec, 16);
+                int32_t sv_size;
+                uint64_t sv_table;
+                memcpy(&sv_size, svec, 4);
+                memcpy(&sv_table, svec + 8, 8);
 
-            for (unsigned si = 0; si < 3 && !sysent_found; si++) {
-                int stride = strides[si];
-                int match_size = stride * 9;
+                printf("    sysentvec PA=0x%lx, sv_size=%d, sv_table=0x%lx\n",
+                       (unsigned long)sysentvec_pa, sv_size, (unsigned long)sv_table);
+
+                /* Validate: sv_size should be ~600 (FREEBSD_MAXSYSCALL), sv_table in kdata */
+                if (sv_size >= 300 && sv_size <= 1024 &&
+                    sv_table >= g_kdata_base && sv_table < g_kdata_base + 0x4000000) {
+                    sysent_kva = sv_table;
+                    sysent_found = 1;
+                    printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries\n",
+                           (unsigned long)sysent_kva,
+                           (unsigned long)(sysent_kva - g_kdata_base), sv_size);
+                } else {
+                    printf("    sv_size or sv_table out of expected range — trying scan.\n");
+                }
+            } else {
+                printf("    sysentvec VA 0x%lx not mapped — trying scan.\n",
+                       (unsigned long)sysentvec_kva);
+            }
+
+            /* Fallback: scan kdata via DMAP for narg pattern */
+            if (!sysent_found) {
+                printf("[*] Scanning kdata for sysent table via DMAP...\n");
+                fflush(stdout);
+
+                static const int expected_nargs[] = {0, 1, 0, 3, 3, 1, 3, 0, 3};
+                int match_size = SYSENT_STRIDE * 9;
+                uint8_t blk[4096];
+                int pages_ok = 0, pages_fail = 0;
 
                 for (uint64_t pg = 0; pg < 0x4000000 && !sysent_found; pg += 4096) {
                     uint64_t kva = g_kdata_base + pg;
-                    if (kernel_copyout(kva, blk, 4096) != 0) continue;
+                    uint64_t pa = va_to_pa_quiet(kva);
+                    if (!pa) { pages_fail++; continue; }
+                    if (kernel_copyout(g_dmap_base + pa, blk, 4096) != 0) {
+                        pages_fail++; continue;
+                    }
+                    pages_ok++;
 
-                    /* Check at 8-byte alignment (struct may have 8-byte alignment) */
                     for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 8) {
                         int match = 1;
                         for (int i = 0; i < 9 && match; i++) {
                             int32_t narg;
-                            memcpy(&narg, &blk[boff + i * stride], 4);
+                            memcpy(&narg, &blk[boff + i * SYSENT_STRIDE], 4);
                             if (narg != expected_nargs[i]) match = 0;
                         }
                         if (match) {
-                            /* Verify sy_call[0] is in ktext */
                             uint64_t call0;
                             memcpy(&call0, &blk[boff + 8], 8);
                             if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
                                 sysent_kva = kva + boff;
-                                sysent_stride = stride;
                                 sysent_found = 1;
                             }
                         }
                     }
                 }
+                if (!sysent_found)
+                    printf("[-] Sysent not found (scanned %d pages, %d unmapped).\n",
+                           pages_ok, pages_fail);
             }
 
             if (sysent_found) {
-                printf("[+] Sysent table at kdata+0x%lx (KVA 0x%lx), entry size=%d bytes\n",
-                       (unsigned long)(sysent_kva - g_kdata_base),
-                       (unsigned long)sysent_kva, sysent_stride);
-
-                /* Dump key syscalls for ROP planning */
+                /* Dump key syscalls via DMAP reads */
                 printf("[*] Key sysent entries (sy_narg, sy_call -> ktext offset):\n");
                 static const struct { int num; const char *name; } key_syscalls[] = {
                     {0, "nosys"}, {1, "exit"}, {2, "fork"}, {3, "read"},
@@ -2257,28 +2299,23 @@ ring3_fallback:
                 };
                 for (unsigned i = 0; i < sizeof(key_syscalls)/sizeof(key_syscalls[0]); i++) {
                     int num = key_syscalls[i].num;
-                    uint8_t entry[64];
-                    kernel_copyout(sysent_kva + (uint64_t)num * sysent_stride, entry, sysent_stride);
-                    int32_t narg;
-                    uint64_t sy_call;
-                    memcpy(&narg, entry, 4);
-                    memcpy(&sy_call, entry + 8, 8);
+                    uint64_t ent_kva = sysent_kva + (uint64_t)num * SYSENT_STRIDE;
+                    uint64_t ent_pa = va_to_pa_quiet(ent_kva);
+                    uint8_t entry[SYSENT_STRIDE];
+                    int32_t narg = -1;
+                    uint64_t sy_call = 0;
+                    if (ent_pa) {
+                        kernel_copyout(g_dmap_base + ent_pa, entry, SYSENT_STRIDE);
+                        memcpy(&narg, entry, 4);
+                        memcpy(&sy_call, entry + 8, 8);
+                    }
                     printf("    [%3d] %-12s narg=%d  sy_call=0x%lx (ktext+0x%lx)\n",
                            num, key_syscalls[i].name, narg,
                            (unsigned long)sy_call,
                            (unsigned long)(sy_call - g_ktext_base));
                 }
-
-                printf("\n[*] For ROP-based MSR reading, key gadgets needed:\n");
-                printf("    1. 'ret' gadget at known ktext offset\n");
-                printf("    2. 'pop rcx; ret' to set MSR number\n");
-                printf("    3. 'rdmsr; ret' or function containing rdmsr\n");
-                printf("    4. Gadget to store RAX/RDX to memory\n");
-                printf("    Use sysent sy_call addresses as ktext anchors.\n");
-            } else {
-                printf("[-] Sysent table not found in kdata (first 64MB).\n");
-                printf("    Tried entry sizes: 48, 32, 16 bytes.\n");
             }
+            fflush(stdout);
         }
 
 idt_done: ;
