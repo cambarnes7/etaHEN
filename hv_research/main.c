@@ -2091,32 +2091,47 @@ ring3_fallback:
         printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
         fflush(stdout);
 
-        /* 4d-3: IDT handler addresses (ktext reference points) */
+        /* 4d-3: IDT handler addresses
+         * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
+         * the process.  Find IDT by scanning kdata instead.
+         * IDT entries are 16-byte gate descriptors with handler addresses
+         * in ktext and selector = kernel CS (typically 0x20). */
         {
-            struct {
-                uint16_t limit;
-                uint64_t base;
-            } __attribute__((packed)) idtr2;
-            __asm__ volatile("sidt %0" : "=m"(idtr2));
-
-            printf("[*] IDTR: base=0x%lx, limit=0x%x\n",
-                   (unsigned long)idtr2.base, idtr2.limit);
+            printf("[*] Searching kdata for IDT (SIDT is HV-intercepted)...\n");
             fflush(stdout);
 
-            /* Verify IDT is readable before iterating */
-            uint64_t idt_pa = va_to_pa_quiet(idtr2.base);
-            printf("    IDT PA=0x%lx\n", (unsigned long)idt_pa);
-            fflush(stdout);
+            uint64_t idt_kva = 0;
+            uint8_t idt_pg[4096];
 
-            struct {
-                uint16_t offset_lo; uint16_t selector;
-                uint8_t ist; uint8_t type_attr;
-                uint16_t offset_mid; uint32_t offset_hi; uint32_t reserved;
-            } __attribute__((packed)) gate;
+            for (uint64_t off = 0; off < 0x800000 && !idt_kva; off += 4096) {
+                uint64_t kva = g_kdata_base + off;
+                if (kernel_copyout(kva, idt_pg, 4096) != 0) continue;
 
-            /* Read IDT entries via DMAP to avoid kernel_copyout issues */
-            if (idt_pa != 0) {
-                printf("[*] IDT handler addresses (via DMAP):\n");
+                for (int boff = 0; boff <= 4096 - 16*8 && !idt_kva; boff += 16) {
+                    int good = 0;
+                    for (int e = 0; e < 8; e++) {
+                        uint8_t *g = &idt_pg[boff + e * 16];
+                        uint16_t lo, sel, mid;
+                        uint32_t hi;
+                        memcpy(&lo,  g + 0, 2);
+                        memcpy(&sel, g + 2, 2);
+                        memcpy(&mid, g + 6, 2);
+                        memcpy(&hi,  g + 8, 4);
+                        uint64_t h = (uint64_t)lo | ((uint64_t)mid << 16) |
+                                     ((uint64_t)hi << 32);
+                        if (sel == 0x20 && h >= g_ktext_base &&
+                            h < g_ktext_base + 0x2000000)
+                            good++;
+                    }
+                    if (good >= 6) idt_kva = kva + boff;
+                }
+            }
+
+            if (idt_kva) {
+                printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx)\n",
+                       (unsigned long)(idt_kva - g_kdata_base),
+                       (unsigned long)idt_kva);
+
                 static const struct { int vec; const char *name; } idt_vecs[] = {
                     {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
                     {6, "#UD"}, {8, "#DF"}, {13, "#GP"}, {14, "#PF"},
@@ -2124,23 +2139,22 @@ ring3_fallback:
                 };
                 for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
                     int v = idt_vecs[i].vec;
-                    /* Read gate via DMAP instead of kernel_copyout */
-                    uint64_t gate_pa = idt_pa + v * 16;
-                    int rc = kernel_copyout(g_dmap_base + gate_pa, &gate, 16);
-                    if (rc != 0) {
-                        printf("    IDT[%3d] %-6s — DMAP read failed\n",
-                               v, idt_vecs[i].name);
-                        continue;
-                    }
-                    uint64_t handler = (uint64_t)gate.offset_lo |
-                                       ((uint64_t)gate.offset_mid << 16) |
-                                       ((uint64_t)gate.offset_hi << 32);
-                    printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx)\n",
+                    uint8_t g[16];
+                    kernel_copyout(idt_kva + v * 16, g, 16);
+                    uint16_t lo, sel, mid;
+                    uint32_t hi;
+                    memcpy(&lo,  g + 0, 2);
+                    memcpy(&sel, g + 2, 2);
+                    memcpy(&mid, g + 6, 2);
+                    memcpy(&hi,  g + 8, 4);
+                    uint64_t handler = (uint64_t)lo | ((uint64_t)mid << 16) |
+                                       ((uint64_t)hi << 32);
+                    printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx) sel=0x%x\n",
                            v, idt_vecs[i].name, (unsigned long)handler,
-                           (unsigned long)(handler - g_ktext_base));
+                           (unsigned long)(handler - g_ktext_base), sel);
                 }
             } else {
-                printf("[-] IDT page not mapped — skipping handler dump.\n");
+                printf("[-] IDT not found in kdata (first 8MB).\n");
             }
             fflush(stdout);
         }
