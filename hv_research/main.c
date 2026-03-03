@@ -2110,8 +2110,12 @@ ring3_fallback:
             uint8_t idt_pg[4096];
             int pages_ok = 0, pages_fail = 0;
 
-            /* Scan first 64MB of kdata via DMAP */
-            for (uint64_t off = 0; off < 0x4000000 && !idt_kva; off += 4096) {
+            /* Scan first 128MB of kdata via DMAP.
+             * Relaxed criteria: accept any kernel VA handler (>= 0xffffffff80000000),
+             * selector up to 0x80, to account for PS5's custom GDT. */
+            int best_run = 0;
+            uint64_t best_run_off = 0;
+            for (uint64_t off = 0; off < 0x8000000 && !idt_kva; off += 4096) {
                 uint64_t kva = g_kdata_base + off;
                 uint64_t pa = va_to_pa_quiet(kva);
                 if (!pa) { pages_fail++; continue; }
@@ -2136,13 +2140,18 @@ ring3_fallback:
                         memcpy(&rsv, g + 12, 4);
                         uint64_t h = (uint64_t)lo | ((uint64_t)mid << 16) |
                                      ((uint64_t)hi << 32);
-                        if (h >= g_ktext_base && h < g_ktext_base + 0x2000000 &&
+                        /* Relaxed: any kernel VA, selector up to 0x80 */
+                        if (h >= 0xffffffff80000000ULL &&
                             (type_attr == 0x8E || type_attr == 0x8F) &&
-                            sel != 0 && sel <= 0x40 && (sel & 7) == 0 &&
+                            sel != 0 && sel <= 0x80 && (sel & 7) == 0 &&
                             rsv == 0) {
                             good++;
                             if (first_sel == 0) first_sel = sel;
                         }
+                    }
+                    if (good > best_run) {
+                        best_run = good;
+                        best_run_off = off + boff;
                     }
                     if (good >= 6) {
                         idt_kva = kva + boff;
@@ -2151,7 +2160,8 @@ ring3_fallback:
                 }
             }
 
-            printf("    (scanned %d pages, %d unmapped)\n", pages_ok, pages_fail);
+            printf("    (scanned %d pages, %d unmapped, best gate run=%d at kdata+0x%lx)\n",
+                   pages_ok, pages_fail, best_run, (unsigned long)best_run_off);
 
             if (idt_kva) {
                 printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
@@ -2185,7 +2195,7 @@ ring3_fallback:
                            (unsigned long)(handler - g_ktext_base), sel);
                 }
             } else {
-                printf("[-] IDT not found in kdata (first 64MB).\n");
+                printf("[-] IDT not found in kdata (first 128MB).\n");
             }
             fflush(stdout);
         }
@@ -2204,40 +2214,68 @@ ring3_fallback:
              *   0x2C: uint32_t sy_thrcnt
              *
              * sysentvec for FW 4.03 is at kdata+0xd11bb8 (from etaHEN offsets).
-             * sysentvec.sv_table (offset +8) points to the sysent[] array. */
+             *
+             * PS5 struct sysentvec is PACKED — sv_table is at offset 4
+             * (no padding after sv_size), not offset 8 as on stock FreeBSD.
+             * We try both offsets for robustness. */
             printf("[*] Looking up sysent via known sysentvec offset...\n");
             fflush(stdout);
 
             #define SYSENT_STRIDE 0x30  /* 48 bytes per entry */
 
-            /* Read sysentvec at known offset via DMAP (direct KVA reads may fail) */
+            /* Read sysentvec at known offset via DMAP */
             uint64_t sysentvec_kva = g_kdata_base + 0xd11bb8;
             uint64_t sysentvec_pa = va_to_pa_quiet(sysentvec_kva);
 
             int sysent_found = 0;
             uint64_t sysent_kva = 0;
+            (void)0;
 
             if (sysentvec_pa) {
-                uint8_t svec[16];
-                kernel_copyout(g_dmap_base + sysentvec_pa, svec, 16);
+                uint8_t svec[24];
+                kernel_copyout(g_dmap_base + sysentvec_pa, svec, 24);
+
+                /* Dump raw bytes for diagnostics */
+                printf("    sysentvec raw (24 bytes at PA 0x%lx):\n      ",
+                       (unsigned long)sysentvec_pa);
+                for (int i = 0; i < 24; i++)
+                    printf("%02x ", svec[i]);
+                printf("\n");
+
                 int32_t sv_size;
-                uint64_t sv_table;
                 memcpy(&sv_size, svec, 4);
-                memcpy(&sv_table, svec + 8, 8);
+                printf("    sv_size=%d\n", sv_size);
 
-                printf("    sysentvec PA=0x%lx, sv_size=%d, sv_table=0x%lx\n",
-                       (unsigned long)sysentvec_pa, sv_size, (unsigned long)sv_table);
+                /* Try sv_table at offset 4 (packed/PS5) and offset 8 (stock FreeBSD) */
+                uint64_t sv_table_off4, sv_table_off8;
+                memcpy(&sv_table_off4, svec + 4, 8);
+                memcpy(&sv_table_off8, svec + 8, 8);
+                printf("    sv_table@off4=0x%lx  sv_table@off8=0x%lx\n",
+                       (unsigned long)sv_table_off4, (unsigned long)sv_table_off8);
 
-                /* Validate: sv_size should be ~600 (FREEBSD_MAXSYSCALL), sv_table in kdata */
-                if (sv_size >= 300 && sv_size <= 1024 &&
-                    sv_table >= g_kdata_base && sv_table < g_kdata_base + 0x4000000) {
+                /* Pick whichever offset yields a valid kdata pointer */
+                uint64_t sv_table = 0;
+                int sv_off = 0;
+                if (sv_table_off4 >= g_kdata_base &&
+                    sv_table_off4 < g_kdata_base + 0x4000000) {
+                    sv_table = sv_table_off4;
+                    sv_off = 4;
+                } else if (sv_table_off8 >= g_kdata_base &&
+                           sv_table_off8 < g_kdata_base + 0x4000000) {
+                    sv_table = sv_table_off8;
+                    sv_off = 8;
+                }
+
+                if (sv_size >= 300 && sv_size <= 1024 && sv_table) {
                     sysent_kva = sv_table;
                     sysent_found = 1;
-                    printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries\n",
+                    printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries"
+                           " (sv_table at struct offset %d)\n",
                            (unsigned long)sysent_kva,
-                           (unsigned long)(sysent_kva - g_kdata_base), sv_size);
+                           (unsigned long)(sysent_kva - g_kdata_base),
+                           sv_size, sv_off);
                 } else {
-                    printf("    sv_size or sv_table out of expected range — trying scan.\n");
+                    printf("    Neither offset yielded valid kdata ptr — trying scan.\n");
                 }
             } else {
                 printf("    sysentvec VA 0x%lx not mapped — trying scan.\n",
