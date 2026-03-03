@@ -2438,7 +2438,15 @@ ring3_fallback:
                     uint64_t ent_pa = va_to_pa_quiet(ent_kva);
                     kernel_copyout(g_dmap_base + ent_pa, orig_ent, SYSENT_STRIDE);
 
-                    /* Call before modification — should get ENOSYS (78) */
+                    /* Read & display original sy_call */
+                    uint64_t orig_call = 0;
+                    uint64_t call_pa = va_to_pa_quiet(ent_kva + 8);
+                    kernel_copyout(g_dmap_base + call_pa, &orig_call, 8);
+                    printf("    Original sy_call: 0x%lx (nosys=0x%lx, match=%s)\n",
+                           (unsigned long)orig_call, (unsigned long)nosys_call,
+                           orig_call == nosys_call ? "YES" : "NO");
+
+                    /* Call before modification */
                     errno = 0;
                     long ret0 = syscall(test_sc);
                     int err0 = errno;
@@ -2451,15 +2459,24 @@ ring3_fallback:
                         sysent_kva + 20ULL * SYSENT_STRIDE + 8);
                     uint64_t getpid_call = 0;
                     kernel_copyout(g_dmap_base + getpid_pa, &getpid_call, 8);
+                    printf("    getpid sy_call: 0x%lx\n",
+                           (unsigned long)getpid_call);
 
                     /* Write getpid handler into test syscall via DMAP */
-                    uint64_t call_pa = va_to_pa_quiet(ent_kva + 8);
                     kernel_copyin(&getpid_call, g_dmap_base + call_pa, 8);
 
                     /* Also set narg=0 to match getpid */
                     int32_t zero = 0;
                     uint64_t narg_pa = va_to_pa_quiet(ent_kva);
                     kernel_copyin(&zero, g_dmap_base + narg_pa, 4);
+
+                    /* Read back to verify the DMAP write stuck */
+                    uint64_t readback = 0;
+                    kernel_copyout(g_dmap_base + call_pa, &readback, 8);
+                    int write_ok = (readback == getpid_call);
+                    printf("    DMAP write verify: wrote 0x%lx, read back 0x%lx [%s]\n",
+                           (unsigned long)getpid_call, (unsigned long)readback,
+                           write_ok ? "OK" : "MISMATCH");
 
                     /* Call after modification — should return our PID */
                     errno = 0;
@@ -2471,13 +2488,82 @@ ring3_fallback:
 
                     if (ret1 == real_pid && err1 == 0) {
                         printf("[+] SYSENT HOOK VERIFIED — full syscall dispatch control!\n");
-                    } else if (ret1 != -1 && err1 == 0) {
-                        printf("[+] Sysent hook WORKED (ret=%ld, may differ due to td)\n",
-                               ret1);
+                    } else if (write_ok && ret1 == ret0) {
+                        /* Write succeeded but behavior unchanged —
+                         * something else dispatches before sysent */
+                        printf("[-] DMAP write verified but syscall behavior UNCHANGED.\n");
+                        printf("    ret before=%ld, after=%ld (identical)\n", ret0, ret1);
+                        printf("    etaHEN syscall wrapper likely intercepts before sysent.\n");
+                        printf("[*] Investigating etaHEN dispatch path...\n");
+                        fflush(stdout);
+
+                        /* Dump the sysentvec structure for more context */
+                        uint64_t sv_pa = va_to_pa_quiet(
+                            g_kdata_base + 0x1401bb8ULL);
+                        if (sv_pa) {
+                            uint8_t sv_raw[64];
+                            kernel_copyout(g_dmap_base + sv_pa, sv_raw, 64);
+                            printf("    sysentvec[0..63]:\n      ");
+                            for (int j = 0; j < 64; j++) {
+                                printf("%02x ", sv_raw[j]);
+                                if ((j & 15) == 15) printf("\n      ");
+                            }
+                            printf("\n");
+                            /* sv_fixup is at offset 48 (syscall entry func ptr) */
+                            uint64_t sv_fixup = 0;
+                            memcpy(&sv_fixup, sv_raw + 48, 8);
+                            printf("    sv_fixup (offset 48): 0x%lx",
+                                   (unsigned long)sv_fixup);
+                            if (sv_fixup >= g_ktext_base &&
+                                sv_fixup < g_ktext_base + 0x2000000ULL)
+                                printf(" (ktext+0x%lx)",
+                                       (unsigned long)(sv_fixup - g_ktext_base));
+                            printf("\n");
+                        }
+
+                        /* Read the actual Xfast_syscall entry from IDT 128
+                         * (int 0x80) — etaHEN may have replaced it */
+                        printf("[*] Checking IDT[128] (int80) handler...\n");
+                        /* IDT[128] already dumped above. Now check if
+                         * sysent dispatch is done via sv_table pointer or
+                         * a hardcoded address in Xfast_syscall */
+                        /* Try the DIRECT sysent approach: patch sysent[20]
+                         * (getpid itself) to return a magic value by pointing
+                         * it at nosys — if getpid() then returns ENOSYS,
+                         * the kernel IS using our sysent table */
+                        printf("[*] Reverse test: hook sysent[20] (getpid) to nosys...\n");
+                        uint64_t gpid_ent_kva = sysent_kva + 20ULL * SYSENT_STRIDE;
+                        uint64_t gpid_call_pa = va_to_pa_quiet(gpid_ent_kva + 8);
+                        uint64_t gpid_orig = 0;
+                        kernel_copyout(g_dmap_base + gpid_call_pa, &gpid_orig, 8);
+                        /* Write nosys into getpid */
+                        kernel_copyin(&nosys_call, g_dmap_base + gpid_call_pa, 8);
+                        uint64_t gpid_rb = 0;
+                        kernel_copyout(g_dmap_base + gpid_call_pa, &gpid_rb, 8);
+                        printf("    getpid sy_call: was 0x%lx, now 0x%lx (nosys)\n",
+                               (unsigned long)gpid_orig, (unsigned long)gpid_rb);
+                        errno = 0;
+                        pid_t test_pid = getpid();
+                        int test_err = errno;
+                        printf("    getpid() = %d, errno=%d\n", test_pid, test_err);
+                        if (test_pid != real_pid || test_err != 0) {
+                            printf("[+] getpid CHANGED! Kernel IS reading our sysent.\n");
+                            printf("    The nosys syscall test failed because Sony's nosys\n");
+                            printf("    returns %ld with carry clear (not standard ENOSYS).\n",
+                                   ret0);
+                        } else {
+                            printf("[-] getpid unchanged — sysent dispatch bypassed.\n");
+                            printf("    etaHEN or HV has its own dispatch table.\n");
+                        }
+                        /* Restore getpid */
+                        kernel_copyin(&gpid_orig, g_dmap_base + gpid_call_pa, 8);
+                        printf("    Restored sysent[20] (getpid)\n");
+                    } else if (!write_ok) {
+                        printf("[-] DMAP write FAILED — sysent page is write-protected.\n");
                     } else {
-                        printf("[-] Sysent hook did not behave as expected.\n");
-                        printf("    kernel_copyin to DMAP may not support writes,\n");
-                        printf("    or sysent page has write protection.\n");
+                        printf("[-] Sysent hook result unexpected: ret=%ld, errno=%d\n",
+                               ret1, err1);
+                        printf("    Write verified OK but behavior unclear.\n");
                     }
 
                     /* Restore original entry */
@@ -2485,7 +2571,7 @@ ring3_fallback:
                     printf("    Restored sysent[%d]\n", test_sc);
                     fflush(stdout);
                 } else {
-                    printf("[-] No unused syscall found in 700-720 range.\n");
+                    printf("[-] No unused nosys syscall found in 500-723.\n");
                 }
             }
         }
