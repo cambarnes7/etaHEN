@@ -1139,23 +1139,71 @@ static void campaign_kmod_kldload(void) {
     }
     memcpy(ko_buf, KMOD_KO, (size_t)KMOD_KO_SZ);
 
-    /* Find and replace sentinel with actual DMAP-mapped KVA */
-    int patched = 0;
+    /* Parse ELF64 section headers to find .data section bounds.
+     * The sentinel 0xDEAD000000000000 appears in BOTH .text (as the
+     * comparison operand in `if (g_output_kva != OUTPUT_KVA_SENTINEL)`)
+     * and .data (as g_output_kva's actual storage).  A naive forward
+     * scan hits the .text copy first and patches the wrong location,
+     * corrupting the comparison and leaving g_output_kva untouched. */
     uint8_t *ko_bytes = (uint8_t *)ko_buf;
-    for (size_t i = 0; i + 8 <= (size_t)KMOD_KO_SZ; i++) {
+
+    /* Minimal ELF64 header types for section parsing */
+    struct ko_elf64_ehdr {
+        unsigned char e_ident[16];
+        uint16_t e_type, e_machine;
+        uint32_t e_version;
+        uint64_t e_entry, e_phoff, e_shoff;
+        uint32_t e_flags;
+        uint16_t e_ehsize, e_phentsize, e_phnum;
+        uint16_t e_shentsize, e_shnum, e_shstrndx;
+    };
+    struct ko_elf64_shdr {
+        uint32_t sh_name, sh_type;
+        uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+        uint32_t sh_link, sh_info;
+        uint64_t sh_addralign, sh_entsize;
+    };
+
+    size_t data_off = 0, data_sz = 0;
+    struct ko_elf64_ehdr *ehdr = (struct ko_elf64_ehdr *)ko_bytes;
+    if (ehdr->e_shoff && ehdr->e_shstrndx < ehdr->e_shnum) {
+        struct ko_elf64_shdr *shdr =
+            (struct ko_elf64_shdr *)(ko_bytes + ehdr->e_shoff);
+        const char *shstrtab =
+            (const char *)(ko_bytes + shdr[ehdr->e_shstrndx].sh_offset);
+        for (uint16_t s = 0; s < ehdr->e_shnum; s++) {
+            if (strcmp(&shstrtab[shdr[s].sh_name], ".data") == 0) {
+                data_off = (size_t)shdr[s].sh_offset;
+                data_sz  = (size_t)shdr[s].sh_size;
+                break;
+            }
+        }
+    }
+
+    if (data_off == 0 || data_sz == 0) {
+        printf("[-] Could not locate .data section in .ko ELF!\n");
+        free(ko_buf);
+        return;
+    }
+    printf("[*] .data section: file offset 0x%zx, size 0x%zx\n",
+           data_off, data_sz);
+
+    /* Search only within .data for the sentinel (g_output_kva storage) */
+    int patched = 0;
+    for (size_t i = data_off; i + 8 <= data_off + data_sz; i++) {
         uint64_t val;
         memcpy(&val, &ko_bytes[i], 8);
         if (val == OUTPUT_KVA_SENTINEL) {
             memcpy(&ko_bytes[i], &result_kva, 8);
-            printf("[+] Patched sentinel at .ko offset 0x%zx -> 0x%lx\n",
-                   i, (unsigned long)result_kva);
+            printf("[+] Patched g_output_kva at .ko offset 0x%zx (.data+0x%zx) -> 0x%lx\n",
+                   i, i - data_off, (unsigned long)result_kva);
             patched = 1;
             break;
         }
     }
 
     if (!patched) {
-        printf("[-] Could not find OUTPUT_KVA_SENTINEL (0x%llx) in .ko!\n",
+        printf("[-] Could not find OUTPUT_KVA_SENTINEL (0x%llx) in .data section!\n",
                (unsigned long long)OUTPUT_KVA_SENTINEL);
         printf("    The .ko may have been compiled without g_output_kva.\n");
         free(ko_buf);
