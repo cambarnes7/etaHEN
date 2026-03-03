@@ -2629,6 +2629,232 @@ ring3_fallback:
             }
         }
 
+        /* ================================================================
+         * NPT (Nested Page Table) Discovery Scan
+         * ================================================================
+         * Goal: Find the PS5 hypervisor's page table structures that
+         * enforce W^X on kernel memory.  Entirely read-only via DMAP.
+         *
+         * Strategy:
+         *   1. Scan guest physical memory for VMCB (contains nCR3 = NPT root)
+         *      - VMCB has guest CR3 at save-state offset 0x580
+         *   2. Scan for page table pages referencing known kdata/ktext PAs
+         *   3. Map out which PA ranges are guest-accessible vs HV-protected
+         *
+         * AMD NPT entry format (8 bytes):
+         *   Bit 0:     Present
+         *   Bit 1:     Read/Write
+         *   Bit 2:     User/Supervisor
+         *   Bit 7:     Page Size (2MB at PD level)
+         *   Bits 12-51: Physical page frame number
+         *   Bit 63:    NX (No Execute)
+         * ================================================================ */
+        {
+            printf("\n=============================================\n");
+            printf("  NPT Discovery: HV Page Table Scan\n");
+            printf("=============================================\n\n");
+            fflush(stdout);
+
+            /* Get known physical addresses for signature matching */
+            uint64_t ktext_pa = va_to_pa_quiet(g_ktext_base);
+            uint64_t kdata_pa = va_to_pa_quiet(g_kdata_base);
+            uint64_t ktext_2mb = ktext_pa & ~0x1FFFFFULL;
+            uint64_t kdata_2mb = kdata_pa & ~0x1FFFFFULL;
+
+            printf("[*] Search signatures:\n");
+            printf("    ktext PA  = 0x%lx (2MB page: 0x%lx)\n",
+                   (unsigned long)ktext_pa, (unsigned long)ktext_2mb);
+            printf("    kdata PA  = 0x%lx (2MB page: 0x%lx)\n",
+                   (unsigned long)kdata_pa, (unsigned long)kdata_2mb);
+            printf("    Guest CR3 = 0x%lx\n", (unsigned long)g_cr3_phys);
+            printf("    Scan range: PA 0x0 → 0x20000000 (512MB)\n");
+            fflush(stdout);
+
+            uint8_t scan_pg[4096];
+            int npt_ok = 0, npt_fail = 0;
+            int vmcb_found = 0;
+            int pt_pages_with_refs = 0;
+            /* Track which 2MB regions are accessible vs blocked */
+            int accessible_2mb = 0, blocked_2mb = 0;
+            uint64_t first_blocked = 0, last_blocked = 0;
+
+            /* Phase 1: Scan for VMCB and PT structures */
+            for (uint64_t pa = 0; pa < 0x20000000ULL; pa += 0x1000) {
+                /* Progress every 64MB */
+                if ((pa & 0x3FFFFFF) == 0 && pa > 0) {
+                    printf("    Scan: %luMB/512MB (%d OK, %d blocked, "
+                           "%d PT refs found)\n",
+                           (unsigned long)(pa >> 20), npt_ok, npt_fail,
+                           pt_pages_with_refs);
+                    fflush(stdout);
+                }
+
+                /* Track 2MB-region accessibility */
+                if ((pa & 0x1FFFFF) == 0) {
+                    /* Test first page of each 2MB region */
+                    if (kernel_copyout(g_dmap_base + pa, scan_pg, 8) != 0) {
+                        blocked_2mb++;
+                        if (!first_blocked) first_blocked = pa;
+                        last_blocked = pa;
+                        pa += 0x1FFFFF; /* Skip rest of blocked 2MB region */
+                        npt_fail += 512;
+                        continue;
+                    }
+                    accessible_2mb++;
+                }
+
+                if (kernel_copyout(g_dmap_base + pa, scan_pg, 4096) != 0) {
+                    npt_fail++;
+                    continue;
+                }
+                npt_ok++;
+
+                uint64_t *ents = (uint64_t *)scan_pg;
+
+                /* Check for VMCB: guest CR3 at save-state offset 0x580 */
+                if (g_cr3_phys != 0) {
+                    uint64_t v580 = 0;
+                    memcpy(&v580, scan_pg + 0x580, 8);
+                    /* CR3 match (mask out PCID bits in low 12) */
+                    if ((v580 & ~0xFFFULL) == (g_cr3_phys & ~0xFFFULL) &&
+                        v580 != 0) {
+                        printf("\n[!] VMCB candidate at PA 0x%lx!\n",
+                               (unsigned long)pa);
+                        printf("    offset 0x580 (CR3): 0x%lx\n",
+                               (unsigned long)v580);
+                        vmcb_found++;
+
+                        /* Dump likely nCR3 locations in control area */
+                        printf("    Control area (possible nCR3):\n");
+                        for (int off = 0x40; off <= 0xB0; off += 8) {
+                            uint64_t val;
+                            memcpy(&val, scan_pg + off, 8);
+                            /* nCR3 should be page-aligned, non-zero,
+                             * reasonable PA */
+                            if (val != 0 && (val & 0xFFF) == 0 &&
+                                val < 0x800000000ULL) {
+                                printf("      [0x%03x] = 0x%lx", off,
+                                       (unsigned long)val);
+                                /* Try to read the page it points to */
+                                uint8_t probe[8];
+                                if (kernel_copyout(g_dmap_base + val,
+                                                   probe, 8) == 0) {
+                                    uint64_t first_e;
+                                    memcpy(&first_e, probe, 8);
+                                    printf(" (readable, first entry:"
+                                           " 0x%lx)", (unsigned long)first_e);
+                                } else {
+                                    printf(" (NOT readable from guest)");
+                                }
+                                printf("\n");
+                            }
+                        }
+                        /* Also dump some save-state area for context */
+                        printf("    Save state context:\n");
+                        /* CR0 at 0x588, CR4 at 0x578, EFER at 0x550 */
+                        uint64_t v_cr0, v_cr4, v_efer;
+                        memcpy(&v_efer, scan_pg + 0x550, 8);
+                        memcpy(&v_cr4, scan_pg + 0x578, 8);
+                        memcpy(&v_cr0, scan_pg + 0x588, 8);
+                        printf("      EFER(0x550)=0x%lx CR4(0x578)=0x%lx"
+                               " CR0(0x588)=0x%lx\n",
+                               (unsigned long)v_efer, (unsigned long)v_cr4,
+                               (unsigned long)v_cr0);
+                        fflush(stdout);
+                    }
+                }
+
+                /* Check if this page has PT entries referencing
+                 * kdata or ktext physical addresses */
+                int kdata_refs = 0, ktext_refs = 0;
+                int present_cnt = 0;
+                for (int i = 0; i < 512; i++) {
+                    uint64_t e = ents[i];
+                    if (!(e & 1)) continue;
+                    present_cnt++;
+
+                    uint64_t e_pa = e & 0x000FFFFFFFFFF000ULL;
+                    int is_2mb = (e & 0x80) != 0;
+
+                    if (is_2mb) {
+                        uint64_t e_2mb = e_pa & ~0x1FFFFFULL;
+                        if (e_2mb == kdata_2mb) kdata_refs++;
+                        if (e_2mb == ktext_2mb) ktext_refs++;
+                    } else {
+                        /* 4KB entry or PT pointer — check if PA is in
+                         * kdata/ktext range (within 32MB) */
+                        if (e_pa >= kdata_pa &&
+                            e_pa < kdata_pa + 0x2000000)
+                            kdata_refs++;
+                        if (e_pa >= ktext_pa &&
+                            e_pa < ktext_pa + 0x2000000)
+                            ktext_refs++;
+                    }
+                }
+
+                if (kdata_refs > 0 || ktext_refs > 0) {
+                    pt_pages_with_refs++;
+                    printf("\n[!] PT page at PA 0x%lx: %d present entries, "
+                           "%d kdata refs, %d ktext refs\n",
+                           (unsigned long)pa, present_cnt,
+                           kdata_refs, ktext_refs);
+
+                    /* Dump matching entries */
+                    for (int i = 0; i < 512; i++) {
+                        uint64_t e = ents[i];
+                        if (!(e & 1)) continue;
+                        uint64_t e_pa = e & 0x000FFFFFFFFFF000ULL;
+                        int is_2mb = (e & 0x80) != 0;
+                        int match = 0;
+                        if (is_2mb) {
+                            uint64_t e_2mb = e_pa & ~0x1FFFFFULL;
+                            if (e_2mb == kdata_2mb ||
+                                e_2mb == ktext_2mb) match = 1;
+                        } else {
+                            if ((e_pa >= kdata_pa &&
+                                 e_pa < kdata_pa + 0x2000000) ||
+                                (e_pa >= ktext_pa &&
+                                 e_pa < ktext_pa + 0x2000000))
+                                match = 1;
+                        }
+                        if (match) {
+                            printf("    [%3d] 0x%016lx → PA=0x%lx "
+                                   "%s %s %s %s\n",
+                                   i, (unsigned long)e, (unsigned long)e_pa,
+                                   is_2mb ? "2MB" : "4KB",
+                                   (e & 2) ? "RW" : "RO",
+                                   (e & 4) ? "User" : "Kern",
+                                   (e >> 63) ? "NX" : "X");
+                        }
+                    }
+                    fflush(stdout);
+                }
+            }
+
+            printf("\n[*] NPT scan summary:\n");
+            printf("    Pages scanned:   %d OK, %d blocked\n",
+                   npt_ok, npt_fail);
+            printf("    2MB regions:     %d accessible, %d blocked\n",
+                   accessible_2mb, blocked_2mb);
+            if (first_blocked)
+                printf("    Blocked range:   first=0x%lx, last=0x%lx\n",
+                       (unsigned long)first_blocked,
+                       (unsigned long)last_blocked);
+            printf("    VMCB candidates: %d\n", vmcb_found);
+            printf("    PT pages w/ kdata/ktext refs: %d\n",
+                   pt_pages_with_refs);
+
+            if (vmcb_found == 0 && pt_pages_with_refs == 0) {
+                printf("\n[*] HV structures not found in guest-accessible memory.\n");
+                printf("    The hypervisor likely protects its page tables.\n");
+                printf("    Alternative: use sysent hook to call kernel pmap\n");
+                printf("    functions (e.g. pmap_protect) from ring 0 to\n");
+                printf("    change page permissions from inside the kernel.\n");
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+
 idt_done: ;
 idt_skip: ;
     }
