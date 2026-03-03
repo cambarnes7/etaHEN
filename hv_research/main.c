@@ -2140,25 +2140,30 @@ ring3_fallback:
             int sysent_found = 0;
             uint64_t sysent_kva = 0;
 
-            /* Search kdata for the sysent array (scan first 64MB) */
-            for (uint64_t off = 0; off < 0x4000000 && !sysent_found; off += 8) {
-                uint64_t kva = g_kdata_base + off;
-                uint8_t sample[16 * 9];  /* 9 entries × 16 bytes */
-                if (kernel_copyout(kva, sample, sizeof(sample)) != 0) continue;
+            /* Search kdata for the sysent array (scan first 64MB).
+             * Read 4KB blocks and search within to minimize syscalls.
+             * sysent entries are 16-byte aligned, so check every 16 bytes. */
+            uint8_t blk[4096];
+            int match_size = 16 * 9;  /* 9 entries × 16 bytes = 144 bytes */
 
-                int match = 1;
-                for (int i = 0; i < 9 && match; i++) {
-                    int32_t narg;
-                    memcpy(&narg, &sample[i * 16], 4);
-                    if (narg != expected_nargs[i]) match = 0;
-                }
-                if (match) {
-                    /* Verify sy_call pointers are in ktext range */
-                    uint64_t call0;
-                    memcpy(&call0, &sample[8], 8);
-                    if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
-                        sysent_kva = kva;
-                        sysent_found = 1;
+            for (uint64_t pg = 0; pg < 0x4000000 && !sysent_found; pg += 4096) {
+                uint64_t kva = g_kdata_base + pg;
+                if (kernel_copyout(kva, blk, 4096) != 0) continue;
+
+                for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 16) {
+                    int match = 1;
+                    for (int i = 0; i < 9 && match; i++) {
+                        int32_t narg;
+                        memcpy(&narg, &blk[boff + i * 16], 4);
+                        if (narg != expected_nargs[i]) match = 0;
+                    }
+                    if (match) {
+                        uint64_t call0;
+                        memcpy(&call0, &blk[boff + 8], 8);
+                        if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
+                            sysent_kva = kva + boff;
+                            sysent_found = 1;
+                        }
                     }
                 }
             }
