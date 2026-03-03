@@ -1026,27 +1026,398 @@ static void campaign_iommu_recon(void) {
     }
 }
 
+/* ── ELF64 definitions for userland module loader ── */
+
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type, e_machine;
+    uint32_t e_version;
+    uint64_t e_entry, e_phoff, e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum;
+    uint16_t e_shentsize, e_shnum, e_shstrndx;
+} Elf64_Ehdr_t;
+
+typedef struct {
+    uint32_t sh_name, sh_type;
+    uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+    uint32_t sh_link, sh_info;
+    uint64_t sh_addralign, sh_entsize;
+} Elf64_Shdr_t;
+
+typedef struct {
+    uint32_t st_name;
+    uint8_t  st_info, st_other;
+    uint16_t st_shndx;
+    uint64_t st_value, st_size;
+} Elf64_Sym_t;
+
+typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+    int64_t  r_addend;
+} Elf64_Rela_t;
+
+#define ELF_SHT_SYMTAB  2
+#define ELF_SHT_RELA    4
+#define ELF_SHT_NOBITS  8
+#define ELF_SHF_ALLOC   0x2
+
+#define ELF64_R_SYM(i)   ((uint32_t)((i) >> 32))
+#define ELF64_R_TYPE(i)   ((uint32_t)((i) & 0xFFFFFFFF))
+
+#define R_X86_64_NONE    0
+#define R_X86_64_64      1
+#define R_X86_64_PC32    2
+#define R_X86_64_PLT32   4
+#define R_X86_64_32      10
+#define R_X86_64_32S     11
+
+#define KMOD_RESULT_ALLOC_SIZE 0x4000  /* 16KB - plenty for 7200-byte struct */
+
 /*
- * Campaign 7: Kernel Module via kldload
+ * Userland ELF loader: load .ko into DMAP page and execute via IDT hook.
  *
- * This is the core HV research campaign. It uses FreeBSD's native
- * kernel module loading (kldload) instead of sysent hijacking:
+ * This bypasses the PS5 kernel linker's broken SYSINIT/MOD_LOAD dispatch
+ * and neutered kldstat/kldsym. Instead of relying on the kernel to run
+ * our init code, we:
+ *   1. Parse the ET_REL ELF ourselves
+ *   2. Lay out sections in a DMAP-mapped page (kernel-accessible, RWX on FW < 6.50)
+ *   3. Process relocations (the kernel linker's job, done in userland)
+ *   4. Patch g_output_kva with the shared result buffer's DMAP KVA
+ *   5. Hook an IDT entry → hv_idt_trampoline in the loaded image
+ *   6. INT 210 → CPU transitions to ring 0 → trampoline → hv_init → campaigns → IRETQ
  *
- * 1. Write the embedded .ko file to disk
- * 2. Call kldload() to load it into the kernel
- *    - The kernel linker allocates memory, handles relocations
- *    - SYSINIT callback runs our init code in ring 0
- *    - Init reads MSRs, CRs, and optionally executes VMMCALLs
- * 3. Use kldsym() to find the hv_results symbol
- * 4. kernel_copyout() the results to userland
- * 5. kldunload() to clean up
+ * Returns 0 on success (results written to result_vaddr), -1 on failure.
+ */
+static int dmap_load_and_execute(uint64_t result_kva, void *result_vaddr) {
+    const uint8_t *ko = KMOD_KO;
+    const Elf64_Ehdr_t *ehdr = (const Elf64_Ehdr_t *)ko;
+    const Elf64_Shdr_t *shdrs = (const Elf64_Shdr_t *)(ko + ehdr->e_shoff);
+
+    if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
+        printf("[-] DMAP loader: invalid ELF magic\n");
+        return -1;
+    }
+
+    /* Step 1: Calculate total size for ALLOC sections (mirrors kernel linker layout) */
+    uint64_t total_size = 0;
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        if (!(shdrs[i].sh_flags & ELF_SHF_ALLOC))
+            continue;
+        uint64_t align = shdrs[i].sh_addralign;
+        if (align > 1)
+            total_size = (total_size + align - 1) & ~(align - 1);
+        total_size += shdrs[i].sh_size;
+    }
+
+    printf("[*] DMAP loader: %lu bytes needed for module sections\n",
+           (unsigned long)total_size);
+
+    /* Step 2: Allocate DMAP page for code+data */
+    size_t alloc_size = (total_size + 0x3FFF) & ~0x3FFFULL;
+    if (alloc_size < 0x4000) alloc_size = 0x4000;
+
+    off_t code_phys = 0;
+    void *code_vaddr = NULL;
+    int ret = sceKernelAllocateDirectMemory(
+        0, 0x180000000ULL, alloc_size, 0x4000,
+        SCE_KERNEL_WB_ONION, &code_phys);
+    if (ret != 0) {
+        printf("[-] DMAP loader: alloc failed: 0x%x\n", ret);
+        return -1;
+    }
+
+    ret = sceKernelMapDirectMemory(
+        &code_vaddr, alloc_size, SCE_KERNEL_PROT_CPU_RW,
+        0, code_phys, 0x4000);
+    if (ret != 0) {
+        printf("[-] DMAP loader: map failed: 0x%x\n", ret);
+        return -1;
+    }
+
+    memset(code_vaddr, 0, alloc_size);
+
+    uint64_t code_cpu_pa = va_to_cpu_pa((uint64_t)code_vaddr);
+    if (code_cpu_pa == 0) {
+        printf("[-] DMAP loader: page table walk failed for code page\n");
+        return -1;
+    }
+    uint64_t code_kva = g_dmap_base + code_cpu_pa;
+    printf("[+] DMAP code page: userland VA=0x%lx, DMAP KVA=0x%lx\n",
+           (unsigned long)code_vaddr, (unsigned long)code_kva);
+
+    /* Verify DMAP code page is accessible from kernel */
+    volatile uint64_t *test = (volatile uint64_t *)code_vaddr;
+    *test = 0xDEAD1234CAFE5678ULL;
+    uint64_t verify;
+    kernel_copyout(code_kva, &verify, sizeof(verify));
+    *test = 0;
+    if (verify != 0xDEAD1234CAFE5678ULL) {
+        printf("[-] DMAP code page verification failed (got 0x%lx)\n",
+               (unsigned long)verify);
+        return -1;
+    }
+    printf("[+] DMAP code page verified OK\n");
+
+    /* Step 3: Lay out ALLOC sections and record their kernel VAs.
+     * The kernel linker lays out sections in section-header order,
+     * respecting alignment. We mirror this exactly so that relative
+     * relocations (PC32/PLT32) produce valid offsets. */
+    uint64_t *sec_kva = calloc(ehdr->e_shnum, sizeof(uint64_t));
+    if (!sec_kva) {
+        printf("[-] DMAP loader: calloc failed\n");
+        return -1;
+    }
+
+    uint8_t *dest = (uint8_t *)code_vaddr;
+    uint64_t offset = 0;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        if (!(shdrs[i].sh_flags & ELF_SHF_ALLOC))
+            continue;
+        uint64_t align = shdrs[i].sh_addralign;
+        if (align > 1)
+            offset = (offset + align - 1) & ~(align - 1);
+
+        sec_kva[i] = code_kva + offset;
+
+        /* Copy section data (skip NOBITS/.bss — already zeroed) */
+        if (shdrs[i].sh_type != ELF_SHT_NOBITS && shdrs[i].sh_size > 0) {
+            memcpy(dest + offset, ko + shdrs[i].sh_offset, shdrs[i].sh_size);
+        }
+
+        printf("    section[%u]: KVA=0x%lx size=0x%lx\n",
+               i, (unsigned long)sec_kva[i], (unsigned long)shdrs[i].sh_size);
+        offset += shdrs[i].sh_size;
+    }
+
+    /* Step 4: Find symbol table */
+    const Elf64_Shdr_t *symtab_sh = NULL;
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        if (shdrs[i].sh_type == ELF_SHT_SYMTAB) {
+            symtab_sh = &shdrs[i];
+            break;
+        }
+    }
+    if (!symtab_sh) {
+        printf("[-] DMAP loader: no .symtab in .ko\n");
+        free(sec_kva);
+        return -1;
+    }
+
+    const Elf64_Sym_t *syms = (const Elf64_Sym_t *)(ko + symtab_sh->sh_offset);
+    uint64_t nsyms = symtab_sh->sh_size / sizeof(Elf64_Sym_t);
+    const char *strtab = (const char *)(ko + shdrs[symtab_sh->sh_link].sh_offset);
+
+    /* Step 5: Process all RELA relocations */
+    printf("[*] Processing relocations...\n");
+    int reloc_count = 0;
+    int reloc_errors = 0;
+
+    for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+        if (shdrs[i].sh_type != ELF_SHT_RELA)
+            continue;
+
+        uint16_t target_sec = (uint16_t)shdrs[i].sh_info;
+        if (target_sec >= ehdr->e_shnum || !sec_kva[target_sec])
+            continue; /* target section not loaded */
+
+        const Elf64_Rela_t *relas = (const Elf64_Rela_t *)(ko + shdrs[i].sh_offset);
+        uint64_t nrelas = shdrs[i].sh_size / sizeof(Elf64_Rela_t);
+
+        for (uint64_t j = 0; j < nrelas; j++) {
+            uint32_t sym_idx = ELF64_R_SYM(relas[j].r_info);
+            uint32_t rtype   = ELF64_R_TYPE(relas[j].r_info);
+            int64_t  addend  = relas[j].r_addend;
+
+            /* Compute S: symbol's final kernel VA */
+            uint64_t S = 0;
+            if (sym_idx > 0 && sym_idx < nsyms) {
+                uint16_t sym_sec = syms[sym_idx].st_shndx;
+                if (sym_sec < ehdr->e_shnum && sec_kva[sym_sec]) {
+                    S = sec_kva[sym_sec] + syms[sym_idx].st_value;
+                } else if (sym_sec == 0) {
+                    /* Undefined symbol — should not happen in our self-contained module */
+                    printf("[!] Undefined symbol: %s\n", strtab + syms[sym_idx].st_name);
+                    reloc_errors++;
+                    continue;
+                }
+            }
+
+            /* Compute P: address of the relocation site */
+            uint64_t P = sec_kva[target_sec] + relas[j].r_offset;
+
+            /* Local pointer for writing (userland VA) */
+            uint64_t local_off = P - code_kva;
+            uint8_t *loc = dest + local_off;
+
+            switch (rtype) {
+            case R_X86_64_64:
+                *(uint64_t *)loc = (uint64_t)(S + addend);
+                break;
+            case R_X86_64_PC32:
+            case R_X86_64_PLT32:
+                *(int32_t *)loc = (int32_t)((int64_t)S + addend - (int64_t)P);
+                break;
+            case R_X86_64_32:
+                *(uint32_t *)loc = (uint32_t)(S + addend);
+                break;
+            case R_X86_64_32S:
+                *(int32_t *)loc = (int32_t)((int64_t)S + addend);
+                break;
+            case R_X86_64_NONE:
+                break;
+            default:
+                printf("[!] Unsupported reloc type %u at offset 0x%lx\n",
+                       rtype, (unsigned long)relas[j].r_offset);
+                reloc_errors++;
+                break;
+            }
+            reloc_count++;
+        }
+    }
+
+    printf("[+] Processed %d relocations (%d errors)\n", reloc_count, reloc_errors);
+
+    /* Step 6: Find key symbols and patch g_output_kva */
+    uint64_t trampoline_kva = 0;
+    uint64_t g_output_kva_kva = 0;
+
+    for (uint64_t i = 0; i < nsyms; i++) {
+        uint16_t sec = syms[i].st_shndx;
+        if (sec >= ehdr->e_shnum || !sec_kva[sec])
+            continue;
+        uint64_t sym_addr = sec_kva[sec] + syms[i].st_value;
+        const char *name = strtab + syms[i].st_name;
+
+        if (strcmp(name, "hv_idt_trampoline") == 0)
+            trampoline_kva = sym_addr;
+        else if (strcmp(name, "g_output_kva") == 0)
+            g_output_kva_kva = sym_addr;
+    }
+
+    if (!trampoline_kva) {
+        printf("[-] DMAP loader: hv_idt_trampoline not found\n");
+        free(sec_kva);
+        return -1;
+    }
+
+    printf("[+] hv_idt_trampoline KVA: 0x%lx\n", (unsigned long)trampoline_kva);
+
+    if (g_output_kva_kva) {
+        /* Patch g_output_kva in the loaded image */
+        uint64_t local_off = g_output_kva_kva - code_kva;
+        memcpy(dest + local_off, &result_kva, 8);
+        printf("[+] Patched g_output_kva at KVA 0x%lx -> 0x%lx\n",
+               (unsigned long)g_output_kva_kva, (unsigned long)result_kva);
+    } else {
+        printf("[!] g_output_kva not found — results will only be in module-local buffer\n");
+    }
+
+    free(sec_kva);
+
+    /* Ensure all writes are visible before execution */
+    __asm__ volatile("mfence" ::: "memory");
+
+    /* Step 7: Test DMAP executability with a minimal IRETQ stub.
+     * Write IRETQ (0x48 0xCF) to a scratch area past the module,
+     * hook IDT to it, trigger INT. If we return, DMAP is executable. */
+    printf("\n[*] Testing DMAP executability...\n");
+    uint64_t test_off = (offset + 0x100) & ~0xFULL; /* past module, 16-aligned */
+    dest[test_off]     = 0x48; /* REX.W prefix */
+    dest[test_off + 1] = 0xCF; /* IRET */
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint64_t test_kva = code_kva + test_off;
+
+    /* Read IDTR */
+    struct {
+        uint16_t limit;
+        uint64_t base;
+    } __attribute__((packed)) idtr;
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+
+    #define HV_IDT_VECTOR 210
+
+    if (((unsigned)(HV_IDT_VECTOR) + 1) * 16 > (unsigned)(idtr.limit + 1)) {
+        printf("[-] IDT too small for vector %u\n", HV_IDT_VECTOR);
+        return -1;
+    }
+
+    struct idt_gate {
+        uint16_t offset_lo;
+        uint16_t selector;
+        uint8_t  ist;
+        uint8_t  type_attr;
+        uint16_t offset_mid;
+        uint32_t offset_hi;
+        uint32_t reserved;
+    } __attribute__((packed));
+
+    uint64_t gate_addr = idtr.base + HV_IDT_VECTOR * sizeof(struct idt_gate);
+
+    /* Save original IDT entry */
+    struct idt_gate orig_gate;
+    kernel_copyout(gate_addr, &orig_gate, sizeof(orig_gate));
+
+    /* Get kernel CS from #PF handler (vector 14) */
+    struct idt_gate ref_gate;
+    kernel_copyout(idtr.base + 14 * sizeof(struct idt_gate), &ref_gate, sizeof(ref_gate));
+    uint16_t kernel_cs = ref_gate.selector;
+
+    /* Build test gate: DPL=3 interrupt gate → IRETQ stub */
+    struct idt_gate test_gate;
+    memset(&test_gate, 0, sizeof(test_gate));
+    test_gate.offset_lo  = (uint16_t)(test_kva & 0xFFFF);
+    test_gate.offset_mid = (uint16_t)((test_kva >> 16) & 0xFFFF);
+    test_gate.offset_hi  = (uint32_t)(test_kva >> 32);
+    test_gate.selector   = kernel_cs;
+    test_gate.ist        = 0;
+    test_gate.type_attr  = 0xEE; /* P=1, DPL=3, type=0xE (interrupt gate) */
+
+    kernel_copyin(&test_gate, gate_addr, sizeof(test_gate));
+    __asm__ volatile("int $210" ::: "memory");
+    kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
+
+    printf("[+] DMAP code execution works! IRETQ test passed.\n");
+
+    /* Step 8: Execute the real payload via IDT hook */
+    printf("\n[*] Hooking IDT[%u] -> hv_idt_trampoline at 0x%lx...\n",
+           HV_IDT_VECTOR, (unsigned long)trampoline_kva);
+
+    /* Clear result buffer */
+    memset(result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
+
+    struct idt_gate payload_gate;
+    memset(&payload_gate, 0, sizeof(payload_gate));
+    payload_gate.offset_lo  = (uint16_t)(trampoline_kva & 0xFFFF);
+    payload_gate.offset_mid = (uint16_t)((trampoline_kva >> 16) & 0xFFFF);
+    payload_gate.offset_hi  = (uint32_t)(trampoline_kva >> 32);
+    payload_gate.selector   = kernel_cs;
+    payload_gate.ist        = 0;
+    payload_gate.type_attr  = 0xEE;
+
+    kernel_copyin(&payload_gate, gate_addr, sizeof(payload_gate));
+
+    printf("[*] Triggering INT %u → ring 0 campaigns...\n", HV_IDT_VECTOR);
+    __asm__ volatile("int $210" ::: "memory");
+
+    /* Restore IDT immediately */
+    kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
+    printf("[+] Returned from ring 0! IDT[%u] restored.\n", HV_IDT_VECTOR);
+
+    return 0;
+}
+
+/*
+ * Campaign 7: Kernel Module via kldload + DMAP fallback
  *
- * Advantages over sysent hijacking:
- *   - No sysent table scanning (was failing)
- *   - No data cave hunting
- *   - No NX bit clearing
- *   - Kernel handles all memory management and relocation
- *   - Works on FW < 6.50 (GMET not enforced)
+ * Primary path: kldload loads the .ko and SYSINIT fires hv_init in ring 0.
+ * Fallback (PS5 FW 4.03): SYSINIT/MOD_LOAD don't fire, so we use the
+ * userland DMAP ELF loader to place the module in executable DMAP memory
+ * and trigger it via IDT hook (INT 210 → ring 0 → hv_init → IRETQ).
  */
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
@@ -1065,7 +1436,6 @@ static void campaign_kmod_kldload(void) {
      * its kernel VA via DMAP. The kmod writes results here. */
     printf("\n[*] Step 1: Allocating shared result buffer...\n");
 
-    #define KMOD_RESULT_ALLOC_SIZE 0x4000  /* 16KB - plenty for 7200-byte struct */
     off_t result_phys = 0;
     void *result_vaddr = NULL;
 
@@ -1153,33 +1523,6 @@ static void campaign_kmod_kldload(void) {
     int patched = 0;
     uint8_t *ko_bytes = (uint8_t *)ko_buf;
 
-    /* Minimal ELF64 structures for symbol lookup */
-    typedef struct {
-        unsigned char e_ident[16];
-        uint16_t e_type, e_machine;
-        uint32_t e_version;
-        uint64_t e_entry, e_phoff, e_shoff;
-        uint32_t e_flags;
-        uint16_t e_ehsize, e_phentsize, e_phnum;
-        uint16_t e_shentsize, e_shnum, e_shstrndx;
-    } Elf64_Ehdr_t;
-
-    typedef struct {
-        uint32_t sh_name, sh_type;
-        uint64_t sh_flags, sh_addr, sh_offset, sh_size;
-        uint32_t sh_link, sh_info;
-        uint64_t sh_addralign, sh_entsize;
-    } Elf64_Shdr_t;
-
-    typedef struct {
-        uint32_t st_name;
-        uint8_t  st_info, st_other;
-        uint16_t st_shndx;
-        uint64_t st_value, st_size;
-    } Elf64_Sym_t;
-
-    #define SHT_SYMTAB 2
-
     Elf64_Ehdr_t *ehdr = (Elf64_Ehdr_t *)ko_bytes;
 
     if (ehdr->e_shoff && ehdr->e_shnum > 0) {
@@ -1188,7 +1531,7 @@ static void campaign_kmod_kldload(void) {
         /* Find .symtab */
         Elf64_Shdr_t *symtab_sh = NULL;
         for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
-            if (shdrs[i].sh_type == SHT_SYMTAB) {
+            if (shdrs[i].sh_type == ELF_SHT_SYMTAB) {
                 symtab_sh = &shdrs[i];
                 break;
             }
@@ -1317,148 +1660,30 @@ static void campaign_kmod_kldload(void) {
     uint64_t first_qword;
     memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
 
-    /* ── Step 4b: IDT-based manual invocation (if SYSINIT/MOD_LOAD didn't fire) ──
+    /* ── Step 4b: DMAP userland ELF loader (if SYSINIT/MOD_LOAD didn't fire) ──
      *
-     * On PS5 FW 4.03 the kernel linker loads modules into RWX pages
-     * (GMET is not enforced until FW 6.50) but does NOT process SYSINIT
-     * or MOD_LOAD for dynamically loaded modules.
+     * On PS5 FW 4.03, the kernel linker loads modules but does NOT process
+     * SYSINIT or MOD_LOAD. Additionally, kldstat/kldsym are neutered (return
+     * zeros), so we can't find the loaded module's address.
      *
-     * Fallback: hook an IDT entry via kernel_copyin, point it at the
-     * hv_idt_trampoline in the loaded module, and trigger "int N" from
-     * userland.  The CPU transitions to ring 0 through the IDT gate and
-     * executes our trampoline → hv_init → campaigns → IRETQ back.
-     *
-     * This mirrors the approach used by r0gdb / kstuff for kernel code
-     * execution on FW 4.03 (IDT hooking for int1 / int13).
+     * Solution: bypass the kernel linker entirely. We parse the .ko ELF in
+     * userspace, load sections into a DMAP page (RWX on FW < 6.50), process
+     * relocations ourselves, and execute via IDT hook (INT 210 → ring 0).
      */
     if (first_qword == 0) {
-        printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — trying IDT invocation...\n");
+        printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire.\n");
+        printf("[*] Using DMAP userland ELF loader to execute module in ring 0...\n");
 
-        /* 4b-1: Get module base address via kldstat */
-        struct kld_file_stat kstat;
-        memset(&kstat, 0, sizeof(kstat));
-        kstat.version = sizeof(struct kld_file_stat);
-        ret = syscall(SYS_kldstat, kid, &kstat);
-        if (ret < 0) {
-            printf("[-] kldstat failed: errno=%d (%s)\n", errno, strerror(errno));
-            goto idt_skip;
+        if (dmap_load_and_execute(result_kva, result_vaddr) == 0) {
+            /* Re-read results after DMAP execution */
+            memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
+            if (first_qword != 0)
+                printf("[+] Buffer is no longer zero — DMAP execution worked!\n");
+            else
+                printf("[-] Buffer still zero after DMAP execution.\n");
+        } else {
+            printf("[-] DMAP loader failed.\n");
         }
-        printf("[+] kldstat: base=0x%lx, size=0x%lx, name='%.64s'\n",
-               (unsigned long)kstat.address, (unsigned long)kstat.size, kstat.name);
-
-        if (kstat.address == 0 || kstat.size == 0) {
-            printf("[-] kldstat returned invalid module info.\n");
-            goto idt_skip;
-        }
-
-        /* 4b-2: Find hv_idt_trampoline offset from the embedded .ko symbol table */
-        uint64_t trampoline_offset = 0;
-        {
-            /* Re-use the ELF types already defined above */
-            Elf64_Ehdr_t *ko_ehdr = (Elf64_Ehdr_t *)KMOD_KO;
-            if (ko_ehdr->e_shoff && ko_ehdr->e_shnum > 0) {
-                Elf64_Shdr_t *ko_shdrs = (Elf64_Shdr_t *)((const uint8_t *)KMOD_KO + ko_ehdr->e_shoff);
-                for (uint16_t s = 0; s < ko_ehdr->e_shnum; s++) {
-                    if (ko_shdrs[s].sh_type == SHT_SYMTAB) {
-                        Elf64_Sym_t *syms = (Elf64_Sym_t *)((const uint8_t *)KMOD_KO + ko_shdrs[s].sh_offset);
-                        uint64_t nsyms = ko_shdrs[s].sh_size / sizeof(Elf64_Sym_t);
-                        const char *strtab = (const char *)((const uint8_t *)KMOD_KO + ko_shdrs[ko_shdrs[s].sh_link].sh_offset);
-                        for (uint64_t i = 0; i < nsyms; i++) {
-                            if (strcmp(strtab + syms[i].st_name, "hv_idt_trampoline") == 0) {
-                                trampoline_offset = syms[i].st_value;
-                                printf("[+] hv_idt_trampoline: .text+0x%lx\n",
-                                       (unsigned long)trampoline_offset);
-                                break;
-                            }
-                        }
-                        break;  /* only one .symtab */
-                    }
-                }
-            }
-        }
-        if (trampoline_offset == 0) {
-            printf("[-] Could not find hv_idt_trampoline in .ko symbol table.\n");
-            goto idt_skip;
-        }
-
-        /* .text is the first SHF_ALLOC section → starts at module base */
-        uint64_t trampoline_kva = kstat.address + trampoline_offset;
-        printf("[*] Trampoline kernel VA: 0x%lx\n", (unsigned long)trampoline_kva);
-
-        /* 4b-3: Read IDTR (SIDT is unprivileged on AMD64) */
-        struct {
-            uint16_t limit;
-            uint64_t base;
-        } __attribute__((packed)) idtr;
-        __asm__ volatile("sidt %0" : "=m"(idtr));
-        printf("[*] IDTR: base=0x%lx, limit=0x%x (%u entries)\n",
-               (unsigned long)idtr.base, idtr.limit, (idtr.limit + 1) / 16);
-
-        /* 4b-4: Choose an unused interrupt vector */
-        #define HV_IDT_VECTOR 210  /* 0xD2 — well above PIC/APIC range */
-
-        if (((unsigned)(HV_IDT_VECTOR) + 1) * 16 > (unsigned)(idtr.limit + 1)) {
-            printf("[-] IDT has only %u entries — vector %u out of range.\n",
-                   (idtr.limit + 1) / 16, HV_IDT_VECTOR);
-            goto idt_skip;
-        }
-
-        struct idt_gate {
-            uint16_t offset_lo;    /* bits 0-15 of handler VA */
-            uint16_t selector;     /* kernel CS */
-            uint8_t  ist;          /* IST index (0 = use TSS RSP0) */
-            uint8_t  type_attr;    /* P | DPL | 0 | type */
-            uint16_t offset_mid;   /* bits 16-31 */
-            uint32_t offset_hi;    /* bits 32-63 */
-            uint32_t reserved;
-        } __attribute__((packed));
-
-        uint64_t gate_addr = idtr.base + HV_IDT_VECTOR * sizeof(struct idt_gate);
-
-        /* Save original gate */
-        struct idt_gate orig_gate;
-        kernel_copyout(gate_addr, &orig_gate, sizeof(orig_gate));
-
-        /* Get kernel CS from a known-good gate (e.g. #PF = vector 14) */
-        struct idt_gate ref_gate;
-        kernel_copyout(idtr.base + 14 * sizeof(struct idt_gate), &ref_gate, sizeof(ref_gate));
-        uint16_t kernel_cs = ref_gate.selector;
-        printf("[*] Kernel CS: 0x%04x (from IDT[14] page-fault handler)\n", kernel_cs);
-
-        /* Build our gate: interrupt gate, DPL=3 (ring-3 can trigger via INT) */
-        struct idt_gate new_gate;
-        memset(&new_gate, 0, sizeof(new_gate));
-        new_gate.offset_lo  = (uint16_t)(trampoline_kva & 0xFFFF);
-        new_gate.offset_mid = (uint16_t)((trampoline_kva >> 16) & 0xFFFF);
-        new_gate.offset_hi  = (uint32_t)(trampoline_kva >> 32);
-        new_gate.selector   = kernel_cs;
-        new_gate.ist        = 0;     /* use current thread's kernel stack */
-        new_gate.type_attr  = 0xEE;  /* P=1, DPL=3, type=0xE (interrupt gate) */
-
-        printf("[*] Installing IDT[%u] → 0x%lx (interrupt gate, DPL=3)...\n",
-               HV_IDT_VECTOR, (unsigned long)trampoline_kva);
-        kernel_copyin(&new_gate, gate_addr, sizeof(new_gate));
-
-        /* Clear shared buffer before invocation */
-        memset(result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
-
-        /* 4b-5: Fire! Ring 3 → IDT gate → ring 0 trampoline → hv_init → IRETQ */
-        printf("[*] Triggering INT %u → hv_idt_trampoline → hv_init...\n", HV_IDT_VECTOR);
-        __asm__ volatile("int $210" ::: "memory");
-        printf("[+] Returned from ring-0 interrupt handler!\n");
-
-        /* 4b-6: Restore original IDT entry immediately */
-        kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
-        printf("[*] Original IDT[%u] restored.\n", HV_IDT_VECTOR);
-
-        /* Re-read results */
-        memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
-        if (first_qword != 0)
-            printf("[+] Buffer is no longer zero — IDT invocation worked!\n");
-        else
-            printf("[-] Buffer still zero after IDT invocation.\n");
-
-idt_skip: ;
     }
 
     if (results->magic != KMOD_MAGIC) {
@@ -1472,9 +1697,9 @@ idt_skip: ;
         } else if (first_qword == 0) {
             printf("[!] Buffer still all zeros after all init paths.\n");
             printf("    Possible causes:\n");
-            printf("    - kldstat returned wrong base (relocs not applied)\n");
-            printf("    - IDT hook didn't reach trampoline\n");
-            printf("    - HV trapped execution from module pages\n");
+            printf("    - DMAP pages are not executable (NX bit set)\n");
+            printf("    - HV trapped execution from DMAP pages\n");
+            printf("    - Relocation processing error in userland loader\n");
         } else {
             printf("[!] Unexpected first qword: 0x%llx\n",
                    (unsigned long long)first_qword);
