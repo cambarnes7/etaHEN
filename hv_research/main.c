@@ -2215,9 +2215,11 @@ ring3_fallback:
              *
              * sysentvec for FW 4.03 is at kdata+0xd11bb8 (from etaHEN offsets).
              *
-             * PS5 struct sysentvec is PACKED — sv_table is at offset 4
-             * (no padding after sv_size), not offset 8 as on stock FreeBSD.
-             * We try both offsets for robustness. */
+             * IMPORTANT: etaHEN daemon's pause_resume_kstuff() writes
+             * 0xdeb7 or 0xffff at sysentvec+14, which corrupts the
+             * top 16 bits of sv_table (at struct offset 8, bytes 14-15).
+             * We must reconstruct the canonical pointer by forcing
+             * bits 48-63 back to 0xFFFF. */
             printf("[*] Looking up sysent via known sysentvec offset...\n");
             fflush(stdout);
 
@@ -2229,7 +2231,6 @@ ring3_fallback:
 
             int sysent_found = 0;
             uint64_t sysent_kva = 0;
-            (void)0;
 
             if (sysentvec_pa) {
                 uint8_t svec[24];
@@ -2243,39 +2244,37 @@ ring3_fallback:
                 printf("\n");
 
                 int32_t sv_size;
+                uint64_t sv_table_raw;
                 memcpy(&sv_size, svec, 4);
-                printf("    sv_size=%d\n", sv_size);
+                memcpy(&sv_table_raw, svec + 8, 8);
 
-                /* Try sv_table at offset 4 (packed/PS5) and offset 8 (stock FreeBSD) */
-                uint64_t sv_table_off4, sv_table_off8;
-                memcpy(&sv_table_off4, svec + 4, 8);
-                memcpy(&sv_table_off8, svec + 8, 8);
-                printf("    sv_table@off4=0x%lx  sv_table@off8=0x%lx\n",
-                       (unsigned long)sv_table_off4, (unsigned long)sv_table_off8);
+                /* etaHEN daemon corrupts bytes 14-15 (top 16 bits of sv_table)
+                 * with 0xdeb7 (unpaused) or 0xffff (paused).
+                 * Reconstruct canonical kernel pointer. */
+                uint64_t sv_table = (sv_table_raw & 0x0000FFFFFFFFFFFFULL)
+                                  | 0xFFFF000000000000ULL;
 
-                /* Pick whichever offset yields a valid kdata pointer */
-                uint64_t sv_table = 0;
-                int sv_off = 0;
-                if (sv_table_off4 >= g_kdata_base &&
-                    sv_table_off4 < g_kdata_base + 0x4000000) {
-                    sv_table = sv_table_off4;
-                    sv_off = 4;
-                } else if (sv_table_off8 >= g_kdata_base &&
-                           sv_table_off8 < g_kdata_base + 0x4000000) {
-                    sv_table = sv_table_off8;
-                    sv_off = 8;
-                }
+                printf("    sv_size=%d, sv_table_raw=0x%lx → fixed=0x%lx\n",
+                       sv_size, (unsigned long)sv_table_raw,
+                       (unsigned long)sv_table);
 
-                if (sv_size >= 300 && sv_size <= 1024 && sv_table) {
+                /* Also check offset-14 toggle value */
+                uint16_t toggle;
+                memcpy(&toggle, svec + 14, 2);
+                printf("    offset+14 toggle=0x%04x (%s)\n", toggle,
+                       toggle == 0xdeb7 ? "unpaused/etaHEN active" :
+                       toggle == 0xffff ? "paused/normal" : "unknown");
+
+                if (sv_size >= 300 && sv_size <= 1024 &&
+                    sv_table >= g_kdata_base &&
+                    sv_table < g_kdata_base + 0x4000000) {
                     sysent_kva = sv_table;
                     sysent_found = 1;
-                    printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries"
-                           " (sv_table at struct offset %d)\n",
+                    printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries\n",
                            (unsigned long)sysent_kva,
-                           (unsigned long)(sysent_kva - g_kdata_base),
-                           sv_size, sv_off);
+                           (unsigned long)(sysent_kva - g_kdata_base), sv_size);
                 } else {
-                    printf("    Neither offset yielded valid kdata ptr — trying scan.\n");
+                    printf("    Reconstructed sv_table out of range — trying scan.\n");
                 }
             } else {
                 printf("    sysentvec VA 0x%lx not mapped — trying scan.\n",
@@ -2287,8 +2286,11 @@ ring3_fallback:
                 printf("[*] Scanning kdata for sysent table via DMAP...\n");
                 fflush(stdout);
 
-                static const int expected_nargs[] = {0, 1, 0, 3, 3, 1, 3, 0, 3};
-                int match_size = SYSENT_STRIDE * 9;
+                /* FreeBSD syscall nargs for entries 0-6:
+                 *   0=nosys(0), 1=exit(1), 2=fork(0),
+                 *   3=read(3), 4=write(3), 5=open(3), 6=close(1) */
+                static const int expected_nargs[] = {0, 1, 0, 3, 3, 3, 1};
+                int match_size = SYSENT_STRIDE * 7;
                 uint8_t blk[4096];
                 int pages_ok = 0, pages_fail = 0;
 
@@ -2303,7 +2305,7 @@ ring3_fallback:
 
                     for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 8) {
                         int match = 1;
-                        for (int i = 0; i < 9 && match; i++) {
+                        for (int i = 0; i < 7 && match; i++) {
                             int32_t narg;
                             memcpy(&narg, &blk[boff + i * SYSENT_STRIDE], 4);
                             if (narg != expected_nargs[i]) match = 0;
