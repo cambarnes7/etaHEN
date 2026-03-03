@@ -4528,6 +4528,22 @@ idt_skip: ;
     }
 
     /* Extract trampoline addresses for Phase 7 */
+    printf("\n[*] Checking for Phase 7 trampoline addresses in result buffer...\n");
+    printf("    sizeof(struct kmod_result_buf) = %zu\n", sizeof(struct kmod_result_buf));
+    {
+        /* Dump raw bytes at the trampoline field offsets for diagnostics */
+        uint8_t *raw = (uint8_t *)result_vaddr;
+        /* trampoline fields are the last 16 bytes of the struct */
+        size_t base_off = sizeof(struct kmod_result_buf) - 16;
+        printf("    Raw bytes at offset 0x%zx (last 16 bytes of struct):\n      ", base_off);
+        for (size_t i = 0; i < 16; i++)
+            printf("%02x ", raw[base_off + i]);
+        printf("\n");
+        printf("    results->trampoline_func_kva  = 0x%lx\n",
+               (unsigned long)results->trampoline_func_kva);
+        printf("    results->trampoline_target_kva = 0x%lx\n",
+               (unsigned long)results->trampoline_target_kva);
+    }
     if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
         g_kmod_trampoline_func = results->trampoline_func_kva;
         g_kmod_trampoline_target = results->trampoline_target_kva;

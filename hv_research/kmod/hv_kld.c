@@ -150,36 +150,11 @@ volatile uint64_t g_output_kva = OUTPUT_KVA_SENTINEL;
 /* Local result buffer - filled by campaigns, then copied out */
 struct kmod_result_buf hv_results = { .magic = 0x1 };
 
-/* ============================================================
- * Phase 7: apic_ops trampoline
- *
- * This function lives in the module's .text section, which the
- * kernel linker loads into natively executable memory (RWX on
- * FW 4.03 — GMET not enforced until FW 6.50).
- *
- * Userland writes the original xapic_mode address to
- * g_trampoline_target via DMAP, then hooks apic_ops[2] to
- * point to trampoline_xapic_mode.  No PTE NX clearing needed.
- *
- * The trampoline transparently calls the original function,
- * preserving normal APIC operation.  On resume, the PS5 calls
- * xapic_mode via apic_ops[2] → our trampoline → original.
- * ============================================================ */
-
-/* Target address — patched by userland via DMAP before arming.
- * Volatile so the compiler always re-reads from memory. */
-volatile uint64_t g_trampoline_target = 0;
-
-/* Trampoline function — callable as int (*)(void).
- * noinline prevents the compiler from inlining this into hv_init.
- * The function pointer cast matches lapic_xapic_mode's prototype. */
-__attribute__((noinline, used))
-int trampoline_xapic_mode(void) {
-    uint64_t target = g_trampoline_target;
-    if (target)
-        return ((int (*)(void))target)();
-    return 0;  /* fallback: xAPIC mode = 0 */
-}
+/* Phase 7: Forward declarations (definitions at end of file,
+ * AFTER hv_idt_trampoline, so the IDT trampoline remains at
+ * offset 0 in .text — the kmod scanner depends on this!) */
+extern volatile uint64_t g_trampoline_target;
+int trampoline_xapic_mode(void);
 
 /* ============================================================
  * Inline assembly helpers - ring 0 hardware access
@@ -578,4 +553,42 @@ void hv_idt_trampoline(void) {
         "iretq\n"
         ::: "memory"
     );
+}
+
+/* ============================================================
+ * Phase 7: apic_ops trampoline
+ *
+ * IMPORTANT: This function is placed AFTER hv_idt_trampoline
+ * so the IDT trampoline remains at offset 0 in .text.  The
+ * kmod scanner in main.c searches for hv_idt_trampoline's
+ * machine code at the start of each kernel page — if another
+ * function precedes it, the scanner fails and hv_init never
+ * runs.
+ *
+ * This function lives in the module's .text section, which the
+ * kernel linker loads into natively executable memory (RWX on
+ * FW 4.03 — GMET not enforced until FW 6.50).
+ *
+ * Userland writes the original xapic_mode address to
+ * g_trampoline_target via DMAP, then hooks apic_ops[2] to
+ * point to trampoline_xapic_mode.  No PTE NX clearing needed.
+ *
+ * The trampoline transparently calls the original function,
+ * preserving normal APIC operation.  On resume, the PS5 calls
+ * xapic_mode via apic_ops[2] → our trampoline → original.
+ * ============================================================ */
+
+/* Target address — patched by userland via DMAP before arming.
+ * Volatile so the compiler always re-reads from memory. */
+volatile uint64_t g_trampoline_target = 0;
+
+/* Trampoline function — callable as int (*)(void).
+ * noinline prevents the compiler from inlining this into hv_init.
+ * The function pointer cast matches lapic_xapic_mode's prototype. */
+__attribute__((noinline, used))
+int trampoline_xapic_mode(void) {
+    uint64_t target = g_trampoline_target;
+    if (target)
+        return ((int (*)(void))target)();
+    return 0;  /* fallback: xAPIC mode = 0 */
 }
