@@ -2853,6 +2853,147 @@ ring3_fallback:
             }
             printf("\n");
             fflush(stdout);
+
+            /* ── Guest Page Table Walk: check where NX is enforced ──
+             *
+             * The NPT scan found identity-mapping PD tables at PA 0x6a000
+             * and 0x6e000 where BOTH ktext and kdata are RW+X (no NX).
+             * This means NX enforcement is likely in the guest page tables.
+             *
+             * Walk the guest PT (from CR3) for both kdata and ktext,
+             * dumping entries at each level with full permission bits.
+             * If NX is in the guest PTE, we can clear it via DMAP write. */
+            printf("=============================================\n");
+            printf("  Guest Page Table Walk: Permission Analysis\n");
+            printf("=============================================\n\n");
+            fflush(stdout);
+
+            uint64_t walk_targets[] = {
+                g_ktext_base,
+                g_kdata_base,
+                g_kdata_base + 0x1000, /* kdata + 1 page */
+            };
+            const char *walk_names[] = {
+                "ktext_base",
+                "kdata_base",
+                "kdata+0x1000",
+            };
+            int n_walks = 3;
+
+            for (int w = 0; w < n_walks; w++) {
+                uint64_t va = walk_targets[w];
+                printf("[*] Walking guest PT for %s (VA=0x%lx):\n",
+                       walk_names[w], (unsigned long)va);
+
+                int pml4_idx = (va >> 39) & 0x1FF;
+                int pdp_idx  = (va >> 30) & 0x1FF;
+                int pd_idx   = (va >> 21) & 0x1FF;
+                int pt_idx   = (va >> 12) & 0x1FF;
+                printf("    Indices: PML4[%d] PDP[%d] PD[%d] PT[%d]\n",
+                       pml4_idx, pdp_idx, pd_idx, pt_idx);
+
+                /* PML4E */
+                uint64_t pml4e = 0;
+                uint64_t pml4e_pa = g_cr3_phys + pml4_idx * 8;
+                kernel_copyout(g_dmap_base + pml4e_pa, &pml4e, 8);
+                printf("    PML4E: 0x%016lx (PA of entry: 0x%lx)\n",
+                       (unsigned long)pml4e, (unsigned long)pml4e_pa);
+                printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                       " NX=%d → next PA=0x%lx\n",
+                       (int)(pml4e & 1), (int)((pml4e >> 1) & 1),
+                       (int)((pml4e >> 2) & 1), (int)((pml4e >> 3) & 1),
+                       (int)((pml4e >> 4) & 1), (int)((pml4e >> 5) & 1),
+                       (int)(pml4e >> 63),
+                       (unsigned long)(pml4e & PTE_PA_MASK));
+                if (!(pml4e & PTE_PRESENT)) {
+                    printf("    [STOP] PML4E not present.\n\n");
+                    continue;
+                }
+
+                /* PDPE */
+                uint64_t pdpe = 0;
+                uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + pdp_idx * 8;
+                kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
+                printf("    PDPE:  0x%016lx (PA of entry: 0x%lx)\n",
+                       (unsigned long)pdpe, (unsigned long)pdpe_pa);
+                printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                       " PS=%d NX=%d → next PA=0x%lx\n",
+                       (int)(pdpe & 1), (int)((pdpe >> 1) & 1),
+                       (int)((pdpe >> 2) & 1), (int)((pdpe >> 3) & 1),
+                       (int)((pdpe >> 4) & 1), (int)((pdpe >> 5) & 1),
+                       (int)((pdpe >> 7) & 1), (int)(pdpe >> 63),
+                       (unsigned long)(pdpe & PTE_PA_MASK));
+                if (!(pdpe & PTE_PRESENT)) {
+                    printf("    [STOP] PDPE not present.\n\n");
+                    continue;
+                }
+                if (pdpe & PTE_PS) {
+                    printf("    [1GB page] Final PA=0x%lx\n\n",
+                           (unsigned long)((pdpe & 0xFFFFC0000000ULL) |
+                                           (va & 0x3FFFFFFF)));
+                    continue;
+                }
+
+                /* PDE */
+                uint64_t pde = 0;
+                uint64_t pde_pa = (pdpe & PTE_PA_MASK) + pd_idx * 8;
+                kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
+                printf("    PDE:   0x%016lx (PA of entry: 0x%lx)\n",
+                       (unsigned long)pde, (unsigned long)pde_pa);
+                printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                       " D=%d PS=%d G=%d NX=%d → next PA=0x%lx\n",
+                       (int)(pde & 1), (int)((pde >> 1) & 1),
+                       (int)((pde >> 2) & 1), (int)((pde >> 3) & 1),
+                       (int)((pde >> 4) & 1), (int)((pde >> 5) & 1),
+                       (int)((pde >> 6) & 1), (int)((pde >> 7) & 1),
+                       (int)((pde >> 8) & 1), (int)(pde >> 63),
+                       (unsigned long)(pde & PTE_PA_MASK));
+                if (!(pde & PTE_PRESENT)) {
+                    printf("    [STOP] PDE not present.\n\n");
+                    continue;
+                }
+                if (pde & PTE_PS) {
+                    printf("    [2MB page] Final PA=0x%lx\n",
+                           (unsigned long)((pde & 0xFFFFFFE00000ULL) |
+                                           (va & 0x1FFFFF)));
+                    printf("    >>> NX=%d RW=%d — this controls"
+                           " execution permission\n\n",
+                           (int)(pde >> 63), (int)((pde >> 1) & 1));
+                    /* Report PDE physical address for potential mod */
+                    printf("    PDE at PA 0x%lx — writable via DMAP"
+                           " 0x%lx\n\n",
+                           (unsigned long)pde_pa,
+                           (unsigned long)(g_dmap_base + pde_pa));
+                    continue;
+                }
+
+                /* PTE */
+                uint64_t pte = 0;
+                uint64_t pte_pa = (pde & PTE_PA_MASK) + pt_idx * 8;
+                kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
+                printf("    PTE:   0x%016lx (PA of entry: 0x%lx)\n",
+                       (unsigned long)pte, (unsigned long)pte_pa);
+                printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                       " D=%d PAT=%d G=%d NX=%d → PA=0x%lx\n",
+                       (int)(pte & 1), (int)((pte >> 1) & 1),
+                       (int)((pte >> 2) & 1), (int)((pte >> 3) & 1),
+                       (int)((pte >> 4) & 1), (int)((pte >> 5) & 1),
+                       (int)((pte >> 6) & 1), (int)((pte >> 7) & 1),
+                       (int)((pte >> 8) & 1), (int)(pte >> 63),
+                       (unsigned long)(pte & PTE_PA_MASK));
+                if (!(pte & PTE_PRESENT)) {
+                    printf("    [STOP] PTE not present.\n\n");
+                    continue;
+                }
+
+                printf("    >>> NX=%d RW=%d — this controls"
+                       " execution permission\n",
+                       (int)(pte >> 63), (int)((pte >> 1) & 1));
+                printf("    PTE at PA 0x%lx — writable via DMAP 0x%lx\n\n",
+                       (unsigned long)pte_pa,
+                       (unsigned long)(g_dmap_base + pte_pa));
+            }
+            fflush(stdout);
         }
 
 idt_done: ;
