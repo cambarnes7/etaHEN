@@ -1721,6 +1721,11 @@ int main(void) {
         fclose(f);
         freopen("/data/etaHEN/hv_research.log", "w", stdout);
         freopen("/data/etaHEN/hv_research.log", "a", stderr);
+        /* Force line-buffered so every \n flushes to disk immediately.
+         * Without this, file-backed stdout is fully-buffered and a
+         * crash/hang loses all unflushed printf output. */
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        setvbuf(stderr, NULL, _IOLBF, 0);
     } else {
         notify("[HV Research] ERROR: fopen log failed!");
     }
