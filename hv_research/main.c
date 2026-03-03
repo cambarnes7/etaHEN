@@ -2116,6 +2116,12 @@ ring3_fallback:
             int best_run = 0;
             uint64_t best_run_off = 0;
             for (uint64_t off = 0; off < 0x8000000 && !idt_kva; off += 4096) {
+                /* Progress every 16MB (4096 pages) */
+                if ((off & 0xFFFFFF) == 0 && off > 0) {
+                    printf("    IDT scan: %luMB/%dMB (%d pages OK, %d fail)\n",
+                           (unsigned long)(off >> 20), 128, pages_ok, pages_fail);
+                    fflush(stdout);
+                }
                 uint64_t kva = g_kdata_base + off;
                 uint64_t pa = va_to_pa_quiet(kva);
                 if (!pa) { pages_fail++; continue; }
@@ -2521,43 +2527,90 @@ ring3_fallback:
                             printf("\n");
                         }
 
-                        /* Read the actual Xfast_syscall entry from IDT 128
-                         * (int 0x80) — etaHEN may have replaced it */
-                        printf("[*] Checking IDT[128] (int80) handler...\n");
-                        /* IDT[128] already dumped above. Now check if
-                         * sysent dispatch is done via sv_table pointer or
-                         * a hardcoded address in Xfast_syscall */
-                        /* Try the DIRECT sysent approach: patch sysent[20]
-                         * (getpid itself) to return a magic value by pointing
-                         * it at nosys — if getpid() then returns ENOSYS,
-                         * the kernel IS using our sysent table */
-                        printf("[*] Reverse test: hook sysent[20] (getpid) to nosys...\n");
-                        uint64_t gpid_ent_kva = sysent_kva + 20ULL * SYSENT_STRIDE;
-                        uint64_t gpid_call_pa = va_to_pa_quiet(gpid_ent_kva + 8);
-                        uint64_t gpid_orig = 0;
-                        kernel_copyout(g_dmap_base + gpid_call_pa, &gpid_orig, 8);
-                        /* Write nosys into getpid */
-                        kernel_copyin(&nosys_call, g_dmap_base + gpid_call_pa, 8);
-                        uint64_t gpid_rb = 0;
-                        kernel_copyout(g_dmap_base + gpid_call_pa, &gpid_rb, 8);
-                        printf("    getpid sy_call: was 0x%lx, now 0x%lx (nosys)\n",
-                               (unsigned long)gpid_orig, (unsigned long)gpid_rb);
-                        errno = 0;
-                        pid_t test_pid = getpid();
-                        int test_err = errno;
-                        printf("    getpid() = %d, errno=%d\n", test_pid, test_err);
-                        if (test_pid != real_pid || test_err != 0) {
-                            printf("[+] getpid CHANGED! Kernel IS reading our sysent.\n");
-                            printf("    The nosys syscall test failed because Sony's nosys\n");
-                            printf("    returns %ld with carry clear (not standard ENOSYS).\n",
-                                   ret0);
-                        } else {
-                            printf("[-] getpid unchanged — sysent dispatch bypassed.\n");
-                            printf("    etaHEN or HV has its own dispatch table.\n");
+                        /* SAFE reverse test: hook a real but rarely-used syscall
+                         * to getpid handler. If the result changes from its normal
+                         * return value to our PID, sysent IS the dispatch table
+                         * for standard syscalls.
+                         *
+                         * IMPORTANT: Do NOT hook getpid->nosys! That crashes the PS5
+                         * because every kernel thread calling getpid() would hit nosys,
+                         * causing cascading failures and a hard freeze.
+                         *
+                         * Using issetugid (syscall 253): returns 0 or 1 normally,
+                         * narg=0. If hooked to getpid handler, should return our PID.
+                         * Rarely called by kernel threads, so safe to modify briefly. */
+                        printf("[*] Safe reverse test: hook sysent[253] (issetugid) to getpid...\n");
+                        fflush(stdout);
+
+                        /* Read original issetugid entry */
+                        uint64_t issu_ent_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+                        uint64_t issu_call_pa = va_to_pa_quiet(issu_ent_kva + 8);
+                        uint64_t issu_narg_pa = va_to_pa_quiet(issu_ent_kva);
+                        uint64_t issu_orig_call = 0;
+                        int32_t issu_orig_narg = 0;
+                        if (issu_call_pa && issu_narg_pa) {
+                            kernel_copyout(g_dmap_base + issu_call_pa, &issu_orig_call, 8);
+                            kernel_copyout(g_dmap_base + issu_narg_pa, &issu_orig_narg, 4);
                         }
-                        /* Restore getpid */
-                        kernel_copyin(&gpid_orig, g_dmap_base + gpid_call_pa, 8);
-                        printf("    Restored sysent[20] (getpid)\n");
+                        printf("    sysent[253] original: sy_call=0x%lx, narg=%d\n",
+                               (unsigned long)issu_orig_call, issu_orig_narg);
+
+                        if (!issu_call_pa || issu_orig_call == 0) {
+                            printf("[-] Can't read sysent[253], skipping reverse test.\n");
+                        } else {
+                            /* Call issetugid before hook */
+                            errno = 0;
+                            long issu_before = syscall(253);
+                            int issu_err0 = errno;
+                            printf("    Before hook: issetugid()=%ld, errno=%d\n",
+                                   issu_before, issu_err0);
+
+                            /* Save full entry for restore */
+                            uint8_t issu_orig_ent[SYSENT_STRIDE];
+                            uint64_t issu_ent_pa = va_to_pa_quiet(issu_ent_kva);
+                            kernel_copyout(g_dmap_base + issu_ent_pa,
+                                           issu_orig_ent, SYSENT_STRIDE);
+
+                            /* Write getpid handler into issetugid */
+                            kernel_copyin(&getpid_call, g_dmap_base + issu_call_pa, 8);
+                            /* Set narg=0 to match getpid */
+                            int32_t zero_narg = 0;
+                            kernel_copyin(&zero_narg, g_dmap_base + issu_narg_pa, 4);
+
+                            /* Verify write */
+                            uint64_t issu_rb = 0;
+                            kernel_copyout(g_dmap_base + issu_call_pa, &issu_rb, 8);
+                            printf("    After write: sy_call=0x%lx (%s)\n",
+                                   (unsigned long)issu_rb,
+                                   issu_rb == getpid_call ? "OK" : "MISMATCH");
+
+                            /* Call issetugid after hook — should return PID */
+                            errno = 0;
+                            long issu_after = syscall(253);
+                            int issu_err1 = errno;
+                            printf("    After hook:  issetugid()=%ld, errno=%d (pid=%d)\n",
+                                   issu_after, issu_err1, real_pid);
+
+                            /* Restore IMMEDIATELY */
+                            kernel_copyin(issu_orig_ent,
+                                          g_dmap_base + issu_ent_pa, SYSENT_STRIDE);
+                            printf("    Restored sysent[253]\n");
+
+                            if (issu_after == (long)real_pid && issu_err1 == 0) {
+                                printf("[+] SYSENT HOOK CONFIRMED for standard syscalls!\n");
+                                printf("    Kernel dispatches real syscalls through sysent.\n");
+                                printf("    etaHEN only intercepts high/custom syscalls.\n");
+                                printf("    This means: hook any standard sysent entry\n");
+                                printf("    → execution redirected to chosen kernel function.\n");
+                            } else if (issu_after == issu_before &&
+                                       issu_err1 == issu_err0) {
+                                printf("[-] issetugid unchanged — etaHEN intercepts all.\n");
+                            } else {
+                                printf("[?] Unexpected: before=%ld, after=%ld\n",
+                                       issu_before, issu_after);
+                                printf("    Partial sysent dispatch? Needs investigation.\n");
+                            }
+                        }
                     } else if (!write_ok) {
                         printf("[-] DMAP write FAILED — sysent page is write-protected.\n");
                     } else {
