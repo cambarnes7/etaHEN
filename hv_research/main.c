@@ -1139,25 +1139,110 @@ static void campaign_kmod_kldload(void) {
     }
     memcpy(ko_buf, KMOD_KO, (size_t)KMOD_KO_SZ);
 
-    /* Find and replace sentinel with actual DMAP-mapped KVA */
+    /*
+     * Patch g_output_kva by parsing the ELF symbol table.
+     *
+     * The sentinel value 0xDEAD000000000000 appears TWICE in the .ko:
+     *   1. In .text as a MOV immediate (comparison constant)
+     *   2. In .data as g_output_kva's initial value
+     * A byte-scan would patch the wrong copy (#1), corrupting the
+     * comparison and leaving g_output_kva unchanged. So we parse the
+     * ET_REL ELF symbol table to find g_output_kva precisely.
+     */
     int patched = 0;
     uint8_t *ko_bytes = (uint8_t *)ko_buf;
-    for (size_t i = 0; i + 8 <= (size_t)KMOD_KO_SZ; i++) {
-        uint64_t val;
-        memcpy(&val, &ko_bytes[i], 8);
-        if (val == OUTPUT_KVA_SENTINEL) {
-            memcpy(&ko_bytes[i], &result_kva, 8);
-            printf("[+] Patched sentinel at .ko offset 0x%zx -> 0x%lx\n",
-                   i, (unsigned long)result_kva);
+
+    /* Minimal ELF64 structures for symbol lookup */
+    typedef struct {
+        unsigned char e_ident[16];
+        uint16_t e_type, e_machine;
+        uint32_t e_version;
+        uint64_t e_entry, e_phoff, e_shoff;
+        uint32_t e_flags;
+        uint16_t e_ehsize, e_phentsize, e_phnum;
+        uint16_t e_shentsize, e_shnum, e_shstrndx;
+    } Elf64_Ehdr_t;
+
+    typedef struct {
+        uint32_t sh_name, sh_type;
+        uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+        uint32_t sh_link, sh_info;
+        uint64_t sh_addralign, sh_entsize;
+    } Elf64_Shdr_t;
+
+    typedef struct {
+        uint32_t st_name;
+        uint8_t  st_info, st_other;
+        uint16_t st_shndx;
+        uint64_t st_value, st_size;
+    } Elf64_Sym_t;
+
+    #define SHT_SYMTAB 2
+
+    Elf64_Ehdr_t *ehdr = (Elf64_Ehdr_t *)ko_bytes;
+
+    if (ehdr->e_shoff && ehdr->e_shnum > 0) {
+        Elf64_Shdr_t *shdrs = (Elf64_Shdr_t *)(ko_bytes + ehdr->e_shoff);
+
+        /* Find .symtab */
+        Elf64_Shdr_t *symtab_sh = NULL;
+        for (uint16_t i = 0; i < ehdr->e_shnum; i++) {
+            if (shdrs[i].sh_type == SHT_SYMTAB) {
+                symtab_sh = &shdrs[i];
+                break;
+            }
+        }
+
+        if (symtab_sh) {
+            Elf64_Sym_t *syms = (Elf64_Sym_t *)(ko_bytes + symtab_sh->sh_offset);
+            uint64_t nsyms = symtab_sh->sh_size / sizeof(Elf64_Sym_t);
+            char *strtab = (char *)(ko_bytes + shdrs[symtab_sh->sh_link].sh_offset);
+
+            for (uint64_t i = 0; i < nsyms; i++) {
+                if (strcmp(strtab + syms[i].st_name, "g_output_kva") == 0) {
+                    uint16_t shndx = syms[i].st_shndx;
+                    if (shndx < ehdr->e_shnum) {
+                        uint64_t file_off = shdrs[shndx].sh_offset + syms[i].st_value;
+                        if (file_off + 8 <= (size_t)KMOD_KO_SZ) {
+                            uint64_t cur;
+                            memcpy(&cur, ko_bytes + file_off, 8);
+                            printf("[+] ELF sym g_output_kva: section=%u, "
+                                   "file_offset=0x%lx, current=0x%lx\n",
+                                   shndx, (unsigned long)file_off,
+                                   (unsigned long)cur);
+                            memcpy(ko_bytes + file_off, &result_kva, 8);
+                            printf("[+] Patched g_output_kva -> 0x%lx\n",
+                                   (unsigned long)result_kva);
+                            patched = 1;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Fallback: if ELF parsing failed, patch the LAST sentinel occurrence
+     * (the first is in .text as an immediate, the last is in .data) */
+    if (!patched) {
+        printf("[!] ELF symbol lookup failed, falling back to byte scan...\n");
+        size_t last_offset = (size_t)-1;
+        for (size_t i = 0; i + 8 <= (size_t)KMOD_KO_SZ; i++) {
+            uint64_t val;
+            memcpy(&val, &ko_bytes[i], 8);
+            if (val == OUTPUT_KVA_SENTINEL)
+                last_offset = i;
+        }
+        if (last_offset != (size_t)-1) {
+            memcpy(&ko_bytes[last_offset], &result_kva, 8);
+            printf("[+] Patched LAST sentinel at .ko offset 0x%zx -> 0x%lx\n",
+                   last_offset, (unsigned long)result_kva);
             patched = 1;
-            break;
         }
     }
 
     if (!patched) {
-        printf("[-] Could not find OUTPUT_KVA_SENTINEL (0x%llx) in .ko!\n",
-               (unsigned long long)OUTPUT_KVA_SENTINEL);
-        printf("    The .ko may have been compiled without g_output_kva.\n");
+        printf("[-] Could not find g_output_kva in .ko!\n");
         free(ko_buf);
         return;
     }
@@ -1224,15 +1309,30 @@ static void campaign_kmod_kldload(void) {
     }
     printf("\n");
 
+    /* Check for pre-campaign canary (0xAAAABBBBCCCCDDDD) at buffer start.
+     * This is written by hv_init BEFORE campaigns run. If present,
+     * it means hv_init ran and g_output_kva was correct, but the full
+     * results weren't copied (campaign crash or copy skipped). */
+    uint64_t first_qword;
+    memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
+
     if (results->magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
                (unsigned long long)KMOD_MAGIC, (unsigned long long)results->magic);
-        printf("    Possible causes:\n");
-        printf("    - SYSINIT init did not execute\n");
-        printf("    - g_output_kva relocation failed (kmod wrote to wrong address)\n");
-        printf("    - DMAP mapping issue\n");
 
-        /* Try kldsym as a diagnostic */
+        if (first_qword == 0xAAAABBBBCCCCDDDDULL) {
+            printf("[!] Pre-campaign CANARY found! hv_init() DID execute.\n");
+            printf("    g_output_kva is correct, but campaign or copy crashed.\n");
+            printf("    Try disabling VMMCALL campaigns (set RUN_VMMCALL_ENUM=0).\n");
+        } else if (first_qword == 0) {
+            printf("[!] Buffer is all zeros - hv_init() likely NEVER executed.\n");
+            printf("    Neither SYSINIT nor MOD_LOAD path triggered.\n");
+        } else {
+            printf("[!] Unexpected first qword: 0x%llx\n",
+                   (unsigned long long)first_qword);
+        }
+
+        /* kldsym diagnostic */
         printf("\n[*] Diagnostic: trying kldsym...\n");
         struct kld_sym_lookup sym;
         memset(&sym, 0, sizeof(sym));
@@ -1242,7 +1342,7 @@ static void campaign_kmod_kldload(void) {
         printf("    kldsym ret=%d, symvalue=0x%lx, symsize=%lu\n",
                ret, (unsigned long)sym.symvalue, (unsigned long)sym.symsize);
 
-        /* Try reading via kernel_copyout from g_output_kva as diagnostic */
+        /* kernel_copyout diagnostic */
         printf("    Trying kernel_copyout from DMAP KVA 0x%lx...\n",
                (unsigned long)result_kva);
         struct kmod_result_buf kc_results;

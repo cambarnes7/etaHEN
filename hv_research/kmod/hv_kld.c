@@ -22,7 +22,19 @@
  *
  * We define these manually since we don't have FreeBSD kernel
  * headers available for cross-compilation.
+ *
+ * Two independent init paths are provided:
+ *   1. Module metadata (set_modmetadata_set) + MOD_LOAD event
+ *      → linker_file_register_modules() finds our metadata,
+ *        kernel calls our modevent handler with MOD_LOAD
+ *   2. SYSINIT (set_sysinit_set) as a fallback
+ *      → linker_file_sysinit() calls hv_init directly
+ *
+ * PS5's kernel may not process one or both of these.
+ * Using both maximizes the chance that hv_init runs.
  * ============================================================ */
+
+/* --- SYSINIT types --- */
 
 typedef void (*sysinit_cfunc_t)(const void *);
 
@@ -35,6 +47,40 @@ struct sysinit {
 
 #define SI_SUB_DRIVERS      0x3100000
 #define SI_ORDER_MIDDLE     0x1000000
+
+/* --- Module framework types --- */
+
+typedef struct module *module_t;
+typedef int (*modeventhand_t)(module_t, int, void *);
+
+typedef enum modeventtype {
+    MOD_LOAD     = 1,
+    MOD_UNLOAD   = 2,
+    MOD_SHUTDOWN = 3,
+    MOD_QUIESCE  = 4,
+} modeventtype_t;
+
+struct moduledata {
+    const char     *name;
+    modeventhand_t  evhand;
+    void           *priv;
+};
+
+/* Module metadata types - used by linker_file_register_modules() */
+#define MDT_MODULE   1
+#define MDT_VERSION  5
+#define MDTV_GENERIC 2
+
+struct mod_metadata {
+    int         md_ver;     /* structure version (MDTV_GENERIC) */
+    int         md_type;    /* type (MDT_MODULE, MDT_VERSION, etc) */
+    void       *md_data;    /* type-specific data */
+    const char *md_cval;    /* module name */
+};
+
+struct mod_version {
+    int mv_version;
+};
 
 /* ============================================================
  * Campaign control - comment out to disable
@@ -309,7 +355,26 @@ static void campaign_vmmcall_iommu(void) {
  * have completed and hv_results is populated.
  * ============================================================ */
 
+static volatile uint32_t hv_init_called = 0;
+
 static void hv_init(const void *arg __attribute__((unused))) {
+    /* Guard against double-call (both SYSINIT and MOD_LOAD might fire) */
+    if (hv_init_called)
+        return;
+    hv_init_called = 1;
+    memory_barrier();
+
+    /*
+     * Write a canary to the output address FIRST, before anything else.
+     * This lets userland distinguish "init never ran" from "init ran but
+     * campaigns crashed" by checking for the canary value.
+     */
+    if (g_output_kva != OUTPUT_KVA_SENTINEL && g_output_kva != 0) {
+        volatile uint64_t *canary = (volatile uint64_t *)g_output_kva;
+        *canary = 0xAAAABBBBCCCCDDDDULL;  /* pre-campaign canary */
+        memory_barrier();
+    }
+
     /* Zero out the result buffer (no memset in freestanding kernel) */
     volatile uint8_t *p = (volatile uint8_t *)&hv_results;
     for (unsigned int i = 0; i < sizeof(hv_results); i++)
@@ -355,11 +420,65 @@ static void hv_init(const void *arg __attribute__((unused))) {
 }
 
 /* ============================================================
- * SYSINIT registration
+ * Path 1: Module metadata + MOD_LOAD event handler
  *
- * Places a pointer to our sysinit struct in the set_sysinit_set
- * section. The FreeBSD kernel linker iterates this section
- * during module load and calls each registered function.
+ * linker_file_register_modules() finds set_modmetadata_set,
+ * registers our module, then the kernel calls hv_modevent
+ * with MOD_LOAD. This is the standard FreeBSD mechanism for
+ * loadable kernel module initialization.
+ * ============================================================ */
+
+static int hv_modevent(module_t mod __attribute__((unused)),
+                        int type,
+                        void *data __attribute__((unused))) {
+    if (type == MOD_LOAD) {
+        hv_init((const void *)0);
+    }
+    return 0;
+}
+
+static struct moduledata hv_mod = {
+    .name   = "hv_kmod",
+    .evhand = hv_modevent,
+    .priv   = 0
+};
+
+/* MDT_MODULE metadata - tells kernel this is a loadable module */
+static struct mod_metadata hv_mod_meta = {
+    .md_ver  = MDTV_GENERIC,
+    .md_type = MDT_MODULE,
+    .md_data = (void *)&hv_mod,
+    .md_cval = "hv_kmod"
+};
+
+/* MDT_VERSION metadata - required by some FreeBSD kernel versions */
+static struct mod_version hv_mod_ver = {
+    .mv_version = 1
+};
+
+static struct mod_metadata hv_ver_meta = {
+    .md_ver  = MDTV_GENERIC,
+    .md_type = MDT_VERSION,
+    .md_data = (void *)&hv_mod_ver,
+    .md_cval = "hv_kmod"
+};
+
+/* Place metadata pointers in set_modmetadata_set linker set */
+static const void * const __set_modmetadata_set_mod
+    __attribute__((section("set_modmetadata_set"), used))
+    = &hv_mod_meta;
+
+static const void * const __set_modmetadata_set_ver
+    __attribute__((section("set_modmetadata_set"), used))
+    = &hv_ver_meta;
+
+/* ============================================================
+ * Path 2: SYSINIT (fallback)
+ *
+ * If the module metadata path doesn't work on PS5, this
+ * provides a second chance. The kernel linker iterates
+ * set_sysinit_set and calls hv_init directly.
+ * The hv_init_called guard prevents double execution.
  * ============================================================ */
 
 static struct sysinit hv_sysinit = {
