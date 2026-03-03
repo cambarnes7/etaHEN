@@ -445,6 +445,14 @@ static int discover_sbl_offsets(void) {
 #define PTE_PRESENT   (1ULL << 0)
 #define PTE_PS        (1ULL << 7)   /* Page Size bit (huge/giant page) */
 #define PTE_PA_MASK   0x000FFFFFFFFFF000ULL
+/*
+ * Maximum physical address considered safe for DMAP reads.
+ * PAs above this likely map to PCIe BARs, GPU MMIO, or other
+ * device memory.  Reading these via DMAP can hang the CPU
+ * indefinitely (device doesn't respond to load).
+ * PS5 has 16GB GDDR6; use 32GB as generous upper bound.
+ */
+#define MAX_SAFE_PA   0x800000000ULL  /* 32GB */
 
 static uint64_t va_to_cpu_pa(uint64_t va) {
     if (!g_cr3_phys || !g_dmap_base) {
@@ -1749,11 +1757,26 @@ static void campaign_kmod_kldload(void) {
                    ri + 1, nranges, ranges[ri].label,
                    (unsigned long)rs, (unsigned long)re,
                    (unsigned long)((re - rs) >> 20));
+            fflush(stdout);
+
+            uint64_t skipped_mmio = 0;
 
             /* Walk page tables hierarchically, 2MB at a time */
             uint64_t va = rs & ~0x1FFFFFULL; /* align down to 2MB */
 
             for (; va < re && trampoline_kva == 0; ) {
+                /* Progress every 100 2MB chunks */
+                if (total_2mb_checked > 0 && (total_2mb_checked % 100) == 0) {
+                    printf("    ...%lu chunks, %lu mapped, %lu pages, "
+                           "%lu mmio-skipped (VA=0x%lx)\r",
+                           (unsigned long)total_2mb_checked,
+                           (unsigned long)total_2mb_mapped,
+                           (unsigned long)total_pages_mapped,
+                           (unsigned long)skipped_mmio,
+                           (unsigned long)va);
+                    fflush(stdout);
+                }
+
                 /* --- PML4 (512GB granularity) --- */
                 uint64_t pml4e;
                 kernel_copyout(g_dmap_base + g_cr3_phys +
@@ -1766,8 +1789,16 @@ static void campaign_kmod_kldload(void) {
                 }
 
                 /* --- PDPT (1GB granularity) --- */
+                uint64_t pdpt_pa = pml4e & PTE_PA_MASK;
+                if (pdpt_pa >= MAX_SAFE_PA) {
+                    skipped_mmio++;
+                    uint64_t next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                    if (next <= va) break;
+                    va = next;
+                    continue;
+                }
                 uint64_t pdpte;
-                kernel_copyout(g_dmap_base + (pml4e & PTE_PA_MASK) +
+                kernel_copyout(g_dmap_base + pdpt_pa +
                                ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
                 if (!(pdpte & PTE_PRESENT)) {
                     uint64_t next = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
@@ -1784,8 +1815,14 @@ static void campaign_kmod_kldload(void) {
                 }
 
                 /* --- PD (2MB granularity) --- */
+                uint64_t pd_pa = pdpte & PTE_PA_MASK;
+                if (pd_pa >= MAX_SAFE_PA) {
+                    skipped_mmio++;
+                    va += (1ULL << 21);
+                    continue;
+                }
                 uint64_t pde;
-                kernel_copyout(g_dmap_base + (pdpte & PTE_PA_MASK) +
+                kernel_copyout(g_dmap_base + pd_pa +
                                ((va >> 21) & 0x1FF) * 8, &pde, 8);
                 total_2mb_checked++;
 
@@ -1798,12 +1835,18 @@ static void campaign_kmod_kldload(void) {
                     /* 2MB huge page — scan each 4KB offset */
                     total_2mb_mapped++;
                     uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                    if (base_pa >= MAX_SAFE_PA) {
+                        skipped_mmio++;
+                        va += (1ULL << 21);
+                        continue;
+                    }
                     uint64_t chunk_start = va & ~0x1FFFFFULL;
                     for (int pi = 0; pi < 512 && trampoline_kva == 0; pi++) {
                         uint64_t page_va = chunk_start + (uint64_t)pi * 0x1000;
                         if (page_va < rs || page_va >= re) continue;
                         total_pages_mapped++;
                         uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                        if (pa >= MAX_SAFE_PA) { skipped_mmio++; continue; }
                         if (kernel_copyout(g_dmap_base + pa, hdr, sizeof(hdr)) != 0)
                             continue;
                         if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
@@ -1816,9 +1859,15 @@ static void campaign_kmod_kldload(void) {
                 }
 
                 /* --- PT: bulk-read 512 entries (4KB) in ONE kernel_copyout --- */
+                uint64_t pt_pa = pde & PTE_PA_MASK;
+                if (pt_pa >= MAX_SAFE_PA) {
+                    skipped_mmio++;
+                    va += (1ULL << 21);
+                    continue;
+                }
                 total_2mb_mapped++;
                 uint64_t pt_entries[512];
-                kernel_copyout(g_dmap_base + (pde & PTE_PA_MASK),
+                kernel_copyout(g_dmap_base + pt_pa,
                                pt_entries, sizeof(pt_entries));
 
                 uint64_t chunk_start = va & ~0x1FFFFFULL;
@@ -1829,6 +1878,7 @@ static void campaign_kmod_kldload(void) {
                     total_pages_mapped++;
 
                     uint64_t pa = pt_entries[pi] & PTE_PA_MASK;
+                    if (pa >= MAX_SAFE_PA) { skipped_mmio++; continue; }
                     if (kernel_copyout(g_dmap_base + pa, hdr, sizeof(hdr)) != 0)
                         continue;
                     if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
@@ -1839,10 +1889,12 @@ static void campaign_kmod_kldload(void) {
                 va += (1ULL << 21);
             }
 
-            printf("    2MB chunks: %lu checked, %lu mapped; pages: %lu mapped\n",
+            printf("    2MB chunks: %lu checked, %lu mapped; pages: %lu mapped"
+                   " (mmio-skipped: %lu)\n",
                    (unsigned long)total_2mb_checked,
                    (unsigned long)total_2mb_mapped,
-                   (unsigned long)total_pages_mapped);
+                   (unsigned long)total_pages_mapped,
+                   (unsigned long)skipped_mmio);
         }
 
         if (trampoline_kva) {
@@ -1857,9 +1909,11 @@ static void campaign_kmod_kldload(void) {
         if (trampoline_kva == 0) {
             printf("[*] Trampoline not at page start — trying sentinel scan...\n");
             printf("[*] Searching for sentinel 0x%lx\n", (unsigned long)result_kva);
+            fflush(stdout);
 
             uint8_t page[4096];
             uint64_t sentinel_va = 0;
+            uint64_t sent_chunks = 0;
 
             for (int ri = 0; ri < nranges && sentinel_va == 0; ri++) {
                 uint64_t rs = ranges[ri].start, re = ranges[ri].end;
@@ -1873,25 +1927,40 @@ static void campaign_kmod_kldload(void) {
                         uint64_t n = (va + (1ULL<<39)) & ~((1ULL<<39)-1);
                         if (n <= va) break; va = n; continue;
                     }
+                    uint64_t pdpt_pa = pml4e & PTE_PA_MASK;
+                    if (pdpt_pa >= MAX_SAFE_PA) {
+                        uint64_t n = (va + (1ULL<<30)) & ~((1ULL<<30)-1);
+                        if (n <= va) break; va = n; continue;
+                    }
                     uint64_t pdpte;
-                    kernel_copyout(g_dmap_base + (pml4e & PTE_PA_MASK) +
+                    kernel_copyout(g_dmap_base + pdpt_pa +
                                    ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
                     if (!(pdpte & PTE_PRESENT) || (pdpte & PTE_PS)) {
                         uint64_t n = (va + (1ULL<<30)) & ~((1ULL<<30)-1);
                         if (n <= va) break; va = n; continue;
                     }
+                    uint64_t pd_pa = pdpte & PTE_PA_MASK;
+                    if (pd_pa >= MAX_SAFE_PA) { va += (1ULL<<21); continue; }
                     uint64_t pde;
-                    kernel_copyout(g_dmap_base + (pdpte & PTE_PA_MASK) +
+                    kernel_copyout(g_dmap_base + pd_pa +
                                    ((va >> 21) & 0x1FF) * 8, &pde, 8);
+                    sent_chunks++;
+                    if (sent_chunks % 100 == 0) {
+                        printf("    ...sentinel: %lu chunks (VA=0x%lx)\r",
+                               (unsigned long)sent_chunks, (unsigned long)va);
+                        fflush(stdout);
+                    }
                     if (!(pde & PTE_PRESENT)) { va += (1ULL<<21); continue; }
 
                     if (pde & PTE_PS) {
                         uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                        if (base_pa >= MAX_SAFE_PA) { va += (1ULL<<21); continue; }
                         uint64_t cs = va & ~0x1FFFFFULL;
                         for (int pi = 0; pi < 512 && !sentinel_va; pi++) {
                             uint64_t pva = cs + (uint64_t)pi * 0x1000;
                             if (pva < rs || pva >= re) continue;
                             uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                            if (pa >= MAX_SAFE_PA) continue;
                             if (kernel_copyout(g_dmap_base + pa, page, 4096) != 0) continue;
                             for (int off = 0; off <= 4096 - 8; off += 8) {
                                 uint64_t v; memcpy(&v, page + off, 8);
@@ -1904,14 +1973,17 @@ static void campaign_kmod_kldload(void) {
                         va += (1ULL<<21); continue;
                     }
 
+                    uint64_t pt_pa = pde & PTE_PA_MASK;
+                    if (pt_pa >= MAX_SAFE_PA) { va += (1ULL<<21); continue; }
                     uint64_t pt[512];
-                    kernel_copyout(g_dmap_base + (pde & PTE_PA_MASK), pt, sizeof(pt));
+                    kernel_copyout(g_dmap_base + pt_pa, pt, sizeof(pt));
                     uint64_t cs = va & ~0x1FFFFFULL;
                     for (int pi = 0; pi < 512 && !sentinel_va; pi++) {
                         uint64_t pva = cs + (uint64_t)pi * 0x1000;
                         if (pva < rs || pva >= re) continue;
                         if (!(pt[pi] & PTE_PRESENT)) continue;
                         uint64_t pa = pt[pi] & PTE_PA_MASK;
+                        if (pa >= MAX_SAFE_PA) continue;
                         if (kernel_copyout(g_dmap_base + pa, page, 4096) != 0) continue;
                         for (int off = 0; off <= 4096 - 8; off += 8) {
                             uint64_t v; memcpy(&v, page + off, 8);
@@ -2239,7 +2311,7 @@ ring3_fallback:
                 }
                 uint64_t kva = g_kdata_base + off;
                 uint64_t pa = va_to_pa_quiet(kva);
-                if (!pa) { pages_fail++; continue; }
+                if (!pa || pa >= MAX_SAFE_PA) { pages_fail++; continue; }
                 if (kernel_copyout(g_dmap_base + pa, idt_pg, 4096) != 0) {
                     pages_fail++; continue;
                 }
@@ -3585,7 +3657,7 @@ ring3_fallback:
                      off += APIC_SCAN_CHUNK) {
                     uint64_t scan_kva = g_kdata_base + off;
                     uint64_t scan_pa = va_to_pa_quiet(scan_kva);
-                    if (scan_pa == 0) {
+                    if (scan_pa == 0 || scan_pa >= MAX_SAFE_PA) {
                         /* Page not mapped — reset run */
                         if (apic_run_len >= APIC_MIN_RUN) {
                             printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
