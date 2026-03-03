@@ -3637,17 +3637,24 @@ ring3_fallback:
                 printf("=============================================\n\n");
 
                 /*
-                 * Use the actual ktext→kdata gap as the ktext size.
-                 * On PS5, ktext and kdata are in the same PML4 entry;
-                 * the gap between them is 2MB (guard page).  The ktext
-                 * section itself can be 10-12MB+.
+                 * ktext pointer range for validation.
+                 * Use 32MB from ktext_base — some LAPIC functions are
+                 * in late sections beyond the ktext→kdata gap (~12MB).
+                 * The other research branch (apic-ops-summary) confirmed
+                 * 32MB is needed to capture all 28 apic_ops pointers.
                  */
-                uint64_t ktext_size = g_kdata_base - g_ktext_base;
-                if (ktext_size > 0x2000000) ktext_size = 0x2000000; /* cap 32MB */
+                uint64_t ktext_size = 0x2000000; /* 32MB */
+
+                /*
+                 * Known apic_ops offset on FW 4.03 (from apic-ops-summary
+                 * research branch): kdata+0x170650, 28 entries.
+                 */
+                #define APIC_OPS_KNOWN_OFFSET  0x170650
+                #define APIC_OPS_KNOWN_COUNT   28
 
                 printf("[*] Scanning kdata for function pointer tables (apic_ops)...\n");
                 printf("[*] Looking for clusters of 4+ consecutive ktext pointers.\n");
-                printf("    ktext range: 0x%lx — 0x%lx (%luMB)\n",
+                printf("    ktext ptr range: 0x%lx — 0x%lx (%luMB)\n",
                        (unsigned long)g_ktext_base,
                        (unsigned long)(g_ktext_base + ktext_size),
                        (unsigned long)(ktext_size >> 20));
@@ -3667,19 +3674,68 @@ ring3_fallback:
                        APIC_SCAN_SIZE >> 20);
                 fflush(stdout);
 
-                /*
-                 * Strategy: Read kdata in 4KB chunks via kernel_copyout.
-                 * For each 8-byte-aligned qword, check if it's in ktext range.
-                 * Track runs of consecutive ktext pointers.
-                 * apic_ops has 31 entries on stock FreeBSD; Sony may have
-                 * trimmed it, so look for tables with 10+ entries too.
-                 */
-
                 int apic_found_tables = 0;
                 int apic_run_len = 0;
                 uint64_t apic_run_start = 0;
                 uint64_t apic_best_addr = 0;
                 int apic_best_len = 0;
+
+                /* ── Direct check at known FW 4.03 offset first ── */
+                {
+                    uint64_t known_kva = g_kdata_base + APIC_OPS_KNOWN_OFFSET;
+                    uint64_t known_pa = va_to_pa_quiet(known_kva);
+                    printf("\n[*] Direct check at known offset kdata+0x%x...\n",
+                           APIC_OPS_KNOWN_OFFSET);
+                    if (known_pa && known_pa < MAX_SAFE_PA) {
+                        uint64_t known_ptrs[40];
+                        kernel_copyout(g_dmap_base + known_pa, known_ptrs,
+                                       sizeof(known_ptrs));
+                        int known_run = 0;
+                        for (int ki = 0; ki < 40; ki++) {
+                            if (known_ptrs[ki] >= g_ktext_base &&
+                                known_ptrs[ki] < g_ktext_base + ktext_size &&
+                                (known_ptrs[ki] & 0x3) == 0) {
+                                known_run++;
+                            } else {
+                                break;
+                            }
+                        }
+                        printf("    Found %d consecutive ktext ptrs at known offset\n",
+                               known_run);
+                        if (known_run >= 20) {
+                            printf("[+] CONFIRMED: apic_ops at kdata+0x%x (%d entries)\n",
+                                   APIC_OPS_KNOWN_OFFSET, known_run);
+                            apic_best_addr = known_kva;
+                            apic_best_len = known_run;
+                            apic_found_tables++;
+                            /* Dump all entries */
+                            printf("[*] apic_ops entries:\n");
+                            for (int ki = 0; ki < known_run && ki < 40; ki++) {
+                                printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                       ki, (unsigned long)known_ptrs[ki],
+                                       (unsigned long)(known_ptrs[ki] - g_ktext_base));
+                            }
+                            printf("    xapic_mode [2] = 0x%016lx\n",
+                                   (unsigned long)known_ptrs[2]);
+                        } else {
+                            printf("    Only %d ptrs — offset may differ on this boot\n",
+                                   known_run);
+                        }
+                    } else {
+                        printf("    Page not mapped at known offset\n");
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
+
+                /*
+                 * Full scan: Read kdata in 4KB chunks via kernel_copyout.
+                 * For each 8-byte-aligned qword, check if it's in ktext range.
+                 * Track runs of consecutive ktext pointers.
+                 * apic_ops has 28 entries on PS5 FW 4.03 (Sony trimmed 3
+                 * from FreeBSD's 31).
+                 */
+                printf("[*] Full scan for other vtables...\n");
 
                 uint8_t apic_chunk[APIC_SCAN_CHUNK];
 
