@@ -141,8 +141,37 @@ struct kmod_result_buf {
  * returns all zeros (likely Sony modifications).
  * ============================================================ */
 
-#define OUTPUT_KVA_SENTINEL 0xDEAD000000000000ULL
-volatile uint64_t g_output_kva = OUTPUT_KVA_SENTINEL;
+/* Forward declaration of hv_init (needed by g_comm struct below) */
+static void hv_init(const void *arg);
+
+/* ============================================================
+ * Communication struct - searched by userland in kernel memory
+ *
+ * After kldload, the kernel linker relocates init_func to
+ * hv_init's actual kernel VA. Userland searches for the
+ * output_kva sentinel (patched before loading) plus the
+ * signature to locate this struct, then reads init_func
+ * to get hv_init's address for kexec invocation.
+ *
+ * If SYSINIT or MOD_LOAD fires, hv_init runs automatically
+ * and the kexec path is skipped. The g_comm struct is used
+ * either way for the DMAP output address.
+ * ============================================================ */
+
+#define OUTPUT_KVA_SENTINEL   0xDEAD000000000000ULL
+#define KMOD_COMM_SIGNATURE   0xCAFE1337BEEF5678ULL
+
+struct kmod_comm {
+    volatile uint64_t output_kva;              /* +0x00: patched by userland */
+    void            (*init_func)(const void *);/* +0x08: relocated by linker */
+    uint64_t          signature;               /* +0x10: verification pattern */
+};
+
+struct kmod_comm g_comm = {
+    .output_kva  = OUTPUT_KVA_SENTINEL,
+    .init_func   = hv_init,
+    .signature   = KMOD_COMM_SIGNATURE,
+};
 
 /* Local result buffer - filled by campaigns, then copied out */
 struct kmod_result_buf hv_results = { .magic = 0x1 };
@@ -369,8 +398,8 @@ static void hv_init(const void *arg __attribute__((unused))) {
      * This lets userland distinguish "init never ran" from "init ran but
      * campaigns crashed" by checking for the canary value.
      */
-    if (g_output_kva != OUTPUT_KVA_SENTINEL && g_output_kva != 0) {
-        volatile uint64_t *canary = (volatile uint64_t *)g_output_kva;
+    if (g_comm.output_kva != OUTPUT_KVA_SENTINEL && g_comm.output_kva != 0) {
+        volatile uint64_t *canary = (volatile uint64_t *)g_comm.output_kva;
         *canary = 0xAAAABBBBCCCCDDDDULL;  /* pre-campaign canary */
         memory_barrier();
     }
@@ -410,8 +439,8 @@ static void hv_init(const void *arg __attribute__((unused))) {
      * (DMAP base + physical address) before the .ko was loaded.
      * Writing here lets userland read results directly from its
      * mapped buffer without needing kldsym or kernel_copyout. */
-    if (g_output_kva != OUTPUT_KVA_SENTINEL && g_output_kva != 0) {
-        volatile uint8_t *dst = (volatile uint8_t *)g_output_kva;
+    if (g_comm.output_kva != OUTPUT_KVA_SENTINEL && g_comm.output_kva != 0) {
+        volatile uint8_t *dst = (volatile uint8_t *)g_comm.output_kva;
         volatile uint8_t *src = (volatile uint8_t *)&hv_results;
         for (unsigned int i = 0; i < sizeof(hv_results); i++)
             dst[i] = src[i];

