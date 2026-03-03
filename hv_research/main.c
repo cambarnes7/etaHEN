@@ -4935,58 +4935,24 @@ static void campaign_flatz_setup(void) {
     fflush(stdout);
 
     /*
-     * Step 2: Clear XOTEXT (bit 58) + set RW + clear NX on any entries
-     * that have XOTEXT set.  On FW 4.03 this may find 0 entries if
-     * XOM is enforced purely via NPT.
+     * Step 2: XOTEXT analysis (READ-ONLY — no modifications).
+     *
+     * Previously we cleared XOTEXT (bit 58) on all ktext guest PTEs.
+     * This caused a critical problem: the HV integrity monitor detects
+     * modified guest PTEs during the suspend process, preventing the
+     * PS5 from entering rest mode (white light flashes indefinitely).
+     *
+     * Since XOM is enforced via NPT (not guest PTEs), clearing XOTEXT
+     * in guest PTEs doesn't help anyway.  We now only report the count.
      */
     int pte_modified = 0, pde_modified = 0;
+    (void)pte_modified; (void)pde_modified;
 
     if (total_xotext > 0) {
-        printf("\n[*] Clearing XOTEXT on %d entries...\n", total_xotext);
-        for (uint64_t va = g_ktext_base; va < ktext_end && va >= g_ktext_base; ) {
-            uint64_t pml4e = 0;
-            kernel_copyout(g_dmap_base + g_cr3_phys + ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
-            if (!(pml4e & PTE_PRESENT)) { va += 0x1000; continue; }
-
-            uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + ((va >> 30) & 0x1FF) * 8;
-            uint64_t pdpe = 0;
-            kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
-            if (!(pdpe & PTE_PRESENT)) { va += 0x1000; continue; }
-            if (pdpe & PTE_PS) {
-                if (pdpe & PTE_BIT_XOTEXT) {
-                    pdpe &= ~PTE_BIT_XOTEXT; pdpe |= PTE_BIT_RW; pdpe &= ~PTE_BIT_NX;
-                    kernel_copyin(&pdpe, g_dmap_base + pdpe_pa, 8);
-                    pde_modified++;
-                }
-                va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
-                continue;
-            }
-
-            uint64_t pde_pa = (pdpe & PTE_PA_MASK) + ((va >> 21) & 0x1FF) * 8;
-            uint64_t pde = 0;
-            kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
-            if (!(pde & PTE_PRESENT)) { va += 0x1000; continue; }
-            if (pde & PTE_PS) {
-                if (pde & PTE_BIT_XOTEXT) {
-                    pde &= ~PTE_BIT_XOTEXT; pde |= PTE_BIT_RW; pde &= ~PTE_BIT_NX;
-                    kernel_copyin(&pde, g_dmap_base + pde_pa, 8);
-                    pde_modified++;
-                }
-                va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
-                continue;
-            }
-
-            uint64_t pte_pa = (pde & PTE_PA_MASK) + ((va >> 12) & 0x1FF) * 8;
-            uint64_t pte = 0;
-            kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
-            if (pte & PTE_PRESENT && pte & PTE_BIT_XOTEXT) {
-                pte &= ~PTE_BIT_XOTEXT; pte |= PTE_BIT_RW; pte &= ~PTE_BIT_NX;
-                kernel_copyin(&pte, g_dmap_base + pte_pa, 8);
-                pte_modified++;
-            }
-            va += 0x1000;
-        }
-        printf("[+] Cleared: %d PDEs, %d PTEs\n", pde_modified, pte_modified);
+        printf("\n[*] XOTEXT found in %d guest PTEs.\n", total_xotext);
+        printf("    NOT clearing — HV integrity monitor detects modified PTEs\n");
+        printf("    and prevents rest mode (suspend hangs with flashing white light).\n");
+        printf("    XOM is enforced via NPT anyway, so clearing has no effect.\n");
     } else {
         printf("\n[!] No XOTEXT bits found in guest PTEs.\n");
         printf("    FW 4.03 enforces XOM purely via HV Nested Page Tables.\n");
