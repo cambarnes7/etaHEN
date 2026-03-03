@@ -491,3 +491,53 @@ static struct sysinit hv_sysinit = {
 static const void * const __set_sysinit_set_sym_hv_sysinit
     __attribute__((section("set_sysinit_set"), used))
     = &hv_sysinit;
+
+/* ============================================================
+ * Path 3: IDT trampoline (manual invocation from userland)
+ *
+ * On PS5 FW 4.03, the kernel linker loads the module into
+ * RWX kernel memory (GMET is not enforced until FW 6.50)
+ * but does not process SYSINIT or MOD_LOAD for loaded modules.
+ *
+ * As a fallback, userland hooks an IDT entry to point to this
+ * trampoline, then triggers "int N" from ring 3.  The CPU
+ * transitions to ring 0 via the IDT gate and executes the
+ * trampoline on the current thread's kernel stack.
+ *
+ * The trampoline saves caller-clobbered registers, calls
+ * hv_init, restores them, and returns via IRETQ.
+ * ============================================================ */
+
+__attribute__((naked, used))
+void hv_idt_trampoline(void) {
+    __asm__ volatile(
+        /* CPU already pushed SS, RSP, RFLAGS, CS, RIP onto
+         * the kernel stack (IST=0 → TSS.RSP0 for ring 3→0).
+         * Save registers that hv_init may clobber. */
+        "push %%rax\n"
+        "push %%rcx\n"
+        "push %%rdx\n"
+        "push %%rsi\n"
+        "push %%rdi\n"
+        "push %%r8\n"
+        "push %%r9\n"
+        "push %%r10\n"
+        "push %%r11\n"
+        /* Call hv_init(NULL) */
+        "xor %%edi, %%edi\n"
+        "call hv_init\n"
+        /* Restore registers */
+        "pop %%r11\n"
+        "pop %%r10\n"
+        "pop %%r9\n"
+        "pop %%r8\n"
+        "pop %%rdi\n"
+        "pop %%rsi\n"
+        "pop %%rdx\n"
+        "pop %%rcx\n"
+        "pop %%rax\n"
+        /* Return from interrupt → back to ring 3 userland */
+        "iretq\n"
+        ::: "memory"
+    );
+}
