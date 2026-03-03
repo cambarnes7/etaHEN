@@ -1884,38 +1884,37 @@ static void campaign_kmod_kldload(void) {
         uint64_t total_2mb_checked = 0, total_2mb_mapped = 0;
         uint64_t total_pages_mapped = 0;
 
-        /* Scan ranges */
+        /* Scan ranges — ordered by likelihood for PS5 kmod allocation.
+         *
+         * The hierarchical page-table walker skips unmapped 512GB/1GB/2MB
+         * regions in a single kernel_copyout, so even huge VA ranges are
+         * fast when most entries are not present.
+         *
+         * PS5 kernel modules (via kldload) are allocated by kmem_alloc
+         * from the exec_map or kernel_arena.  The VA region depends on
+         * Sony's kernel modifications and KASLR, so we scan broadly. */
         struct { uint64_t start, end; const char *label; } ranges[4];
         int nranges = 0;
 
-        /* Range 1: full kernel heap (kdata+32MB → end of VA space)
-         * ALLPROC is at kdata+0x27EDCB8 (~40MB), so BSS extends
-         * at least that far.  virtual_avail (heap start) is after BSS.
-         * Start at kdata+32MB; scan to near the top of the canonical
-         * address space.  The hierarchical walker skips unmapped 512GB/
-         * 1GB/2MB regions instantly, so this is fast despite the huge
-         * VA range.
-         *
-         * Cap at FFE00000 (not FFFFF000) to prevent the 2MB-aligned
-         * scan from overflowing past 64-bit max → wrapping to VA 0
-         * and looping forever. */
+        /* Range 1: kdata → end of VA space (includes BSS, heap, modules)
+         * Cap at FFE00000 to prevent 2MB-aligned scan overflow. */
         {
-            uint64_t s = g_kdata_base + 0x2000000;  /* +32MB */
-            uint64_t e = 0xFFFFFFFFFFE00000ULL;     /* last 2MB-aligned VA */
+            uint64_t s = g_kdata_base;
+            uint64_t e = 0xFFFFFFFFFFE00000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "kdata→top"}; }
         }
-        /* Range 2: DMAP end → kernel text */
+        /* Range 2: DMAP end → kernel text (full gap, no 1GB cap) */
         {
             uint64_t s = g_dmap_base + 0x200000000ULL;
             uint64_t e = g_ktext_base;
-            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "DMAP→ktext gap"}; }
         }
-        /* Range 3: below DMAP */
+        /* Range 3: 0xFFFF800000000000 → DMAP (exec_map, kernel_arena)
+         * Full scan — the hierarchical walker skips unmapped 512GB
+         * PML4 entries instantly (~256 kernel_copyouts for 128TB). */
         {
             uint64_t s = 0xFFFF800000000000ULL;
             uint64_t e = g_dmap_base;
-            if (e > s && e - s > 0x40000000ULL) s = e - 0x40000000ULL;
             if (s < e) { ranges[nranges++] = (typeof(ranges[0])){s, e, "below DMAP"}; }
         }
 
@@ -2077,56 +2076,6 @@ static void campaign_kmod_kldload(void) {
             printf("    bytes: ");
             for (int b = 0; b < 58; b++) printf("%02x ", hdr[b]);
             printf("\n");
-
-            /* Compute trampoline_xapic_mode and g_trampoline_target
-             * addresses directly from the loaded machine code.
-             *
-             * This bypasses R_X86_64_32S relocations in hv_init (which
-             * the PS5 kernel linker doesn't resolve for these symbols).
-             * Instead we use:
-             *   - Known .text layout: trampoline_xapic_mode is at +0x23
-             *     (right after hv_idt_trampoline's 35-byte naked asm)
-             *   - The R_X86_64_PC32 relocation in the mov instruction,
-             *     which the kernel linker DOES resolve, to find
-             *     g_trampoline_target's actual KVA.
-             *
-             * Layout (from objdump -d hv_kmod.ko):
-             *   0x00: hv_idt_trampoline  (35 bytes)
-             *   0x23: trampoline_xapic_mode:
-             *         55              push rbp
-             *         48 8b 05 XX..   mov disp32(%rip), %rax  ← g_trampoline_target
-             *         ...
-             * The 4-byte displacement at hdr[0x27..0x2a] is RIP-relative
-             * from offset 0x2b (end of the 7-byte mov instruction). */
-            #define KMOD_XAPIC_OFFSET  0x23
-            #define KMOD_DISP_OFFSET   0x27
-            #define KMOD_DISP_RIP      0x2B  /* RIP after mov instruction */
-
-            if (hdr[KMOD_XAPIC_OFFSET]   == 0x55 &&  /* push rbp */
-                hdr[KMOD_XAPIC_OFFSET+1]  == 0x48 &&  /* REX.W */
-                hdr[KMOD_XAPIC_OFFSET+2]  == 0x8b &&  /* MOV r64, r/m64 */
-                hdr[KMOD_XAPIC_OFFSET+3]  == 0x05) {  /* ModR/M: [RIP+disp32] → RAX */
-
-                int32_t disp;
-                memcpy(&disp, &hdr[KMOD_DISP_OFFSET], 4);
-
-                g_kmod_trampoline_func   = trampoline_kva + KMOD_XAPIC_OFFSET;
-                g_kmod_trampoline_target = trampoline_kva + KMOD_DISP_RIP + (int64_t)disp;
-                g_kmod_kid = kid;
-
-                printf("[+] Phase 7: Computed trampoline addresses from machine code:\n");
-                printf("    trampoline_xapic_mode() = 0x%016lx (page + 0x%x)\n",
-                       (unsigned long)g_kmod_trampoline_func, KMOD_XAPIC_OFFSET);
-                printf("    g_trampoline_target     = 0x%016lx (RIP+disp32, disp=%d)\n",
-                       (unsigned long)g_kmod_trampoline_target, (int)disp);
-            } else {
-                printf("[!] trampoline_xapic_mode signature mismatch at +0x%x:\n",
-                       KMOD_XAPIC_OFFSET);
-                printf("    Expected: 55 48 8b 05\n");
-                printf("    Got:      %02x %02x %02x %02x\n",
-                       hdr[KMOD_XAPIC_OFFSET], hdr[KMOD_XAPIC_OFFSET+1],
-                       hdr[KMOD_XAPIC_OFFSET+2], hdr[KMOD_XAPIC_OFFSET+3]);
-            }
         }
 
         /* Fallback: sentinel scan (also hierarchical + DMAP) */
@@ -2243,6 +2192,58 @@ static void campaign_kmod_kldload(void) {
         printf("[*] Scan done: %lu 2MB chunks (%lu mapped), %lu pages mapped\n",
                (unsigned long)total_2mb_checked, (unsigned long)total_2mb_mapped,
                (unsigned long)total_pages_mapped);
+
+        /* Compute trampoline_xapic_mode and g_trampoline_target KVAs
+         * from the loaded machine code (works for both primary and
+         * sentinel scan paths — hdr[] has the trampoline page bytes).
+         *
+         * This bypasses R_X86_64_32S relocations in hv_init (which
+         * the PS5 kernel linker doesn't resolve for these symbols).
+         * Instead we use:
+         *   - Known .text layout: trampoline_xapic_mode is at +0x23
+         *     (right after hv_idt_trampoline's 35-byte naked asm)
+         *   - The R_X86_64_PC32 relocation in the mov instruction,
+         *     which the kernel linker DOES resolve, to find
+         *     g_trampoline_target's actual KVA.
+         *
+         * Layout (from objdump -d hv_kmod.ko):
+         *   0x00: hv_idt_trampoline  (35 bytes)
+         *   0x23: trampoline_xapic_mode:
+         *         55              push rbp
+         *         48 8b 05 XX..   mov disp32(%rip), %rax  ← g_trampoline_target
+         *   The 4-byte displacement at hdr[0x27..0x2a] is RIP-relative
+         *   from offset 0x2b (end of the 7-byte mov instruction). */
+        #define KMOD_XAPIC_OFFSET  0x23
+        #define KMOD_DISP_OFFSET   0x27
+        #define KMOD_DISP_RIP      0x2B  /* RIP after mov instruction */
+
+        if (trampoline_kva && !g_kmod_trampoline_func) {
+            if (hdr[KMOD_XAPIC_OFFSET]   == 0x55 &&  /* push rbp */
+                hdr[KMOD_XAPIC_OFFSET+1]  == 0x48 &&  /* REX.W */
+                hdr[KMOD_XAPIC_OFFSET+2]  == 0x8b &&  /* MOV r64, r/m64 */
+                hdr[KMOD_XAPIC_OFFSET+3]  == 0x05) {  /* ModR/M: [RIP+disp32] → RAX */
+
+                int32_t disp;
+                memcpy(&disp, &hdr[KMOD_DISP_OFFSET], 4);
+
+                g_kmod_trampoline_func   = trampoline_kva + KMOD_XAPIC_OFFSET;
+                g_kmod_trampoline_target = trampoline_kva + KMOD_DISP_RIP + (int64_t)disp;
+                g_kmod_kid = kid;
+
+                printf("[+] Phase 7: Computed trampoline addresses from machine code:\n");
+                printf("    trampoline_xapic_mode() = 0x%016lx (page + 0x%x)\n",
+                       (unsigned long)g_kmod_trampoline_func, KMOD_XAPIC_OFFSET);
+                printf("    g_trampoline_target     = 0x%016lx (RIP+disp32, disp=%d)\n",
+                       (unsigned long)g_kmod_trampoline_target, (int)disp);
+            } else {
+                printf("[!] trampoline_xapic_mode signature mismatch at +0x%x:\n",
+                       KMOD_XAPIC_OFFSET);
+                printf("    Expected: 55 48 8b 05\n");
+                printf("    Got:      %02x %02x %02x %02x\n",
+                       hdr[KMOD_XAPIC_OFFSET], hdr[KMOD_XAPIC_OFFSET+1],
+                       hdr[KMOD_XAPIC_OFFSET+2], hdr[KMOD_XAPIC_OFFSET+3]);
+            }
+        }
 
         /* ── Step 4c: Direct shellcode injection (if kldload module not found) ──
          *
