@@ -160,7 +160,7 @@ struct kld_sym_lookup {
 #define SYS_kldsym      337
 #define KLDSYM_LOOKUP   1
 
-/* kldstat file info structure (matches FreeBSD sys/kld.h) */
+/* kldstat file info structure (matches FreeBSD 11 sys/linker.h) */
 struct kld_file_stat {
     int         version;        /* sizeof(struct kld_file_stat) */
     char        name[1024];     /* MAXPATHLEN */
@@ -168,6 +168,7 @@ struct kld_file_stat {
     int         id;
     uint64_t    address;        /* caddr_t - module base address in kernel */
     uint64_t    size;           /* module size in bytes */
+    char        pathname[1024]; /* MAXPATHLEN - full path */
 };
 
 /* ─── Global state ─── */
