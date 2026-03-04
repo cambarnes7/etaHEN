@@ -1146,12 +1146,16 @@ static void campaign_kmod_kldload(void) {
      * PS5's kernel linker defers SYSINIT processing — the shared buffer
      * may be empty immediately after kldload but populate later (during
      * a context switch, timer tick, or soft interrupt).  Poll briefly
-     * to give SYSINIT time to fire before falling back to the scanner. */
+     * to give SYSINIT time to fire before falling back to the scanner.
+     *
+     * NOTE: On FW 4.03, SYSINIT/MOD_LOAD never fires despite kldload
+     * returning a valid kid.  Keep the poll short (500ms) and fall
+     * through to the scanner/ring-0 path which is proven to work. */
     if (first_qword == 0) {
         printf("\n[*] Step 4a: Buffer empty — polling for deferred SYSINIT...\n");
         fflush(stdout);
-        for (int poll = 0; poll < 40; poll++) {
-            usleep(50000);  /* 50ms per poll, 2s total max */
+        for (int poll = 0; poll < 10; poll++) {
+            usleep(50000);  /* 50ms per poll, 500ms total max */
             memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
             if (first_qword != 0) {
                 printf("[+] SYSINIT fired after %dms! first_qword=0x%016llx\n",
@@ -1160,7 +1164,8 @@ static void campaign_kmod_kldload(void) {
             }
         }
         if (first_qword == 0) {
-            printf("    SYSINIT did not fire within 2s — continuing with scanner.\n");
+            printf("    SYSINIT did not fire within 500ms (expected on FW 4.03).\n");
+            printf("    Falling back to ring-0 execution path.\n");
         }
     }
 
@@ -1877,8 +1882,10 @@ static void campaign_kmod_kldload(void) {
                        best_run, sc_len);
                 printf("    Trying kdata region for code cave...\n");
 
-                /* Fallback: scan first 4MB of kdata for 0xCC or 0x00 runs */
-                for (uint64_t kva = g_kdata_base; kva < g_kdata_base + 0x400000; kva += 0x1000) {
+                /* Fallback: scan first 4MB of kdata for 0xCC or 0x00 runs.
+                 * Skip the first page (kdata+0x0) — it may contain valid
+                 * structures that read as zeros, producing false caves. */
+                for (uint64_t kva = g_kdata_base + 0x1000; kva < g_kdata_base + 0x400000; kva += 0x1000) {
                     uint64_t pa = va_to_pa_quiet(kva);
                     if (pa == 0) continue;
                     if (kernel_copyout(g_dmap_base + pa, kpage, 4096) != 0) continue;
@@ -2087,6 +2094,9 @@ ring3_fallback:
         printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
         fflush(stdout);
 
+        /* Hoisted for Phase 8 cross-validation */
+        uint64_t scan_idt_kva = 0;
+
         /* 4d-3: IDT handler addresses
          * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
          * the process.  Find IDT by scanning kdata via DMAP instead.
@@ -2165,7 +2175,52 @@ ring3_fallback:
             printf("    (scanned %d pages, %d unmapped, best gate run=%d at kdata+0x%lx)\n",
                    pages_ok, pages_fail, best_run, (unsigned long)best_run_off);
 
+            /* ── IDT alignment refinement ──
+             *
+             * The scan may lock onto 16 bytes BEFORE the real IDT if the
+             * last bytes of the preceding structure happen to look gate-like.
+             * Validate entry 0 (#DE): its handler must be a valid ktext address.
+             * If not, shift forward by 16 bytes (one gate descriptor) and
+             * re-validate.  This fixes the observed kdata+0x64cdc70 →
+             * kdata+0x64cdc80 mismatch on FW 4.03. */
             if (idt_kva) {
+                uint64_t e0_pa = va_to_pa_quiet(idt_kva);
+                uint8_t e0[16];
+                int need_shift = 0;
+                if (e0_pa && kernel_copyout(g_dmap_base + e0_pa, e0, 16) == 0) {
+                    uint64_t h0 = (uint64_t)(e0[0] | (e0[1] << 8)) |
+                                  ((uint64_t)(e0[6] | (e0[7] << 8)) << 16) |
+                                  ((uint64_t)(e0[8] | (e0[9] << 8) |
+                                              (e0[10] << 16) | (e0[11] << 24))
+                                   << 32);
+                    /* Entry 0 (#DE) handler must be in ktext range */
+                    if (h0 < g_ktext_base || h0 >= g_ktext_base + 0x2000000) {
+                        need_shift = 1;
+                    }
+                }
+                if (need_shift) {
+                    uint64_t shifted = idt_kva + 16;
+                    uint64_t s_pa = va_to_pa_quiet(shifted);
+                    uint8_t s0[16];
+                    if (s_pa && kernel_copyout(g_dmap_base + s_pa, s0, 16) == 0) {
+                        uint64_t sh = (uint64_t)(s0[0] | (s0[1] << 8)) |
+                                      ((uint64_t)(s0[6] | (s0[7] << 8)) << 16) |
+                                      ((uint64_t)(s0[8] | (s0[9] << 8) |
+                                                  (s0[10] << 16) | (s0[11] << 24))
+                                       << 32);
+                        if (sh >= g_ktext_base && sh < g_ktext_base + 0x2000000) {
+                            printf("[*] IDT alignment fix: entry[0] at kdata+0x%lx "
+                                   "not in ktext, shifted +16 to kdata+0x%lx\n",
+                                   (unsigned long)(idt_kva - g_kdata_base),
+                                   (unsigned long)(shifted - g_kdata_base));
+                            idt_kva = shifted;
+                        }
+                    }
+                }
+            }
+
+            if (idt_kva) {
+                scan_idt_kva = idt_kva;
                 printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
                        (unsigned long)(idt_kva - g_kdata_base),
                        (unsigned long)idt_kva, idt_sel);
@@ -5077,6 +5132,23 @@ static void campaign_flatz_setup(void) {
                    (unsigned long)(ks_xinvtlb - g_ktext_base));
         printf("\n");
         fflush(stdout);
+
+        /* ── Cross-validate scan IDT vs kstuff IDT ── */
+        if (scan_idt_kva) {
+            uint64_t scan_off = scan_idt_kva - g_kdata_base;
+            if (scan_off == KSTUFF_IDT_OFF) {
+                printf("\n[+] IDT scan matches kstuff offset: "
+                       "kdata+0x%lx ✓\n", (unsigned long)scan_off);
+            } else {
+                printf("\n[!] IDT scan/kstuff MISMATCH: scan=kdata+0x%lx "
+                       "kstuff=kdata+0x%lx (delta=%ld bytes)\n",
+                       (unsigned long)scan_off,
+                       (unsigned long)KSTUFF_IDT_OFF,
+                       (long)(scan_off - KSTUFF_IDT_OFF));
+            }
+        } else {
+            printf("\n[!] IDT scan did not find IDT — using kstuff offset only.\n");
+        }
 
         /* ── Verify IDT at the kstuff offset ── */
         printf("\n[*] Verifying IDT at kstuff offset...\n");
