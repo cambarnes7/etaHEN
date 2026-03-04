@@ -26,6 +26,7 @@ typedef struct {
 } notify_request_t;
 
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
+int sceSystemStateMgrEnterStandby(void);
 
 static void notify(const char *msg) {
     notify_request_t req;
@@ -5153,7 +5154,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]   - KASLR slide stable across resume\n");
             printf("[+]\n");
             if (hook_armed) {
-                printf("[+] ACTION: Enter REST MODE now!\n");
+                printf("[+] ACTION: Entering REST MODE programmatically!\n");
                 printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
                 printf("[+]   → %s trampoline → original → returns normally\n",
                        hook_is_cave ? "cave" : "KLD");
@@ -5163,9 +5164,42 @@ static void campaign_flatz_setup(void) {
                 printf("[+]   persistence markers only.\n");
             }
 
-            notify(hook_armed
-                   ? "[HV Research] Phase 7: HOOK ARMED! Enter REST MODE!"
-                   : "[HV Research] Phase 7: Markers set. Enter REST MODE!");
+            if (hook_armed) {
+                /* Flush TLB on all CPUs before entering rest mode.
+                 * The cave trampoline's PTE had NX cleared, but other CPUs
+                 * may have stale TLB entries with NX=1.  Clearing the G bit
+                 * ensures the entry is flushed on next CR3 reload (context
+                 * switch).  We sleep 3 seconds to guarantee all CPUs have
+                 * context-switched at least once (timer IRQ fires at 100Hz+). */
+                printf("[+]\n");
+                printf("[*] Waiting 3s for TLB flush on all CPUs...\n");
+                fflush(stdout);
+                fflush(stderr);
+                sleep(3);
+                printf("[+] TLB flush window complete.\n");
+
+                /* Enter rest mode programmatically — bypasses PS button
+                 * interaction which would trigger APIC calls on CPUs that
+                 * may still have stale TLB entries, causing kernel panic. */
+                printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                fflush(stdout);
+                fflush(stderr);
+                notify("[HV Research] Entering rest mode in 3s...");
+                sleep(3);
+                int standby_ret = sceSystemStateMgrEnterStandby();
+                printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
+                       standby_ret);
+                if (standby_ret != 0) {
+                    printf("[!] Standby call failed (ret=%d, errno=%d).\n",
+                           standby_ret, errno);
+                    printf("[!] Falling back to manual rest mode entry.\n");
+                    printf("[!] Navigate to: Settings → System → Power → Rest Mode\n");
+                    printf("[!] Do NOT press the PS button — it may cause kernel panic.\n");
+                    notify("[HV Research] Auto-standby failed! Manually enter rest mode.");
+                }
+            } else {
+                notify("[HV Research] Phase 7: Markers set. Enter REST MODE!");
+            }
         }
 
         /* ─── Phase 8: IDT + kstuff offset verification ───
@@ -5881,7 +5915,7 @@ static void campaign_flatz_setup(void) {
                 printf("[+]   NX clearing: NOT NEEDED\n");
                 printf("[+]\n");
                 printf("[+] NEXT STEPS:\n");
-                printf("[+]   1. Enter REST MODE now\n");
+                printf("[+]   1. Entering REST MODE programmatically\n");
                 printf("[+]   2. On resume: cpususpend_handler calls\n");
                 printf("[+]      xapic_mode → our target → returns 1\n");
                 printf("[+]   3. LAPIC suspend completes normally\n");
@@ -5899,7 +5933,26 @@ static void campaign_flatz_setup(void) {
                 printf("[+]\n");
                 printf("[+] QA flags set with original xapic for restore.\n");
 
-                notify("[HV Research] Phase 7: apic_ops[2] hooked! Enter REST MODE!");
+                /* Wait for TLB flush on all CPUs, then enter rest mode
+                 * programmatically to avoid PS button kernel panic. */
+                printf("[*] Waiting 3s for TLB flush on all CPUs...\n");
+                fflush(stdout);
+                fflush(stderr);
+                sleep(3);
+                printf("[+] TLB flush window complete.\n");
+                printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                fflush(stdout);
+                fflush(stderr);
+                notify("[HV Research] Entering rest mode in 3s...");
+                sleep(3);
+                int standby_ret2 = sceSystemStateMgrEnterStandby();
+                printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
+                       standby_ret2);
+                if (standby_ret2 != 0) {
+                    printf("[!] Standby failed (ret=%d). Manually enter rest mode.\n",
+                           standby_ret2);
+                    notify("[HV Research] Auto-standby failed! Manually enter rest mode.");
+                }
             } else {
                 printf("\n[-] Hook write verification failed.\n");
                 printf("    apic_ops[2] NOT modified as expected.\n");

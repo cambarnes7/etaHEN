@@ -30,7 +30,7 @@ kmod:
 
 # Build the main payload ELF (embeds kmod/hv_kmod.ko via .incbin)
 $(ELF): main.c kmod/hv_kmod.ko
-	$(CC) $(CFLAGS) -o $@ main.c
+	$(CC) $(CFLAGS) -o $@ main.c -lSceSystemService
 
 # Convenience target: ensure kmod .ko exists
 kmod/hv_kmod.ko: kmod
