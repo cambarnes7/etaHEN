@@ -125,9 +125,39 @@ The .ko is compiled as an ET_REL (relocatable ELF), embedded into the .elf via `
 - Hooks `apic_ops[2]` with a safe target (`mov eax, 1; ret` or KLD trampoline)
 - **Status:** Code is ready, untested (requires successful suspend/resume cycle with readable ktext)
 
+### 16. Phase 7 Pre-Suspend: apic_ops[2] KLD Trampoline Hook
+- When KLD trampoline is available, Phase 7 pre-suspend now arms the hook:
+  - Writes original xapic_mode to `g_trampoline_target` via DMAP
+  - Hooks `apic_ops[2]` → `trampoline_xapic_mode()` in KLD .text
+  - Trampoline calls through to original, returns correct APIC mode
+  - Safe for LAPIC suspend sequence (no kernel panic risk)
+- Falls back to markers-only if KLD trampoline unavailable
+- **Status:** Ready for testing with suspend/resume cycle
+
 ---
 
-## What Was Removed (This Commit)
+## Bug Fixes (This Commit)
+
+### IDT Scanner Off-by-0x10
+- **Bug:** Scanner found IDT at kdata+0x64cdc70 instead of kdata+0x64cdc80
+- **Cause:** Only required 6/8 consecutive valid gates. The 16 bytes before the real IDT happened to look like valid padding, so entries 1-7 (real entries 0-6) gave 7/8 valid — passing the threshold despite wrong alignment.
+- **Fix:** Also require entry 0 (the first checked entry) to be a valid gate. IDT entry 0 (#DE divide-by-zero) is always present on x86-64.
+
+### Code Cave Finder Inconsistency
+- **Bug:** Run 1 found cave at kdata+0x0, run 2 at kdata+0x1000 (persistence markers from run 1 made first page non-zero)
+- **Fix:** Skip first page of kdata in cave scan — reserved for Phase 7 persistence markers.
+
+### SIDT Comment Correction
+- **Bug:** Comment at IDT scanner said "SIDT is intercepted by PS5 HV and kills the process" but SIDT works fine at ring 3 on FW 4.03.
+- **Fix:** Updated comment to note SIDT works on FW 4.03, scanner used as portable fallback.
+
+### Phase 7 Pre-Suspend Hook Armed
+- **Bug:** Phase 7 pre-suspend only set persistence markers but did NOT hook apic_ops[2], despite having a safe KLD trampoline that calls through to the original function.
+- **Fix:** Pre-suspend now hooks apic_ops[2] → KLD trampoline when available. This is safe because the trampoline calls the original xapic_mode and returns the real APIC mode value.
+
+---
+
+## What Was Removed (Previous Commit)
 
 The following speculative/fallback code was removed to keep only confirmed-working or going-to-work items:
 
@@ -160,12 +190,13 @@ The flatz suspend/resume method requires running code during early resume, befor
 - Whether the HV reinitializes NPT without XOM protection on resume
 
 **Next Steps:**
-1. Test current build (apic_ops hook + persistence markers)
-2. Enter rest mode with markers set
+1. Test current build (KLD trampoline hook armed + persistence markers)
+2. Enter rest mode with hook armed
 3. Wake, re-exploit, re-run tool
-4. Check if ktext is readable post-resume
-5. If yes: gadget scan + apic_ops hook with ktext target works automatically
-6. If no: need to investigate alternative approaches
+4. Verify KLD trampoline survived resume (apic_ops[2] → trampoline)
+5. Check if ktext is readable post-resume
+6. If yes: gadget scan + upgrade to stack pivot ROP chain
+7. If no: investigate alternative approaches (IST stack manipulation)
 
 ---
 

