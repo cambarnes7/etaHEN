@@ -1563,11 +1563,23 @@ static void campaign_kmod_kldload(void) {
         return;
     }
 
-    /* Step 2: Patch .ko with the DMAP output address and write to disk.
-     * Find the sentinel value (OUTPUT_KVA_SENTINEL) in the .ko binary
-     * and replace it with the kernel VA of our shared result buffer.
-     * The kmod's init function will write results to this address. */
-    printf("\n[*] Step 2: Patching .ko with output KVA and writing to disk...\n");
+    /* ── Steps 2-3 SKIPPED: kmod loading destabilizes PS5 ──
+     *
+     * PS5 kernel linker is gutted: kldload creates a kid but doesn't
+     * actually load module code/data into memory.  The half-loaded kmod
+     * corrupts kernel state causing freeze/crash.  Phase 9 now builds
+     * the #GP handler inline — no kmod dependency.
+     *
+     * We skip .ko patching, writing, and kldload entirely.  The shared
+     * result buffer (allocated above) is used by the ring-0 shellcode
+     * execution test later in this function.  The ring-3 recon path
+     * (sysent discovery, PTE NX-clear, apic_ops scan) runs normally. */
+    printf("\n[*] Steps 2-3: kmod patching + kldload SKIPPED.\n");
+    printf("    PS5 kernel linker is gutted — kldload destabilizes system.\n");
+    printf("    Phase 9 uses inline handler. Proceeding to recon.\n");
+    int kid = 0;  /* no module loaded */
+
+    if (0) {  /* Dead code — preserved for reference */
 
     /* Copy .ko to modifiable buffer */
     void *ko_buf = malloc((size_t)KMOD_KO_SZ);
@@ -1704,58 +1716,12 @@ static void campaign_kmod_kldload(void) {
     }
     printf("[+] Wrote patched hv_kmod.ko (%zu bytes)\n", written);
 
-    /* Step 3: Load the kernel module via kldload */
-    printf("\n[*] Step 3: Loading kernel module via kldload(2)...\n");
-    printf("    The kernel linker will:\n");
-    printf("    - Parse the ET_REL ELF\n");
-    printf("    - Allocate kernel memory, process relocations\n");
-    printf("    - Call SYSINIT -> hv_init runs campaigns in ring 0\n");
-    printf("    - hv_init copies results to our shared buffer via DMAP\n");
+    }  /* end if (0) — dead code block for Steps 2-3 */
 
-    int kid = syscall(SYS_kldload, "/data/etaHEN/hv_kmod.ko");
-    if (kid < 0) {
-        int err = errno;
-        printf("[-] kldload failed: kid=%d, errno=%d (%s)\n", kid, err, strerror(err));
-
-        if (err == 1 /* EPERM */) {
-            printf("    EPERM: securelevel or priv_check rejected the load.\n");
-        } else if (err == 2 /* ENOENT */) {
-            printf("    ENOENT: file not found. Check /data/etaHEN/ exists.\n");
-        } else if (err == 8 /* ENOEXEC */) {
-            printf("    ENOEXEC: kernel rejected the ELF format.\n");
-        }
-
-        unlink("/data/etaHEN/hv_kmod.ko");
-        return;
-    }
-    printf("[+] Module loaded! kid=%d\n", kid);
-
-    /* kldstat diagnostic: get the module's reported load address */
+    /* kfs is used by kldstat-directed trampoline check (always fails
+     * with kid=0, but code references it).  Zero-init so it's safe. */
     struct kld_file_stat kfs;
     memset(&kfs, 0, sizeof(kfs));
-    kfs.version = sizeof(kfs);
-    int ks_ret = syscall(SYS_kldstat, kid, &kfs);
-    printf("    kldstat(%d): ret=%d, address=0x%lx, size=0x%lx\n",
-           kid, ks_ret, (unsigned long)kfs.address, (unsigned long)kfs.size);
-    if (kfs.address != 0) {
-        printf("    kldstat reports module at 0x%lx (%lu bytes)\n",
-               (unsigned long)kfs.address, (unsigned long)kfs.size);
-        /* Try reading the first 16 bytes from the reported address via DMAP */
-        uint64_t mod_pa = va_to_pa_quiet(kfs.address);
-        if (mod_pa != 0) {
-            uint8_t mod_hdr[16];
-            kernel_copyout(g_dmap_base + (mod_pa & ~0xFFFULL) +
-                           (kfs.address & 0xFFF), mod_hdr, 16);
-            printf("    First 16 bytes at module base: ");
-            for (int i = 0; i < 16; i++) printf("%02x ", mod_hdr[i]);
-            printf("\n");
-        } else {
-            printf("    va_to_pa(0x%lx) returned 0 — page not mapped?\n",
-                   (unsigned long)kfs.address);
-        }
-    } else {
-        printf("    kldstat returned address=0 — kernel linker may not track module base.\n");
-    }
 
     /* Step 4: Read results directly from shared buffer.
      * The kmod's hv_init wrote results to result_kva (DMAP-mapped).
@@ -6757,12 +6723,10 @@ int main(void) {
     /* Run research campaigns */
     campaign_kernel_recon();
 
-    /* Campaign 7: Kernel module via kldload — DISABLED.
-     * PS5 kernel linker is gutted: kldload creates a kid but doesn't
-     * load module code/data.  Loading the kmod destabilizes the system
-     * (freeze/crash shortly after).  Phase 9 now builds the #GP handler
-     * inline — no kmod dependency.  */
-    /* campaign_kmod_kldload(); */
+    /* Campaign 7: Ring-3 recon (sysent, ring-0 exec, apic_ops discovery).
+     * kldload is skipped inside (destabilizes PS5), but the ring-3
+     * recon path discovers apic_ops needed for Phase 9. */
+    campaign_kmod_kldload();
 
     /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
     if (g_dmap_base) {
