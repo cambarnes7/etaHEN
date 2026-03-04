@@ -5486,40 +5486,36 @@ static void campaign_flatz_setup(void) {
 
             if (hook_armed) {
                 /*
-                 * Cave trampoline vs KLD trampoline:
+                 * ALWAYS restore apic_ops[2] to original before suspend.
                  *
-                 * The cave trampoline lives in kdata (at kdata_base+0x100).
-                 * It's safe to leave armed during suspend because:
-                 *   - All CPUs share the same guest page tables
-                 *   - The guest PTE NX-clear is permanent (persists across resume)
-                 *   - NPT allows execution on kdata pages (confirmed by ring-0 test)
-                 *   - The trampoline calls through to the original xapic_mode
+                 * Cave trampoline: lives in kdata (kdata_base+0x100).
+                 * We cleared NX+G in the guest PTE, but other CPUs still
+                 * have stale TLB entries with NX=1 (Global entries survive
+                 * CR3 reloads — only INVLPG flushes them, which we can't
+                 * issue from userspace).  Any CPU calling apic_ops[2] hits
+                 * the stale NX TLB → #PF → kernel panic.
                  *
-                 * The KLD trampoline lives in kldload-allocated module pages
-                 * which may not be NPT-executable on secondary CPUs. So we
-                 * only leave the hook armed for cave trampolines.
+                 * KLD trampoline: pages may not be NPT-executable on
+                 * secondary CPUs.
+                 *
+                 * Both cases: restore original to prevent panic.  The hook
+                 * was verified working on the primary CPU; persistence
+                 * markers (cave + QA flags) will confirm resume detection.
                  */
-                if (hook_is_cave) {
-                    printf("[+]\n");
-                    printf("[*] Cave trampoline hook — LEAVING ARMED during suspend.\n");
-                    printf("    Cave trampoline is in kdata (shared by all CPUs).\n");
-                    printf("    Guest PTE NX-clear persists across resume.\n");
-                    printf("    NPT allows execution on kdata PA.\n");
-                    printf("    On resume: cpususpend_handler → apic_ops[2]\n");
-                    printf("      → cave trampoline → original xapic_mode → returns 1\n");
-                } else {
-                    /* KLD trampoline: restore original to prevent panic on secondary CPUs */
-                    printf("[+]\n");
-                    printf("[*] KLD trampoline — restoring apic_ops[2] before rest mode.\n");
+                printf("[+]\n");
+                printf("[*] Restoring apic_ops[2] to original before rest mode.\n");
+                if (hook_is_cave)
+                    printf("    Cave trampoline: stale Global TLB entries on other CPUs\n"
+                           "    still have NX=1 — can't INVLPG from userspace.\n");
+                else
                     printf("    KLD pages may not be NPT-executable on secondary CPUs.\n");
-                    kernel_copyin(&original_xapic,
-                                  g_dmap_base + ops_pa + 0x10, 8);
-                    uint64_t restore_verify = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                    printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
-                           (unsigned long)restore_verify,
-                           restore_verify == original_xapic ? "OK" : "FAIL");
-                }
+                kernel_copyin(&original_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_verify,
+                       restore_verify == original_xapic ? "OK" : "FAIL");
 
                 /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
