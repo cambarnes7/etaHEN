@@ -1563,23 +1563,18 @@ static void campaign_kmod_kldload(void) {
         return;
     }
 
-    /* ── Steps 2-3 SKIPPED: kmod loading destabilizes PS5 ──
+    /* ── Step 2: Patch g_output_kva in .ko with result buffer KVA ──
      *
-     * PS5 kernel linker is gutted: kldload creates a kid but doesn't
-     * actually load module code/data into memory.  The half-loaded kmod
-     * corrupts kernel state causing freeze/crash.  Phase 9 now builds
-     * the #GP handler inline — no kmod dependency.
+     * On PS5 FW 4.03 the kernel linker DOES load module code/data into
+     * dynamically-allocated kernel memory (confirmed by trampoline scanner
+     * finding and executing hv_idt_trampoline via IDT hook).  GMET is not
+     * enforced until FW 6.50, so this memory is NPT-executable.
      *
-     * We skip .ko patching, writing, and kldload entirely.  The shared
-     * result buffer (allocated above) is used by the ring-0 shellcode
-     * execution test later in this function.  The ring-3 recon path
-     * (sysent discovery, PTE NX-clear, apic_ops scan) runs normally. */
-    printf("\n[*] Steps 2-3: kmod patching + kldload SKIPPED.\n");
-    printf("    PS5 kernel linker is gutted — kldload destabilizes system.\n");
-    printf("    Phase 9 uses inline handler. Proceeding to recon.\n");
-    int kid = 0;  /* no module loaded */
-
-    if (0) {  /* Dead code — preserved for reference */
+     * The kernel linker does NOT process SYSINIT or MOD_LOAD, so we use
+     * the IDT hook path (Step 4b) to invoke hv_init manually.
+     *
+     * Phase 9 depends on gp_handler living in this NPT-executable KLD
+     * .text memory — kdata cave is NX under NPT. */
 
     /* Copy .ko to modifiable buffer */
     void *ko_buf = malloc((size_t)KMOD_KO_SZ);
@@ -1716,12 +1711,41 @@ static void campaign_kmod_kldload(void) {
     }
     printf("[+] Wrote patched hv_kmod.ko (%zu bytes)\n", written);
 
-    }  /* end if (0) — dead code block for Steps 2-3 */
+    /* ── Step 3: Load the kernel module via kldload(2) ──
+     *
+     * On PS5 FW 4.03, kldload allocates kernel memory, copies module
+     * code/data, and handles R_X86_64_PC32 relocations.  It does NOT
+     * process SYSINIT/MOD_LOAD, so hv_init won't run automatically —
+     * we invoke it manually via IDT hook in Step 4b.
+     *
+     * The loaded .text pages are NPT-executable (GMET not enforced on
+     * FW < 6.50), which is critical for Phase 9's gp_handler. */
+    printf("\n[*] Step 3: Loading kernel module via kldload...\n");
+    int kid = syscall(SYS_kldload, "/data/etaHEN/hv_kmod.ko");
+    if (kid < 0) {
+        printf("[-] kldload failed: errno=%d (%s)\n", errno, strerror(errno));
+        printf("    Continuing with scanner — module may still be in memory.\n");
+        kid = 0;
+    } else {
+        printf("[+] kldload returned kid=%d\n", kid);
+    }
 
-    /* kfs is used by kldstat-directed trampoline check (always fails
-     * with kid=0, but code references it).  Zero-init so it's safe. */
     struct kld_file_stat kfs;
     memset(&kfs, 0, sizeof(kfs));
+
+    /* Try kldstat to get module base address (may be broken on PS5) */
+    if (kid > 0) {
+        kfs.version = sizeof(kfs);
+        int ks_ret = syscall(SYS_kldstat, kid, &kfs);
+        if (ks_ret == 0 && kfs.address != 0) {
+            printf("[+] kldstat: base=0x%lx size=0x%lx name=%s\n",
+                   (unsigned long)(uintptr_t)kfs.address,
+                   (unsigned long)kfs.size, kfs.name);
+        } else {
+            printf("[*] kldstat returned %d (address=0x%lx) — will scan for module.\n",
+                   ks_ret, (unsigned long)(uintptr_t)kfs.address);
+        }
+    }
 
     /* Step 4: Read results directly from shared buffer.
      * The kmod's hv_init wrote results to result_kva (DMAP-mapped).
@@ -2304,16 +2328,16 @@ static void campaign_kmod_kldload(void) {
          *
          * Layout (from objdump -d hv_kmod.ko):
          *   0x00: hv_idt_trampoline  (35 bytes, padded to 0x30)
-         *   0x30: gp_handler          (92 bytes, ends at 0x8b)
-         *   0x8b: trampoline_xapic_mode:
+         *   0x30: gp_handler          (88 bytes, ends at 0x88)
+         *   0x88: trampoline_xapic_mode:
          *         55              push rbp
          *         48 8b 05 XX..   mov disp32(%rip), %rax  ← g_trampoline_target
-         *   The 4-byte displacement at hdr[0x8f..0x92] is RIP-relative
-         *   from offset 0x93 (end of the 7-byte mov instruction). */
+         *   The 4-byte displacement at hdr[0x8c..0x8f] is RIP-relative
+         *   from offset 0x90 (end of the 7-byte mov instruction). */
         #define KMOD_GP_OFFSET     0x30
-        #define KMOD_XAPIC_OFFSET  0x8B
-        #define KMOD_DISP_OFFSET   0x8F
-        #define KMOD_DISP_RIP      0x93  /* RIP after mov instruction */
+        #define KMOD_XAPIC_OFFSET  0x88
+        #define KMOD_DISP_OFFSET   0x8C
+        #define KMOD_DISP_RIP      0x90  /* RIP after mov instruction */
 
         if (trampoline_kva && !g_kmod_trampoline_func) {
             if (hdr[KMOD_XAPIC_OFFSET]   == 0x55 &&  /* push rbp */
@@ -2348,10 +2372,10 @@ static void campaign_kmod_kldload(void) {
             }
         }
 
-        /* ── Step 4c: Direct shellcode injection (if kldload module not found) ──
+        /* ── Step 4c: Direct shellcode injection (if trampoline not found) ──
          *
-         * kldload on PS5 creates a kid but does NOT load module code/data
-         * into kernel memory (Sony gutted the kernel linker).
+         * If kldload failed or the trampoline scanner didn't find the
+         * module in memory, fall back to direct shellcode injection.
          *
          * Fallback: write self-contained MSR-reading shellcode into a ktext
          * code cave, hook an IDT entry, trigger INT from ring 3, then
@@ -6901,9 +6925,9 @@ int main(void) {
     /* Run research campaigns */
     campaign_kernel_recon();
 
-    /* Campaign 7: Ring-3 recon (sysent, ring-0 exec, apic_ops discovery).
-     * kldload is skipped inside (destabilizes PS5), but the ring-3
-     * recon path discovers apic_ops needed for Phase 9. */
+    /* Campaign 7: kldload + ring-0 exec via IDT + ring-3 recon.
+     * Loads .ko into kernel memory, scans for trampoline, invokes
+     * hv_init via IDT hook, discovers apic_ops for Phase 9. */
     campaign_kmod_kldload();
 
     /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
