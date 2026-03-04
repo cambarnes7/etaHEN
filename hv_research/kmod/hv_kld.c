@@ -690,5 +690,5 @@ int trampoline_xapic_mode(void) {
     uint64_t target = g_trampoline_target;
     if (target)
         return ((int (*)(void))target)();
-    return 0;  /* fallback: xAPIC mode = 0 */
+    return 1;  /* fallback: must return 1 (APIC_MODE_XAPIC) for LAPIC suspend */
 }
