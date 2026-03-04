@@ -18,17 +18,6 @@
 
 #include <ps5/kernel.h>
 
-/* ─── ktext_base fallback ───
- * The ps5-payload-sdk CRT doesn't always export KERNEL_ADDRESS_TEXT_BASE.
- * On FW 4.03 the ktext→kdata offset is ~0xA00000 (10 MB); we derive it
- * from the known kstuff offset for nop_ret at kdata - 0x9d20ca, giving
- * ktext_start ≈ kdata - 0x9d3000 (page-aligned).
- * Computed at runtime in init_fw_offsets().
- */
-#define NEED_KTEXT_BASE_COMPUTED 1
-static uint64_t _ktext_base_computed = 0;
-#define KERNEL_ADDRESS_TEXT_BASE _ktext_base_computed
-
 /* ─── Notification helper ─── */
 
 typedef struct {
@@ -312,9 +301,6 @@ static int discover_dmap_base(void) {
 static int init_fw_offsets(void) {
     g_fw_version = kernel_get_fw_version() & 0xFFFF0000;
     g_kdata_base = KERNEL_ADDRESS_DATA_BASE;
-
-    /* Compute ktext_base: kdata - 0x9d3000 (page-aligned, from kstuff offsets) */
-    _ktext_base_computed = g_kdata_base - 0x9d3000ULL;
     g_ktext_base = KERNEL_ADDRESS_TEXT_BASE;
 
     printf("[*] FW version: 0x%lx\n", g_fw_version);
@@ -5580,8 +5566,8 @@ static void campaign_flatz_setup(void) {
         } else {
             printf("    IDT PA: 0x%lx\n", (unsigned long)idt_pa);
 
-            /* Read all 256 IDT entries (static to avoid stack overflow) */
-            static uint8_t idt_buf[256 * 16];
+            /* Read all 256 IDT entries */
+            uint8_t idt_buf[256 * 16];
             kernel_copyout(g_dmap_base + idt_pa,
                            idt_buf, sizeof(idt_buf));
 
@@ -5920,7 +5906,7 @@ static void campaign_flatz_setup(void) {
             }
 
             /* Read first 64 bytes to check if empty */
-            static uint8_t probe[64];
+            uint8_t probe[64];
             kernel_copyout(g_dmap_base + pa, probe, sizeof(probe));
             int is_empty = 1;
             for (int j = 0; j < (int)sizeof(probe); j++) {
@@ -5932,7 +5918,7 @@ static void campaign_flatz_setup(void) {
 
             if (is_empty && !best_cave_pa) {
                 /* Verify full CAVE_SIZE is empty */
-                static uint8_t full_probe[CAVE_SIZE];
+                uint8_t full_probe[CAVE_SIZE];
                 kernel_copyout(g_dmap_base + pa, full_probe, CAVE_SIZE);
                 int full_empty = 1;
                 for (int j = 0; j < CAVE_SIZE; j++) {
@@ -5961,7 +5947,7 @@ static void campaign_flatz_setup(void) {
         /* Build ROP chain locally (NOT written to kernel) */
         printf("[*] Building ROP chain locally (dry run)...\n");
 
-        static uint8_t rop[CAVE_SIZE];
+        uint8_t rop[CAVE_SIZE];
         memset(rop, 0, sizeof(rop));
 
         #define ROP_Q(off, val) do { \
