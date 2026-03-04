@@ -125,18 +125,46 @@ The .ko is compiled as an ET_REL (relocatable ELF), embedded into the .elf via `
 - Hooks `apic_ops[2]` with a safe target (`mov eax, 1; ret` or KLD trampoline)
 - **Status:** Code is ready, untested (requires successful suspend/resume cycle with readable ktext)
 
-### 16. Phase 7 Pre-Suspend: apic_ops[2] KLD Trampoline Hook
-- When KLD trampoline is available, Phase 7 pre-suspend now arms the hook:
+### 16. Phase 7 Pre-Suspend: apic_ops[2] Trampoline Hook
+- When a trampoline is available (KLD or cave), Phase 7 pre-suspend arms the hook:
   - Writes original xapic_mode to `g_trampoline_target` via DMAP
-  - Hooks `apic_ops[2]` → `trampoline_xapic_mode()` in KLD .text
+  - Hooks `apic_ops[2]` → `trampoline_xapic_mode()`
   - Trampoline calls through to original, returns correct APIC mode
   - Safe for LAPIC suspend sequence (no kernel panic risk)
-- Falls back to markers-only if KLD trampoline unavailable
-- **Status:** Ready for testing with suspend/resume cycle
+- Two trampoline sources:
+  - **KLD trampoline** (preferred): function in kmod .text (NPT-executable)
+  - **Cave trampoline** (fallback): 28-byte shellcode in kdata code cave (guest PTE NX cleared)
+- Falls back to markers-only if neither trampoline is available
+- **Status:** Cave trampoline ready for testing with suspend/resume cycle
+
+### 17. kdata Cave Trampoline (Phase 5b)
+- When the kmod trampoline scanner fails (module pages are NPT-protected
+  against DMAP reads), builds a self-contained `trampoline_xapic_mode`
+  function directly in the kdata code cave at kdata_base + 0x100
+- 28 bytes total: 20 bytes of position-independent x86-64 code + 8-byte
+  `g_trampoline_target` variable
+- Guest PTE NX bit permanently cleared for the kdata_base page (NPT
+  already allows execution on kdata — confirmed by ring-0 PTE NX-clear test)
+- Eliminates dependency on kmod trampoline scanner
+- **Status:** Code ready, untested (requires suspend/resume cycle)
 
 ---
 
 ## Bug Fixes (This Commit)
+
+### Kmod Trampoline Scanner Failure (NPT Read Protection)
+- **Bug:** The trampoline scanner could not find `hv_idt_trampoline` in kernel
+  memory, preventing hv_init from running via IDT hook. This caused Phase 7
+  to skip arming the apic_ops hook ("KLD trampoline not available").
+- **Cause:** PS5 FW 4.03's HV NPT protects kldload-allocated module pages
+  against DMAP reads (execute-only at NPT level). The scanner reads pages via
+  DMAP and never finds the trampoline signature. kldstat also returns
+  address=0x0 for the module.
+- **Fix:** Added "Phase 5b: kdata Cave Trampoline" — after ring-0 code
+  execution is confirmed, if the kmod trampoline is unavailable, writes a
+  self-contained trampoline function to the kdata code cave and permanently
+  clears the guest PTE NX bit. Phase 7 uses this cave trampoline to arm
+  apic_ops[2].
 
 ### IDT Scanner Off-by-0x10
 - **Bug:** Scanner found IDT at kdata+0x64cdc70 instead of kdata+0x64cdc80
@@ -179,21 +207,23 @@ The flatz suspend/resume method requires running code during early resume, befor
 
 **Proven:**
 - apic_ops[2] (xapic_mode) is called during LAPIC suspend/resume
-- We can hook it (KLD trampoline or ktext gadget)
+- We can hook it (KLD trampoline, kdata cave trampoline, or ktext gadget)
 - Cave markers, QA flags, and apic_ops hooks survive suspend/resume
 - KASLR slide is stable across resume
 - Guest PTE NX-clear works for code execution in kdata
+- NPT allows execution on kdata pages (confirmed via ring-0 shellcode)
+- kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
 
 **Unknown (needs testing):**
+- Whether the cave trampoline (in kdata) survives suspend/resume
 - Whether ktext becomes readable after suspend/resume on FW 4.03
-- Whether the #GP pointer poisoning approach actually fires during resume
 - Whether the HV reinitializes NPT without XOM protection on resume
 
 **Next Steps:**
-1. Test current build (KLD trampoline hook armed + persistence markers)
+1. Test current build (cave trampoline hook armed + persistence markers)
 2. Enter rest mode with hook armed
 3. Wake, re-exploit, re-run tool
-4. Verify KLD trampoline survived resume (apic_ops[2] → trampoline)
+4. Verify cave trampoline survived resume (apic_ops[2] → kdata cave)
 5. Check if ktext is readable post-resume
 6. If yes: gadget scan + upgrade to stack pivot ROP chain
 7. If no: investigate alternative approaches (IST stack manipulation)
