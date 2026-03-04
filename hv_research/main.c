@@ -4751,11 +4751,15 @@ idt_skip: ;
         } else {
             printf("    [-] Result buffer also has zeros.\n");
         }
-        if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
-            g_kmod_gp_handler = results->gp_handler_kva;
-            printf("    gp_handler()            = 0x%016lx\n",
-                   (unsigned long)g_kmod_gp_handler);
-        }
+    }
+
+    /* Always check for gp_handler KVA (Phase 9), independent of trampoline status */
+    printf("    results->gp_handler_kva = 0x%016lx\n",
+           (unsigned long)results->gp_handler_kva);
+    if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
+        g_kmod_gp_handler = results->gp_handler_kva;
+        printf("    gp_handler()            = 0x%016lx\n",
+               (unsigned long)g_kmod_gp_handler);
     }
 
     /* Step 5: Unload the module (skip if Phase 7 needs it) */
