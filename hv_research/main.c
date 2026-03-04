@@ -5776,6 +5776,18 @@ int main(void) {
         printf("[!] Continuing without DMAP (limited functionality)\n");
     }
 
+    /* Run research campaigns */
+    campaign_kernel_recon();
+
+    /* Campaign 7: kldload + ring-0 exec via IDT + ring-3 recon.
+     * Loads .ko into kernel memory, scans for trampoline, invokes
+     * hv_init via IDT hook, discovers apic_ops for Phase 9. */
+    campaign_kmod_kldload();
+
+    /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
+    if (g_dmap_base) {
+        campaign_flatz_setup();
+    }
 
     printf("\n==============================================\n");
     printf("  All campaigns complete.\n");
