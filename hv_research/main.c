@@ -4227,33 +4227,27 @@ ring3_fallback:
                                                        CAVE_TRAMP_TARGET_OFF;
 
                             /*
-                             * Proof marker DMAP write ENABLED.
-                             * The proof marker is written to kdata_base+0x1000
-                             * which is a DIFFERENT physical page than the
-                             * trampoline code at kdata_base+0x100.  This avoids
-                             * x86 self-modifying code (SMC) detection, which
-                             * only triggers on writes to the same physical page
-                             * as currently executing instructions.
+                             * Proof marker DMAP write DISABLED.
                              *
-                             * The trampoline loads g_proof_marker_addr (DMAP KVA
-                             * of kdata_base+0x1000), writes "FIRED!_!" magic,
-                             * then calls through to the original xapic_mode.
+                             * g_proof_marker_addr is left at 0 (initialized above).
+                             * The trampoline's NULL check (test rcx, rcx; jz)
+                             * will skip the proof write entirely.
+                             *
+                             * Rationale: During LAPIC suspend, cpususpend_handler
+                             * runs on secondary CPUs with interrupts disabled in
+                             * a constrained context.  DMAP writes during this
+                             * window may trigger HV NPT faults (#NPF) — the HV
+                             * may restrict DMAP write permissions during the
+                             * suspend path.  This was the suspected cause of
+                             * kernel panics when entering rest mode with the
+                             * cave trampoline armed.
+                             *
+                             * The trampoline still calls through to the original
+                             * xapic_mode and returns the correct APIC mode value.
+                             * Post-resume detection relies on checking whether
+                             * apic_ops[2] still points to the cave trampoline KVA.
                              */
-                            {
-                                uint64_t proof_dmap_kva = g_dmap_base + tramp_cave_pa
-                                                          - CAVE_TRAMP_OFFSET
-                                                          + CAVE_PROOF_OFFSET;
-                                kernel_copyin(&proof_dmap_kva,
-                                              g_dmap_base + tramp_cave_pa + CAVE_TRAMP_PROOF_OFF,
-                                              8);
-                                /* Verify */
-                                uint64_t proof_verify = 0;
-                                kernel_copyout(g_dmap_base + tramp_cave_pa + CAVE_TRAMP_PROOF_OFF,
-                                               &proof_verify, 8);
-                                printf("[+] Proof marker addr:      0x%016lx %s\n",
-                                       (unsigned long)proof_verify,
-                                       proof_verify == proof_dmap_kva ? "[OK]" : "[FAIL]");
-                            }
+                            printf("[+] Proof marker write:     DISABLED (avoid DMAP write during suspend)\n");
 
                             printf("\n[+] ============================================\n");
                             printf("[+]  CAVE TRAMPOLINE INSTALLED\n");
@@ -4262,7 +4256,7 @@ ring3_fallback:
                                    (unsigned long)g_kmod_trampoline_func);
                             printf("[+] g_trampoline_target     = 0x%016lx\n",
                                    (unsigned long)g_kmod_trampoline_target);
-                            printf("[+] Proof marker write:     ENABLED (different page, no SMC)\n");
+                            printf("[+] Proof marker write:     DISABLED (suspend safety)\n");
                             printf("[+] Guest PTE NX permanently cleared for this page.\n");
                             printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
                         } else {
@@ -5233,10 +5227,10 @@ static void campaign_flatz_setup(void) {
                     printf("    (kernel may have reinitialized apic_ops)\n");
                     printf("[+]   Cave tramp:      FIRED (hook lost post-resume)\n");
                 } else if (!tramp_fired && hook_points_to_cave) {
-                    printf("    Hook still points to cave but no proof marker.\n");
-                    printf("    xapic_mode may not have been called yet, or\n");
-                    printf("    proof marker write was disabled/faulted.\n");
-                    printf("[+]   Cave tramp:      ARMED (awaiting call)\n");
+                    printf("    Hook still points to cave — trampoline survived suspend!\n");
+                    printf("    Proof marker write was disabled (suspend safety).\n");
+                    printf("    Trampoline likely fired and called through to original.\n");
+                    printf("[+]   Cave tramp:      SURVIVED (hook retained, proof disabled)\n");
                 } else {
                     printf("    No proof marker, hook not pointing to cave.\n");
                     printf("    Cave trampoline was not armed during suspend.\n");
@@ -5531,9 +5525,9 @@ static void campaign_flatz_setup(void) {
                      *   apic_ops[2](xapic_mode) → cave trampoline →
                      *   original xapic_mode → returns 1 (xAPIC)
                      *
-                     * The cave trampoline also writes a proof marker
-                     * ("FIRED!_!") to kdata_base+0x20 if proof_addr is set
-                     * (currently disabled for SMC safety).
+                     * The cave trampoline's proof marker write is DISABLED
+                     * (g_proof_marker_addr = 0) to avoid DMAP writes during
+                     * the constrained LAPIC suspend path.
                      */
                     printf("[*] Cave trampoline: LEAVING ARMED for suspend!\n");
                     printf("    G=0 in guest PTE — no stale Global TLB risk.\n");

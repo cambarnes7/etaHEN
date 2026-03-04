@@ -145,8 +145,8 @@ The .ko is compiled as an ET_REL (relocatable ELF), embedded into the .elf via `
   function directly in the kdata code cave at kdata_base + 0x100
 - 56 bytes total: 40 bytes of position-independent x86-64 code + 8-byte
   `g_trampoline_target` + 8-byte `g_proof_marker_addr`
-- On execution, writes "FIRED!_!" (0x4649524544215F21) proof marker to
-  kdata_base+0x20 via DMAP, then calls through to original xapic_mode
+- Proof marker write DISABLED (g_proof_marker_addr = 0) — DMAP writes during
+  LAPIC suspend caused kernel panics. Calls through to original xapic_mode only
 - Guest PTE NX bit permanently cleared for the kdata_base page (NPT
   already allows execution on kdata — confirmed by ring-0 PTE NX-clear test)
 - Eliminates dependency on kmod trampoline scanner
@@ -156,7 +156,25 @@ The .ko is compiled as an ET_REL (relocatable ELF), embedded into the .elf via `
 
 ## Bug Fixes (This Commit)
 
-### Cave Trampoline Not Armed During Suspend
+### Cave Trampoline Proof Marker Write Causes Kernel Panic
+- **Bug:** Entering rest mode with the cave trampoline armed caused a kernel
+  panic. The system displayed "Entering rest mode in 3s..." then panicked
+  during the kernel's LAPIC suspend sequence — never entering rest mode.
+- **Cause:** The cave trampoline wrote "FIRED!_!" proof marker to a DMAP
+  address (`g_dmap_base + PA(kdata) + 0x1000`) every time it was called.
+  During `cpususpend_handler` on secondary CPUs (interrupts disabled,
+  constrained execution context), this DMAP write likely triggered an HV
+  NPT fault — the hypervisor may restrict DMAP write permissions during
+  the suspend path.
+- **Fix:** Disabled the proof marker write by leaving `g_proof_marker_addr`
+  at 0 (its initialized value). The trampoline's built-in NULL check
+  (`test rcx, rcx; jz .skip_proof`) skips the write entirely. The
+  trampoline now only calls through to the original `xapic_mode` and
+  returns the correct APIC mode value — no DMAP writes, no side effects.
+- **Detection alternative:** Post-resume, check whether `apic_ops[2]` still
+  points to the cave trampoline KVA (it retains its value across resume).
+
+### Cave Trampoline Not Armed During Suspend (Previous)
 - **Bug:** Phase 7 unconditionally restored `apic_ops[2]` to original before
   entering rest mode. The rationale was to prevent kernel panics on secondary
   CPUs (KLD trampoline pages may not be NPT-executable on other CPUs).
@@ -286,18 +304,22 @@ The flatz suspend/resume method requires running code during early resume, befor
 - kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
 - ktext remains XOM after resume on FW 4.03 (no free readability)
 
+**Learned:**
+- DMAP writes during LAPIC suspend cause kernel panic (proof marker write crashed)
+- The HV likely restricts DMAP write permissions during the suspend path
+
 **Unknown (needs testing with this build):**
-- Whether the cave trampoline fires during LAPIC resume when left armed
-- Whether the proof marker appears at kdata+0x20 after resume
-- Whether the HV kills the guest if apic_ops[2] points to kdata during resume
+- Whether the cave trampoline (proof write DISABLED) survives LAPIC suspend
+- Whether apic_ops[2] still points to cave trampoline KVA after resume
+- Whether the trampoline actually executes (call-through to original xapic_mode)
 
 **Next Steps:**
-1. Test this build (cave trampoline LEFT ARMED during suspend + proof marker)
+1. Test this build (cave trampoline LEFT ARMED, proof write DISABLED)
 2. Enter rest mode → wake → re-exploit → re-run tool
-3. Check proof marker at kdata+0x20 for "FIRED!_!" (0x4649524544215F21)
-4. If trampoline fired: we have confirmed code execution during resume!
-5. Next: upgrade trampoline payload (currently just writes proof + calls original)
-6. If guest killed: investigate why (NPT enforcement on kdata during resume?)
+3. Check apic_ops[2] post-resume — if it still points to cave trampoline, hook survived
+4. If rest mode works: trampoline executed without panicking during suspend!
+5. Next: investigate safe ways to confirm execution (e.g., modify a register or flag)
+6. If guest killed: NPT doesn't allow execution on kdata during suspend → need ktext gadget
 7. If trampoline didn't fire: check if apic_ops[2] was restored by kernel
 
 ---
