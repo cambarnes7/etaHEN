@@ -1829,7 +1829,7 @@ static void campaign_kmod_kldload(void) {
          * If kldstat reported a module base address, try reading directly
          * from there first (saves the expensive full scan). */
         uint64_t trampoline_kva = 0;
-        uint8_t hdr[64];
+        uint8_t hdr[256];
 
         if (kfs.address != 0) {
             printf("[*] Trying kldstat-reported base 0x%lx...\n",
@@ -2150,7 +2150,7 @@ static void campaign_kmod_kldload(void) {
                                 trampoline_kva = page_va + off;
                                 /* Copy 64 bytes starting from the trampoline into hdr */
                                 int avail = 4096 - off;
-                                if (avail > 64) avail = 64;
+                                if (avail > (int)sizeof(hdr)) avail = (int)sizeof(hdr);
                                 memcpy(hdr, full_page + off, avail);
                                 printf("[+] FOUND trampoline at VA 0x%lx (page offset 0x%x)!\n",
                                        (unsigned long)trampoline_kva, off);
@@ -2337,15 +2337,17 @@ static void campaign_kmod_kldload(void) {
          *     g_trampoline_target's actual KVA.
          *
          * Layout (from objdump -d hv_kmod.ko):
-         *   0x00: hv_idt_trampoline  (35 bytes)
-         *   0x23: trampoline_xapic_mode:
+         *   0x00: hv_idt_trampoline  (35 bytes, padded to 0x30)
+         *   0x30: gp_handler          (92 bytes, ends at 0x8b)
+         *   0x8b: trampoline_xapic_mode:
          *         55              push rbp
          *         48 8b 05 XX..   mov disp32(%rip), %rax  ← g_trampoline_target
-         *   The 4-byte displacement at hdr[0x27..0x2a] is RIP-relative
-         *   from offset 0x2b (end of the 7-byte mov instruction). */
-        #define KMOD_XAPIC_OFFSET  0x23
-        #define KMOD_DISP_OFFSET   0x27
-        #define KMOD_DISP_RIP      0x2B  /* RIP after mov instruction */
+         *   The 4-byte displacement at hdr[0x8f..0x92] is RIP-relative
+         *   from offset 0x93 (end of the 7-byte mov instruction). */
+        #define KMOD_GP_OFFSET     0x30
+        #define KMOD_XAPIC_OFFSET  0x8B
+        #define KMOD_DISP_OFFSET   0x8F
+        #define KMOD_DISP_RIP      0x93  /* RIP after mov instruction */
 
         if (trampoline_kva && !g_kmod_trampoline_func) {
             if (hdr[KMOD_XAPIC_OFFSET]   == 0x55 &&  /* push rbp */
@@ -2365,6 +2367,11 @@ static void campaign_kmod_kldload(void) {
                        (unsigned long)g_kmod_trampoline_func, KMOD_XAPIC_OFFSET);
                 printf("    g_trampoline_target     = 0x%016lx (RIP+disp32, disp=%d)\n",
                        (unsigned long)g_kmod_trampoline_target, (int)disp);
+
+                /* gp_handler is at known offset 0x30 in kmod .text */
+                g_kmod_gp_handler = trampoline_kva + KMOD_GP_OFFSET;
+                printf("    gp_handler()            = 0x%016lx (page + 0x%x)\n",
+                       (unsigned long)g_kmod_gp_handler, KMOD_GP_OFFSET);
             } else {
                 printf("[!] trampoline_xapic_mode signature mismatch at +0x%x:\n",
                        KMOD_XAPIC_OFFSET);
@@ -4753,13 +4760,21 @@ idt_skip: ;
         }
     }
 
-    /* Always check for gp_handler KVA (Phase 9), independent of trampoline status */
-    printf("    results->gp_handler_kva = 0x%016lx\n",
-           (unsigned long)results->gp_handler_kva);
-    if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
-        g_kmod_gp_handler = results->gp_handler_kva;
-        printf("    gp_handler()            = 0x%016lx\n",
+    /* gp_handler KVA: prefer scanner-computed value (set above from offset 0x30).
+     * Result buffer value is unreliable (R_X86_64_32S not resolved by PS5 linker). */
+    printf("\n[*] Phase 9 gp_handler status:\n");
+    if (g_kmod_gp_handler) {
+        printf("    [OK] gp_handler = 0x%016lx (from scanner)\n",
                (unsigned long)g_kmod_gp_handler);
+    } else {
+        printf("    [-] gp_handler not set by scanner.\n");
+        printf("    results->gp_handler_kva = 0x%016lx (likely unresolved reloc)\n",
+               (unsigned long)results->gp_handler_kva);
+        if (results->gp_handler_kva != 0) {
+            g_kmod_gp_handler = results->gp_handler_kva;
+            printf("    Using result buffer fallback: 0x%016lx\n",
+                   (unsigned long)g_kmod_gp_handler);
+        }
     }
 
     /* Step 5: Unload the module (skip if Phase 7 needs it) */
