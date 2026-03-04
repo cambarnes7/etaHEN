@@ -412,12 +412,22 @@ static void hv_init(const void *arg __attribute__((unused))) {
     campaign_vmmcall_iommu();
 #endif
 
-    /* Record trampoline addresses for Phase 7 */
-    hv_results.trampoline_func_kva = (uint64_t)&trampoline_xapic_mode;
-    hv_results.trampoline_target_kva = (uint64_t)&g_trampoline_target;
-
-    /* Record #GP handler address for Phase 9 */
-    hv_results.gp_handler_kva = (uint64_t)&gp_handler;
+    /* Record trampoline addresses for Phase 7.
+     *
+     * CRITICAL: Use RIP-relative LEA instead of (uint64_t)&sym.
+     * Direct casts generate R_X86_64_64 (absolute 64-bit) relocations
+     * that PS5's kernel linker does NOT resolve — the values stay 0.
+     * LEA with (%rip) generates R_X86_64_PC32 relocations which the
+     * PS5 linker DOES resolve (proven by 'call hv_init' working). */
+    {
+        uint64_t addr;
+        __asm__ volatile("lea trampoline_xapic_mode(%%rip), %0" : "=r"(addr));
+        hv_results.trampoline_func_kva = addr;
+        __asm__ volatile("lea g_trampoline_target(%%rip), %0" : "=r"(addr));
+        hv_results.trampoline_target_kva = addr;
+        __asm__ volatile("lea gp_handler(%%rip), %0" : "=r"(addr));
+        hv_results.gp_handler_kva = addr;
+    }
 
     /* Mark completion */
     memory_barrier();

