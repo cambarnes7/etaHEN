@@ -304,11 +304,10 @@ static int discover_dmap_base(void) {
 static int init_fw_offsets(void) {
     g_fw_version = kernel_get_fw_version() & 0xFFFF0000;
     g_kdata_base = KERNEL_ADDRESS_DATA_BASE;
-    g_ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    /* ktext_base discovered later via IDT after DMAP is available */
 
     printf("[*] FW version: 0x%lx\n", g_fw_version);
     printf("[*] Kernel data base: 0x%lx\n", g_kdata_base);
-    printf("[*] Kernel text base: 0x%lx\n", g_ktext_base);
 
     /*
      * SBL mailbox offsets (relative to kernel data base).
@@ -552,6 +551,71 @@ static uint64_t va_to_pa_quiet(uint64_t va) {
     kernel_copyout(g_dmap_base + (e & PTE_PA_MASK) + ((va >> 12) & 0x1FF) * 8, &e, 8);
     if (!(e & PTE_PRESENT)) return 0;
     return (e & PTE_PA_MASK) | (va & 0xFFF);
+}
+
+/* ─── Kernel text base discovery ─── */
+
+/*
+ * Discover kernel text base by reading the IDT.
+ * SIDT (unprivileged on AMD64) gives us the IDT base in kdata.
+ * We then read IDT[0] (#DE handler) via DMAP to get a handler KVA
+ * in kernel .text, and align down to 2MB to find ktext_base.
+ *
+ * Requires: g_dmap_base and g_cr3_phys must already be set.
+ */
+static int discover_ktext_base(void) {
+    if (!g_dmap_base || !g_cr3_phys) {
+        printf("[-] discover_ktext_base: DMAP/CR3 not available\n");
+        return -1;
+    }
+
+    /* Read IDTR (unprivileged on AMD64) */
+    struct {
+        uint16_t limit;
+        uint64_t base;
+    } __attribute__((packed)) idtr;
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+
+    if (idtr.limit < 15 || !idtr.base) {
+        printf("[-] discover_ktext_base: invalid IDTR (base=0x%lx, limit=0x%x)\n",
+               (unsigned long)idtr.base, idtr.limit);
+        return -1;
+    }
+
+    /* Walk page tables to get IDT physical address */
+    uint64_t idt_pa = va_to_pa_quiet(idtr.base);
+    if (!idt_pa) {
+        printf("[-] discover_ktext_base: IDT VA 0x%lx not mapped\n",
+               (unsigned long)idtr.base);
+        return -1;
+    }
+
+    /* Read IDT[0] gate descriptor (16 bytes) via DMAP */
+    uint8_t gate[16];
+    if (kernel_copyout(g_dmap_base + idt_pa, gate, 16) != 0) {
+        printf("[-] discover_ktext_base: failed to read IDT[0] via DMAP\n");
+        return -1;
+    }
+
+    /* Extract handler address from gate descriptor */
+    uint16_t lo, mid;
+    uint32_t hi;
+    memcpy(&lo, gate + 0, 2);
+    memcpy(&mid, gate + 6, 2);
+    memcpy(&hi, gate + 8, 4);
+    uint64_t handler = (uint64_t)lo | ((uint64_t)mid << 16) | ((uint64_t)hi << 32);
+
+    if (handler < 0xFFFF800000000000ULL) {
+        printf("[-] discover_ktext_base: IDT[0] handler 0x%lx not in kernel space\n",
+               (unsigned long)handler);
+        return -1;
+    }
+
+    /* Align down to 2MB boundary — kernel .text starts at a 2MB-aligned address */
+    g_ktext_base = handler & ~0x1FFFFFULL;
+    printf("[+] Kernel text base discovered: 0x%lx (from IDT[0] handler 0x%lx)\n",
+           (unsigned long)g_ktext_base, (unsigned long)handler);
+    return 0;
 }
 
 /* ─── Direct MMIO SBL communication ─── */
@@ -934,7 +998,7 @@ static void campaign_kernel_recon(void) {
     printf("=============================================\n\n");
 
     /* Print kernel addresses */
-    printf("[*] KERNEL_ADDRESS_TEXT_BASE  = 0x%lx\n", KERNEL_ADDRESS_TEXT_BASE);
+    printf("[*] g_ktext_base (from IDT)  = 0x%lx\n", g_ktext_base);
     printf("[*] KERNEL_ADDRESS_DATA_BASE = 0x%lx\n", KERNEL_ADDRESS_DATA_BASE);
     printf("[*] KERNEL_ADDRESS_ALLPROC   = 0x%lx\n", KERNEL_ADDRESS_ALLPROC);
     printf("[*] DMAP base                = 0x%lx\n", g_dmap_base);
@@ -1565,16 +1629,18 @@ static void campaign_kmod_kldload(void) {
 
     /* ── Step 2: Patch g_output_kva in .ko with result buffer KVA ──
      *
-     * On PS5 FW 4.03 the kernel linker DOES load module code/data into
-     * dynamically-allocated kernel memory (confirmed by trampoline scanner
-     * finding and executing hv_idt_trampoline via IDT hook).  GMET is not
-     * enforced until FW 6.50, so this memory is NPT-executable.
+     * On PS5 FW 4.03 the kernel linker loads module code/data into
+     * dynamically-allocated kernel memory.  The kernel linker processes
+     * SYSINIT/MOD_LOAD and invokes hv_init automatically.
      *
-     * The kernel linker does NOT process SYSINIT or MOD_LOAD, so we use
-     * the IDT hook path (Step 4b) to invoke hv_init manually.
+     * Module .text is XOM (execute-only under NPT) — the trampoline
+     * scanner cannot read it via DMAP.  Instead, the kmod computes its
+     * own function addresses using RIP-relative LEA (R_X86_64_PC32
+     * relocations, which PS5's linker resolves) and writes them to the
+     * shared result buffer.
      *
-     * Phase 9 depends on gp_handler living in this NPT-executable KLD
-     * .text memory — kdata cave is NX under NPT. */
+     * Phase 9 uses an inline handler in kdata cave (same 2MB NPT page
+     * as kdata_base, proven executable via PTE NX-clear + sysent hook). */
 
     /* Copy .ko to modifiable buffer */
     void *ko_buf = malloc((size_t)KMOD_KO_SZ);
@@ -1714,12 +1780,12 @@ static void campaign_kmod_kldload(void) {
     /* ── Step 3: Load the kernel module via kldload(2) ──
      *
      * On PS5 FW 4.03, kldload allocates kernel memory, copies module
-     * code/data, and handles R_X86_64_PC32 relocations.  It does NOT
-     * process SYSINIT/MOD_LOAD, so hv_init won't run automatically —
-     * we invoke it manually via IDT hook in Step 4b.
+     * code/data, handles R_X86_64_PC32 relocations, and processes
+     * SYSINIT/MOD_LOAD (hv_init runs automatically).
      *
-     * The loaded .text pages are NPT-executable (GMET not enforced on
-     * FW < 6.50), which is critical for Phase 9's gp_handler. */
+     * Module .text is XOM under NPT — unreadable via DMAP.  The kmod
+     * uses RIP-relative LEA to compute its own function addresses and
+     * writes them to the shared result buffer. */
     printf("\n[*] Step 3: Loading kernel module via kldload...\n");
     int kid = syscall(SYS_kldload, "/data/etaHEN/hv_kmod.ko");
     if (kid < 0) {
@@ -4747,7 +4813,18 @@ idt_skip: ;
         }
     }
 
-    /* Check Phase 7 trampoline status */
+    /* Check Phase 7 trampoline status.
+     *
+     * Two sources for KLD addresses:
+     *   1. Scanner: walks kernel memory, matches trampoline machine code,
+     *      decodes .text layout.  Fails when module .text is XOM (NPT
+     *      enforces execute-only — DMAP reads return zeros).
+     *   2. Result buffer: kmod's hv_init() computes addresses via LEA
+     *      with RIP-relative addressing (R_X86_64_PC32 relocations,
+     *      which PS5's linker resolves).  Reliable when KMOD_MAGIC found.
+     *
+     * Prefer scanner (verified by signature match), fall back to result
+     * buffer (which now works thanks to the LEA fix in hv_kld.c). */
     printf("\n[*] Phase 7 trampoline address status:\n");
     if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
         printf("    [OK] Addresses computed from scanner (machine code decode).\n");
@@ -4755,39 +4832,48 @@ idt_skip: ;
                (unsigned long)g_kmod_trampoline_func);
         printf("    g_trampoline_target     = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_target);
+    } else if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
+        /* Result buffer has valid addresses (LEA-computed in kmod) */
+        g_kmod_trampoline_func = results->trampoline_func_kva;
+        g_kmod_trampoline_target = results->trampoline_target_kva;
+        g_kmod_kid = kid;
+        printf("    [OK] Addresses from result buffer (RIP-relative LEA).\n");
+        printf("    trampoline_xapic_mode() = 0x%016lx\n",
+               (unsigned long)g_kmod_trampoline_func);
+        printf("    g_trampoline_target     = 0x%016lx\n",
+               (unsigned long)g_kmod_trampoline_target);
     } else {
-        /* Last-resort fallback: try result buffer (R_X86_64_32S relocs) */
-        printf("    Scanner-based computation didn't set addresses.\n");
-        printf("    Trying result buffer fallback...\n");
+        printf("    [-] Scanner didn't find trampoline (XOM prevents DMAP read).\n");
+        printf("    [-] Result buffer also has zeros (kmod LEA fix not applied?).\n");
         printf("    results->trampoline_func_kva  = 0x%lx\n",
                (unsigned long)results->trampoline_func_kva);
         printf("    results->trampoline_target_kva = 0x%lx\n",
                (unsigned long)results->trampoline_target_kva);
-        if (results->trampoline_func_kva != 0 && results->trampoline_target_kva != 0) {
-            g_kmod_trampoline_func = results->trampoline_func_kva;
-            g_kmod_trampoline_target = results->trampoline_target_kva;
-            g_kmod_kid = kid;
-            printf("    [OK] Got addresses from result buffer.\n");
-        } else {
-            printf("    [-] Result buffer also has zeros.\n");
-        }
     }
 
-    /* gp_handler KVA: prefer scanner-computed value (set above from offset 0x30).
-     * Result buffer value is unreliable (R_X86_64_32S not resolved by PS5 linker). */
+    /* gp_handler KVA: prefer scanner-computed value, fall back to result
+     * buffer (now reliable via LEA in kmod).
+     *
+     * NOTE: Even with a valid gp_handler KVA, the KLD handler cannot be
+     * PATCHED at runtime because module .text is XOM under NPT — DMAP
+     * reads return zeros.  Phase 9 uses the inline handler in kdata cave
+     * instead (self-contained, no patching needed). */
     printf("\n[*] Phase 9 gp_handler status:\n");
     if (g_kmod_gp_handler) {
         printf("    [OK] gp_handler = 0x%016lx (from scanner)\n",
                (unsigned long)g_kmod_gp_handler);
+    } else if (results->gp_handler_kva != 0) {
+        g_kmod_gp_handler = results->gp_handler_kva;
+        printf("    [OK] gp_handler = 0x%016lx (from result buffer, RIP-relative LEA)\n",
+               (unsigned long)g_kmod_gp_handler);
     } else {
-        printf("    [-] gp_handler not set by scanner.\n");
-        printf("    results->gp_handler_kva = 0x%016lx (likely unresolved reloc)\n",
-               (unsigned long)results->gp_handler_kva);
-        if (results->gp_handler_kva != 0) {
-            g_kmod_gp_handler = results->gp_handler_kva;
-            printf("    Using result buffer fallback: 0x%016lx\n",
-                   (unsigned long)g_kmod_gp_handler);
-        }
+        printf("    [-] gp_handler not available (scanner failed + result buffer zero).\n");
+    }
+    /* XOM caveat: KLD handler can't be patched via DMAP (read returns zeros).
+     * Phase 9 will use the inline handler in kdata cave instead. */
+    if (g_kmod_gp_handler) {
+        printf("    [!] KLD .text is XOM — handler unreadable/unpatchable via DMAP.\n");
+        printf("    [!] Phase 9 will use inline handler in kdata cave.\n");
     }
 
     /* Step 5: Unload the module (skip if Phase 7 needs it) */
@@ -5883,37 +5969,35 @@ static void campaign_flatz_setup(void) {
         printf("=============================================\n\n");
         fflush(stdout);
 
-        /* ── Phase 9: Build inline handler + arm via KLD ──
+        /* ── Phase 9: Build inline handler + arm ──
          *
-         * The kdata cave handler is NX under NPT — can't execute directly.
-         * CONFIRMED BY TESTING: arming with kdata handler causes panic.
+         * Technique from ps5-kstuff "On offsets" documentation:
+         *   - Pointer poisoning: top 16 bits → 0xdeb7 (non-canonical)
+         *   - #GP fires on call through poisoned pointer
+         *   - Custom IDT[13] handler restores everything, iretq re-executes
          *
-         * SOLUTION (from ps5-kstuff "On offsets" documentation):
-         * Use the KLD module's gp_handler() in .text section.  The kernel
-         * linker allocates module memory dynamically — the HV's NPT does
-         * NOT mark dynamically-allocated pages as NX (GMET not enforced
-         * on FW 4.03).  This is proven by INT 210 → hv_idt_trampoline
-         * working during campaign_kmod_kldload.
+         * Handler placement: the inline handler lives in a kdata cave.
+         * Ring-0 code execution at kdata_base is PROVEN via PTE NX-clear
+         * + sysent hook.  The cave shares the same 2MB NPT page, so it
+         * has the same NPT execute permission.
+         *
+         * Previously we tried using the KLD module's gp_handler in .text,
+         * but module .text is XOM (execute-only under NPT) — DMAP reads
+         * return zeros, so the 6 magic immediates can't be patched.
+         * The inline handler avoids this: all addresses are baked in at
+         * construction time, no runtime patching needed.
          *
          * Flow:
-         *   1. Build inline handler (diagnostic, written to cave)
-         *   2. Write cave metadata (IDT backup, xapic, markers)
-         *   3. If KLD gp_handler available:
-         *      a. Patch 6 magic immediates in KLD handler via DMAP
-         *      b. Redirect IDT[13] → KLD handler (IST=3)
-         *      c. Set IST3 → cave stack (cave+0x100)
-         *      d. Poison apic_ops[2] with 0xdeb7 prefix
-         *   4. On next xapic_mode() call:
-         *      #GP fires → KLD handler runs → restores everything → iretq
+         *   1. Build inline handler (all addresses baked in)
+         *   2. Write handler + metadata to cave via DMAP
+         *   3. Clear cave page guest PTE NX bit
+         *   4. If cave is NPT-executable:
+         *      a. Redirect IDT[13] → inline handler (IST=3)
+         *      b. Set IST3 → cave stack (cave+0x100)
+         *      c. Poison apic_ops[2] with 0xdeb7 prefix
+         *   5. On next xapic_mode() call:
+         *      #GP fires → inline handler runs → restores → iretq
          */
-        if (g_kmod_gp_handler) {
-            printf("[*] Phase 9: KLD gp_handler available — will ARM.\n\n");
-        } else {
-            printf("[!] Phase 9: DIAGNOSTIC ONLY — KLD handler not loaded.\n");
-            printf("    Inline handler in kdata cave is NX under NPT.\n\n");
-        }
-        fflush(stdout);
-
         if (!idt_pa || !tss_pa) {
             printf("[-] IDT/TSS PA not resolved — cannot arm Phase 9.\n");
             fflush(stdout);
@@ -5979,7 +6063,11 @@ static void campaign_flatz_setup(void) {
         if (cave_npt_executable) {
             printf("[+] Cave PA 0x%lx in same 2MB NPT page as kdata_base PA 0x%lx — NPT-executable!\n",
                    (unsigned long)cave_pa, (unsigned long)kdata_base_pa);
+            printf("[*] Phase 9: Cave is NPT-executable — will ARM with inline handler.\n");
+        } else {
+            printf("[!] Phase 9: DIAGNOSTIC ONLY — cave not in NPT-executable range.\n");
         }
+        fflush(stdout);
 
         /* Save cave KVA in FLATZHOO marker (offset 0x18) */
         {
@@ -6271,19 +6359,22 @@ static void campaign_flatz_setup(void) {
 
         printf("[+] Cave data written (IDT backup, xapic, markers)\n");
 
-        /* ── Phase 9: Arm using KLD handler (NPT-executable) ──
-         *
-         * The kdata cave handler is NX under NPT — can't execute it.
-         * BUT: the KLD module's .text is in dynamically-allocated kernel
-         * memory, which IS NPT-executable (GMET not enforced on FW 4.03).
-         * This is proven by the INT 210 → hv_idt_trampoline path working.
+        /* ── Phase 9: Arm using inline handler (NPT-executable cave) ──
          *
          * Technique from ps5-kstuff "On offsets" documentation:
-         *   - Pointer poisoning: replace top 16 bits with 0xdeb7
+         *   - Pointer poisoning: top 16 bits → 0xdeb7 (non-canonical)
          *   - Non-canonical address causes #GP on dereference
-         *   - IDT[13] → our gp_handler in KLD .text (NPT-executable)
+         *   - IDT[13] → inline handler in cave (NPT-executable)
          *   - Handler restores IDT[13] + apic_ops[2] + IST3
          *   - iretq re-executes the call with the valid pointer
+         *
+         * The inline handler is preferred over the KLD handler because:
+         *   - Module .text is XOM (execute-only under NPT) — can't read
+         *     or patch the KLD handler's magic immediates via DMAP
+         *   - The inline handler has all addresses baked in at construction
+         *     time — no runtime patching needed
+         *   - Ring-0 execution at kdata_base is PROVEN (PTE NX-clear +
+         *     sysent hook test) — cave in same 2MB NPT page is executable
          *
          * The handler is one-shot: after it fires, everything is restored
          * and the system continues with normal #GP handling.
@@ -6291,188 +6382,17 @@ static void campaign_flatz_setup(void) {
 
         int phase9_armed = 0;
 
-        if (g_kmod_gp_handler) {
-            printf("\n[+] KLD gp_handler available at 0x%016lx\n",
-                   (unsigned long)g_kmod_gp_handler);
-            printf("[*] Using KLD .text for #GP handler (NPT-executable)\n");
-
-            /* Resolve KLD handler physical address */
-            uint64_t gp_pa = va_to_pa_quiet(g_kmod_gp_handler);
-            if (!gp_pa) {
-                printf("[-] Cannot resolve gp_handler PA — skipping arm.\n");
-                goto phase9_not_armed;
-            }
-            printf("[+] KLD handler PA: 0x%lx\n", (unsigned long)gp_pa);
-
-            /* Read KLD handler bytes via DMAP */
-            uint8_t gp_buf[256];
-            kernel_copyout(g_dmap_base + gp_pa, gp_buf, sizeof(gp_buf));
-
-            /* Patch the 6 magic immediates in the handler:
-             *   0xDEAD000000000001 → IDT backup source (DMAP addr of cave+0x100)
-             *   0xDEAD000000000002 → IDT[13] destination (DMAP addr)
-             *   0xDEAD000000000003 → original xapic_mode VALUE
-             *   0xDEAD000000000004 → apic_ops[2] DMAP addr
-             *   0xDEAD000000000005 → original IST3 VALUE
-             *   0xDEAD000000000006 → IST3 DMAP addr
-             */
-            uint64_t magics[6] = {
-                0xDEAD000000000001ULL, 0xDEAD000000000002ULL,
-                0xDEAD000000000003ULL, 0xDEAD000000000004ULL,
-                0xDEAD000000000005ULL, 0xDEAD000000000006ULL,
-            };
-            uint64_t values[6] = {
-                cave_dmap + 0x100,      /* 1: IDT backup source (DMAP) */
-                idt13_dmap_addr,        /* 2: IDT[13] destination (DMAP) */
-                orig_xapic_value,       /* 3: original xapic_mode VALUE */
-                apic_ops2_dmap,         /* 4: apic_ops[2] DMAP addr */
-                orig_ist3,              /* 5: original IST3 VALUE */
-                ist3_dmap,              /* 6: IST3 DMAP addr */
-            };
-
-            int patched = 0;
-            for (int m = 0; m < 6; m++) {
-                int found = 0;
-                for (int off = 0; off < (int)(sizeof(gp_buf) - 8); off++) {
-                    uint64_t v;
-                    memcpy(&v, &gp_buf[off], 8);
-                    if (v == magics[m]) {
-                        memcpy(&gp_buf[off], &values[m], 8);
-                        printf("    Magic %d patched at handler+0x%02x → 0x%016lx\n",
-                               m + 1, off, (unsigned long)values[m]);
-                        found = 1;
-                        patched++;
-                        break;
-                    }
-                }
-                if (!found) {
-                    printf("[-] Magic %d (0x%016lx) not found in handler!\n",
-                           m + 1, (unsigned long)magics[m]);
-                }
-            }
-
-            if (patched != 6) {
-                printf("[-] Only %d/6 magics patched — aborting arm.\n", patched);
-                goto phase9_not_armed;
-            }
-            printf("[+] All 6 magic values patched in KLD handler\n");
-
-            /* Write patched handler back to KLD .text via DMAP */
-            kernel_copyin(gp_buf, g_dmap_base + gp_pa, sizeof(gp_buf));
-
-            /* Verify write-back */
-            uint8_t gp_verify[256];
-            kernel_copyout(g_dmap_base + gp_pa, gp_verify, sizeof(gp_verify));
-            if (memcmp(gp_buf, gp_verify, sizeof(gp_buf))) {
-                printf("[-] Handler write-back verification FAILED — aborting.\n");
-                goto phase9_not_armed;
-            }
-            printf("[+] KLD handler patched and verified OK\n");
-
-            /* Dump first 88 bytes of patched handler */
-            printf("    Patched bytes: ");
-            for (int i = 0; i < 88 && i < (int)sizeof(gp_buf); i++)
-                printf("%02x ", gp_buf[i]);
-            printf("\n");
-
-            /* ── ARM Step 1: Patch IDT[13] → KLD gp_handler ──
-             *
-             * Build new IDT gate for vector 13 (#GP):
-             *   handler  = g_kmod_gp_handler (KLD .text, NPT-executable)
-             *   selector = kernel CS (from original IDT[13])
-             *   IST      = 3 (use IST3 stack from TSS — our cave stack)
-             *   DPL      = 0 (kernel only — #GP is hardware-generated)
-             *   type     = 0xE (64-bit interrupt gate, clears IF)
-             *   P        = 1 (present)
-             */
-            uint8_t new_idt13[16];
-            memcpy(new_idt13, idt13_orig, 16);  /* start from original */
-
-            uint64_t ht = g_kmod_gp_handler;
-            new_idt13[0]  = (uint8_t)(ht & 0xFF);
-            new_idt13[1]  = (uint8_t)((ht >> 8) & 0xFF);
-            /* [2..3] = selector (keep from original) */
-            new_idt13[4]  = (idt13_orig[4] & 0xF8) | 3;  /* IST = 3 */
-            /* [5] = type_attr: keep P=1, DPL=0, type=0xE from original */
-            new_idt13[6]  = (uint8_t)((ht >> 16) & 0xFF);
-            new_idt13[7]  = (uint8_t)((ht >> 24) & 0xFF);
-            new_idt13[8]  = (uint8_t)((ht >> 32) & 0xFF);
-            new_idt13[9]  = (uint8_t)((ht >> 40) & 0xFF);
-            new_idt13[10] = (uint8_t)((ht >> 48) & 0xFF);
-            new_idt13[11] = (uint8_t)((ht >> 56) & 0xFF);
-            /* [12..15] = reserved (keep zeros from original) */
-
-            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
-            printf("[+] IDT[13] → 0x%016lx (KLD gp_handler, IST=3)\n",
-                   (unsigned long)ht);
-
-            /* ── ARM Step 2: Set IST3 → cave stack ──
-             *
-             * IST3 is the stack pointer for IST=3 interrupts.
-             * Point it to cave+0x100 (top of 256-byte stack area).
-             * CPU pushes SS/RSP/RFLAGS/CS/RIP/errcode here on #GP.
-             */
-            uint64_t new_ist3 = cave_kva + 0x100;
-            kernel_copyin(&new_ist3, ist3_dmap, 8);
-            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3);
-
-            /* ── ARM Step 3: Poison apic_ops[2] ──
-             *
-             * Replace top 16 bits with 0xdeb7 (ps5-kstuff dead pointer).
-             * This makes the address non-canonical → #GP on dereference.
-             * The handler restores the original value on first #GP.
-             */
-            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
-                                (0xDEB7ULL << 48);
-            kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
-            printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
-                   (unsigned long)original_xapic, (unsigned long)poisoned);
-
-            phase9_armed = 1;
-
-            printf("\n[+] ============================================\n");
-            printf("[+]  PHASE 9 — ARMED (flatz pointer poisoning)\n");
-            printf("[+] ============================================\n");
-            printf("[+]\n");
-            printf("[+]  Handler:      KLD gp_handler at 0x%lx (NPT-exec)\n",
-                   (unsigned long)g_kmod_gp_handler);
-            printf("[+]  Handler PA:   0x%lx\n", (unsigned long)gp_pa);
-            printf("[+]  IDT[13]:      → KLD handler (IST=3)\n");
-            printf("[+]  IST3:         → cave stack at 0x%lx\n",
-                   (unsigned long)new_ist3);
-            printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
-            printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
-                   (unsigned long)cave_kva, (unsigned long)cave_pa);
-            printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
-                   (unsigned long)orig_ist3);
-            printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
-                   (unsigned long)original_xapic);
-            printf("[+]\n");
-            printf("[+]  Next xapic_mode() call will trigger:\n");
-            printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
-                   (unsigned long)poisoned);
-            printf("[+]    2. CPU → IST3 stack → KLD gp_handler\n");
-            printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
-            printf("[+]    4. iretq re-executes call with valid pointer\n");
-            printf("[+]  System should continue normally after one-shot restore.\n");
-
-            notify("[HV Research] Phase 9 ARMED — #GP hook active!");
-        } else if (cave_npt_executable) {
+        if (cave_npt_executable) {
             /* ── ARM using inline handler in NPT-executable cave ──
              *
-             * KLD handler not available (kldload doesn't allocate code
-             * memory on PS5 FW 4.03 — module registered but .text not
-             * loaded into kernel VA space).
+             * The cave is in the same 2MB NPT page as kdata_base,
+             * where ring-0 code execution via PTE NX-clear is PROVEN.
+             * The inline handler has all addresses baked in (no relocs),
+             * so it works without reading XOM module code.
              *
-             * However, the cave is in the same 2MB NPT page as kdata_base,
-             * where ring-0 code execution via PTE NX-clear is PROVEN to work.
-             * The inline handler has all addresses baked in (no relocations),
-             * so we can use it directly — same technique as the ring-0 proof.
-             *
-             * The guest PTE NX-bit was already cleared above.  NPT allows
+             * Guest PTE NX-bit was already cleared above.  NPT allows
              * execution on this PA range.  Point IDT[13] → inline handler. */
-            printf("\n[+] KLD handler unavailable — using inline handler in NPT-executable cave\n");
+            printf("\n[+] Using inline handler in NPT-executable cave\n");
             printf("[*] Cave PA 0x%lx shares 2MB NPT page with kdata_base PA 0x%lx\n",
                    (unsigned long)cave_pa, (unsigned long)kdata_base_pa);
             printf("[*] Ring-0 execution at this PA range is PROVEN.\n\n");
@@ -6547,7 +6467,6 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 9 ARMED — inline handler in NPT-exec cave!");
         }
 
-phase9_not_armed:
         if (!phase9_armed) {
             printf("\n[+] ============================================\n");
             printf("[+]  PHASE 9 — DIAGNOSTIC COMPLETE (not armed)\n");
@@ -6565,17 +6484,10 @@ phase9_not_armed:
             printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
                    (unsigned long)original_xapic);
             printf("[+]\n");
-            if (!g_kmod_gp_handler && !cave_npt_executable) {
-                printf("[!]  NOT ARMED — KLD gp_handler unavailable and cave not NPT-executable.\n");
-                printf("[!]  Cave PA 0x%lx not in kdata_base 2MB NPT page (0x%lx).\n",
-                       (unsigned long)cave_pa, (unsigned long)(kdata_base_pa & ~0x1FFFFFULL));
-            } else if (!g_kmod_gp_handler) {
-                printf("[!]  NOT ARMED — KLD gp_handler not available.\n");
-                printf("[!]  Load kernel module first (campaign_kmod_kldload).\n");
-            } else {
-                printf("[!]  NOT ARMED — KLD handler patching failed.\n");
-            }
-            printf("[!]  Inline handler in kdata is NX under NPT.\n");
+            printf("[!]  NOT ARMED — cave not in NPT-executable range.\n");
+            printf("[!]  Cave PA 0x%lx not in kdata_base 2MB NPT page (0x%lx).\n",
+                   (unsigned long)cave_pa, (unsigned long)(kdata_base_pa & ~0x1FFFFFULL));
+            printf("[!]  Need cave in same 2MB page as kdata_base for NPT exec.\n");
 
             notify("[HV Research] Phase 9 diagnostic complete (not armed).");
         }
@@ -7040,6 +6952,13 @@ int main(void) {
     if (discover_dmap_base() != 0) {
         printf("[-] Failed to discover DMAP base\n");
         printf("[!] Continuing without DMAP (limited functionality)\n");
+    }
+
+    /* Step 2b: Discover kernel text base from IDT (needs DMAP) */
+    if (g_dmap_base) {
+        if (discover_ktext_base() != 0) {
+            printf("[!] Could not discover ktext base — some scans will be limited\n");
+        }
     }
 
     /* Step 3: Initialize direct SBL communication */

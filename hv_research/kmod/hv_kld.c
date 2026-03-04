@@ -412,12 +412,30 @@ static void hv_init(const void *arg __attribute__((unused))) {
     campaign_vmmcall_iommu();
 #endif
 
-    /* Record trampoline addresses for Phase 7 */
-    hv_results.trampoline_func_kva = (uint64_t)&trampoline_xapic_mode;
-    hv_results.trampoline_target_kva = (uint64_t)&g_trampoline_target;
-
-    /* Record #GP handler address for Phase 9 */
-    hv_results.gp_handler_kva = (uint64_t)&gp_handler;
+    /* Record trampoline addresses for Phase 7.
+     *
+     * CRITICAL: Use LEA with RIP-relative addressing instead of casting
+     * function pointers to uint64_t.  A plain cast like:
+     *   (uint64_t)&gp_handler
+     * generates an R_X86_64_64 relocation (absolute 64-bit address).
+     * PS5's kernel linker does NOT resolve R_X86_64_64 relocations,
+     * so the value stays 0 in the loaded module.
+     *
+     * LEA with (%rip) generates R_X86_64_PC32 (RIP-relative 32-bit
+     * displacement), which PS5's linker DOES resolve — proven by the
+     * `call hv_init` in hv_idt_trampoline working correctly. */
+    {
+        uint64_t tramp_func, tramp_target, gp_addr;
+        __asm__ volatile("leaq trampoline_xapic_mode(%%rip), %0"
+                         : "=r"(tramp_func));
+        __asm__ volatile("leaq g_trampoline_target(%%rip), %0"
+                         : "=r"(tramp_target));
+        __asm__ volatile("leaq gp_handler(%%rip), %0"
+                         : "=r"(gp_addr));
+        hv_results.trampoline_func_kva = tramp_func;
+        hv_results.trampoline_target_kva = tramp_target;
+        hv_results.gp_handler_kva = gp_addr;
+    }
 
     /* Mark completion */
     memory_barrier();
