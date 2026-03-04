@@ -18,6 +18,17 @@
 
 #include <ps5/kernel.h>
 
+/* ─── ktext_base fallback ───
+ * The ps5-payload-sdk CRT doesn't always export KERNEL_ADDRESS_TEXT_BASE.
+ * On FW 4.03 the ktext→kdata offset is ~0xA00000 (10 MB); we derive it
+ * from the known kstuff offset for nop_ret at kdata - 0x9d20ca, giving
+ * ktext_start ≈ kdata - 0x9d3000 (page-aligned).
+ * Computed at runtime in init_fw_offsets().
+ */
+#define NEED_KTEXT_BASE_COMPUTED 1
+static uint64_t _ktext_base_computed = 0;
+#define KERNEL_ADDRESS_TEXT_BASE _ktext_base_computed
+
 /* ─── Notification helper ─── */
 
 typedef struct {
@@ -301,6 +312,9 @@ static int discover_dmap_base(void) {
 static int init_fw_offsets(void) {
     g_fw_version = kernel_get_fw_version() & 0xFFFF0000;
     g_kdata_base = KERNEL_ADDRESS_DATA_BASE;
+
+    /* Compute ktext_base: kdata - 0x9d3000 (page-aligned, from kstuff offsets) */
+    _ktext_base_computed = g_kdata_base - 0x9d3000ULL;
     g_ktext_base = KERNEL_ADDRESS_TEXT_BASE;
 
     printf("[*] FW version: 0x%lx\n", g_fw_version);
@@ -5832,28 +5846,35 @@ static void campaign_flatz_setup(void) {
 
         /* Inspect current IDT[13] (#GP) — what we would replace */
         printf("\n[*] Current IDT[13] (#GP handler) — would be replaced:\n");
-        if (idt_pa) {
-            uint8_t *e13 = &idt_buf[13 * 16];
-            uint64_t gp_cur =
-                (uint64_t)(e13[0] | (e13[1] << 8)) |
-                ((uint64_t)(e13[6] | (e13[7] << 8)) << 16) |
-                ((uint64_t)(e13[8] | (e13[9] << 8) |
-                            (e13[10] << 16) |
-                            (e13[11] << 24)) << 32);
-            uint8_t gp_ist_cur = e13[4] & 0x7;
-            printf("    Handler: 0x%016lx  IST=%d\n",
-                   (unsigned long)gp_cur, gp_ist_cur);
-            printf("    Would change to: handler=0x%016lx  IST=3\n",
-                   (unsigned long)ks_add_rsp_iret);
-            printf("    Raw bytes: ");
-            for (int b = 0; b < 16; b++) printf("%02x ", e13[b]);
-            printf("\n");
+        {
+            uint64_t p9_ks_idt = g_kdata_base + KSTUFF_IDT_OFF;
+            uint64_t p9_idt_pa = va_to_pa_quiet(p9_ks_idt);
+            if (p9_idt_pa) {
+                uint8_t e13[16];
+                kernel_copyout(g_dmap_base + p9_idt_pa + 16 * 13, e13, 16);
+                uint64_t gp_cur =
+                    (uint64_t)(e13[0] | (e13[1] << 8)) |
+                    ((uint64_t)(e13[6] | (e13[7] << 8)) << 16) |
+                    ((uint64_t)(e13[8] | (e13[9] << 8) |
+                                (e13[10] << 16) |
+                                (e13[11] << 24)) << 32);
+                uint8_t gp_ist_cur = e13[4] & 0x7;
+                printf("    Handler: 0x%016lx  IST=%d\n",
+                       (unsigned long)gp_cur, gp_ist_cur);
+                printf("    Would change to: handler=0x%016lx  IST=3\n",
+                       (unsigned long)ks_add_rsp_iret);
+                printf("    Raw bytes: ");
+                for (int b = 0; b < 16; b++) printf("%02x ", e13[b]);
+                printf("\n");
+            } else {
+                printf("    IDT VA→PA failed — cannot inspect.\n");
+            }
         }
         fflush(stdout);
 
         /* Inspect TSS IST3 for all CPUs — what we would overwrite */
         printf("\n[*] Current TSS IST3 values (would be overwritten):\n");
-        if (tss_pa) {
+        {
             for (int cpu = 0; cpu < 16; cpu++) {
                 uint64_t tss_cpu = g_kdata_base + KSTUFF_TSS_OFF + 0x68 * cpu;
                 uint64_t tss_cpu_pa = va_to_pa_quiet(tss_cpu);
@@ -6012,7 +6033,10 @@ static void campaign_flatz_setup(void) {
         fflush(stdout);
 
         /* Overall readiness check */
-        int ready = gadgets_ok && idt_pa && tss_pa && best_cave_pa;
+        /* Re-check IDT/TSS accessibility for final readiness */
+        uint64_t p9_idt_check = va_to_pa_quiet(g_kdata_base + KSTUFF_IDT_OFF);
+        uint64_t p9_tss_check = va_to_pa_quiet(g_kdata_base + KSTUFF_TSS_OFF);
+        int ready = gadgets_ok && p9_idt_check && p9_tss_check && best_cave_pa;
 
         printf("\n[+] ============================================\n");
         printf("[+]  PHASE 9: DRY RUN COMPLETE\n");
