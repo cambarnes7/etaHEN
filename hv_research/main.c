@@ -5836,6 +5836,43 @@ static void campaign_flatz_setup(void) {
         printf("=============================================\n\n");
         fflush(stdout);
 
+        /* ── Phase 9 CANNOT be armed during normal operation ──
+         *
+         * The #GP handler lives in a kdata cave.  During normal operation,
+         * the HV's NPT (Nested Page Tables) enforces NX on ALL kdata pages.
+         * Clearing the guest PTE NX bit is not enough — NPT is the outer
+         * layer and takes precedence.
+         *
+         * If we poison apic_ops[2] now, the next xapic_mode() call triggers
+         * #GP, CPU fetches IDT[13] handler from kdata, NPT blocks execution
+         * → nested page fault → system freeze/crash.
+         *
+         * The handler is ONLY executable during early resume (before the HV
+         * reinitializes NPT).  But we need to arm the poison BEFORE suspend.
+         * This is a chicken-and-egg problem:
+         *   - Handler must be in executable memory (ktext or NPT-allowed)
+         *   - ktext is XOM — can't write to it via DMAP (NPT blocks writes)
+         *   - kdata is writable but NPT blocks execution
+         *
+         * SOLUTION NEEDED: Either:
+         *   a) Use ring-0 (sysent hook) to call pmap functions that make
+         *      the cave page executable in the NPT, or
+         *   b) Place handler in ktext by finding a writable ktext region, or
+         *   c) Use the etaHEN daemon's suspend hook to arm the poison at
+         *      the very last moment during ACPI S3 entry (when HV may be
+         *      partially shut down), or
+         *   d) Use a ktext gadget (e.g. Xinvtlb / push_pop_all_iret) as
+         *      a first-stage handler that pivots to our kdata handler
+         *
+         * For now: print diagnostics, build handler, verify cave, but
+         * DO NOT patch IDT[13] or poison apic_ops[2].
+         */
+        printf("[!] Phase 9: DIAGNOSTIC ONLY — not arming.\n");
+        printf("    Handler in kdata cave is NOT executable under NPT.\n");
+        printf("    Poisoning apic_ops[2] would crash the system.\n");
+        printf("    Need NPT-executable memory for handler first.\n\n");
+        fflush(stdout);
+
         if (!idt_pa || !tss_pa) {
             printf("[-] IDT/TSS PA not resolved — cannot arm Phase 9.\n");
             fflush(stdout);
@@ -6158,92 +6195,47 @@ static void campaign_flatz_setup(void) {
 
         printf("[+] Cave data written (IDT backup, xapic, markers)\n");
 
-        /* ── Patch IDT[13]: handler → cave handler, IST = 3 ── */
-        uint8_t idt13_new[16];
-        memcpy(idt13_new, idt13_orig, 16);
-        uint64_t h = handler_kva;
-        uint16_t h_lo = h & 0xFFFF;
-        uint16_t h_mid = (h >> 16) & 0xFFFF;
-        uint32_t h_hi = (h >> 32) & 0xFFFFFFFF;
-        memcpy(&idt13_new[0], &h_lo, 2);
-        memcpy(&idt13_new[6], &h_mid, 2);
-        memcpy(&idt13_new[8], &h_hi, 4);
-        idt13_new[4] = (idt13_orig[4] & 0xF8) | 0x03;  /* IST = 3 */
-
-        kernel_copyin(idt13_new, g_dmap_base + idt_pa + 16 * 13, 16);
-
-        /* Verify */
-        uint8_t idt13_verify[16];
-        kernel_copyout(g_dmap_base + idt_pa + 16 * 13, idt13_verify, 16);
-        if (memcmp(idt13_new, idt13_verify, 16)) {
-            /* Restore original on failure */
-            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
-            printf("[-] IDT[13] patch FAILED — restored original.\n");
-            fflush(stdout);
-            return;
-        }
-        printf("[+] IDT[13] patched → handler @ 0x%lx (IST=3)\n",
-               (unsigned long)handler_kva);
-
-        /* ── Set TSS IST3 for all CPUs → cave stack top ── */
-        uint64_t ist3_target = cave_kva + 0x100;  /* stack grows DOWN from here */
-        uint64_t ist3_off = 0x24 + 2 * 8;         /* = 0x34 = IST3 offset in TSS */
-        uint64_t orig_ist3 = 0;
-        kernel_copyout(g_dmap_base + tss_pa + ist3_off, &orig_ist3, 8);
-
-        /* Save original IST3 in cave+0x130 for diagnostics */
-        kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
-
-        int cpus_patched = 0;
-        for (int cpu = 0; cpu < 16; cpu++) {
-            uint64_t tp = va_to_pa_quiet(g_kdata_base + KSTUFF_TSS_OFF + 0x68 * cpu);
-            if (!tp) break;
-            kernel_copyin(&ist3_target, g_dmap_base + tp + ist3_off, 8);
-            cpus_patched++;
-        }
-        printf("[+] TSS IST3 set for %d CPUs → cave+0x100\n", cpus_patched);
-
-        /* ── Poison apic_ops[2]: top 16 bits → 0xdeb7 ── */
-        uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL)
-                          | 0xDEB7000000000000ULL;
-        kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
-
-        /* Verify poison was written */
-        uint64_t poison_check = 0;
-        kernel_copyout(g_dmap_base + ops_pa + 2 * 8, &poison_check, 8);
-        if (poison_check != poisoned) {
-            /* Critical failure — try to undo everything */
-            kernel_copyin(idt13_orig, g_dmap_base + idt_pa + 16 * 13, 16);
-            printf("[-] Pointer poison FAILED — IDT restored, aborting.\n");
-            fflush(stdout);
-            return;
-        }
-
-        printf("[+] apic_ops[2] poisoned: 0x%016lx → 0x%016lx\n",
-               (unsigned long)original_xapic, (unsigned long)poisoned);
-
+        /* ── Phase 9 summary (DIAGNOSTIC ONLY) ──
+         *
+         * NOT arming IDT[13], IST3, or apic_ops[2] poison.
+         *
+         * The handler lives in kdata (cave+0x180).  During normal
+         * operation, the HV's NPT enforces NX on kdata.  If we poison
+         * apic_ops[2], the next xapic_mode() call triggers #GP, CPU
+         * fetches handler from kdata, NPT blocks execution → crash.
+         *
+         * The guest PTE NX-clear is insufficient — NPT is the outer
+         * permission layer and overrides guest PTEs.  The handler is
+         * ONLY executable during early resume before HV sets up NPT.
+         *
+         * To proceed, we need one of:
+         *   a) Ring-0 execution to call pmap/NPT functions that mark
+         *      the cave page executable in the HV's NPT
+         *   b) A way to place handler code in ktext (NPT-executable)
+         *   c) A ktext first-stage handler (gadget) that pivots to
+         *      our kdata handler during the pre-NPT resume window
+         *   d) Arm the poison during ACPI S3 entry when HV may be
+         *      partially shut down
+         */
         printf("\n[+] ============================================\n");
-        printf("[+]  PHASE 9 ARMED — FLATZ METHOD READY\n");
-        printf("[+]  (inline handler, no kmod dependency)\n");
+        printf("[+]  PHASE 9 — DIAGNOSTIC COMPLETE\n");
         printf("[+] ============================================\n");
         printf("[+]\n");
-        printf("[+]  Handler  → cave+0x180 @ 0x%lx (%d bytes)\n",
-               (unsigned long)handler_kva, hc);
-        printf("[+]  IDT[13]  → handler (IST=3)\n");
-        printf("[+]  IST3     → cave+0x100 @ 0x%lx\n",
-               (unsigned long)ist3_target);
-        printf("[+]  apic_ops[2] = 0x%016lx (poisoned)\n",
-               (unsigned long)poisoned);
-        printf("[+]  Original xapic: 0x%016lx (backed up)\n",
+        printf("[+]  Handler built: %d bytes at cave+0x180\n", hc);
+        printf("[+]  Handler KVA:   0x%lx\n", (unsigned long)handler_kva);
+        printf("[+]  Cave KVA:      0x%lx  PA: 0x%lx\n",
+               (unsigned long)cave_kva, (unsigned long)cave_pa);
+        printf("[+]  Cave PTE NX:   cleared (guest PTE only)\n");
+        printf("[+]  IDT PA:        0x%lx\n", (unsigned long)idt_pa);
+        printf("[+]  TSS PA:        0x%lx\n", (unsigned long)tss_pa);
+        printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
                (unsigned long)original_xapic);
-        printf("[+]  Cave PTE NX cleared — handler executable\n");
         printf("[+]\n");
-        printf("[+]  Enter REST MODE now!\n");
-        printf("[+]  On resume: xapic_mode() → #GP → handler\n");
-        printf("[+]  → reads ktext proof → restores IDT → restores ptr\n");
-        printf("[+]  → iretq → call succeeds → normal boot\n");
+        printf("[!]  NOT ARMED — handler in kdata is NX under NPT.\n");
+        printf("[!]  Poisoning apic_ops[2] would crash the system.\n");
+        printf("[!]  Need NPT-executable memory for handler.\n");
 
-        notify("[HV Research] Phase 9 ARMED! Enter REST MODE!");
+        notify("[HV Research] Phase 9 diagnostic complete (not armed).");
 
         fflush(stdout);
         return;
