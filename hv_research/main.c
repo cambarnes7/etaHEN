@@ -5492,43 +5492,155 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Safe test armed. Enter REST MODE!");
         }
 
-        /* ─── Phase 8: IDT + TSS Reconnaissance ───
+        /* ─── Phase 8: IDT Reconnaissance ───
          *
          * The IDT lives in kdata (readable via DMAP) and contains
          * ktext pointers for every interrupt handler.  These are
          * the first concrete ktext addresses we can obtain without
          * being able to read ktext directly.
          *
-         * The TSS contains IST (Interrupt Stack Table) entries
-         * needed for the doreti_iret finding trick (flatz method).
+         * NOTE: sidt/sgdt/str hang on PS5 (HV intercepts them).
+         * Instead we find the IDT by scanning kdata for its
+         * distinctive pattern: consecutive 16-byte gate descriptors
+         * with consistent selector, present bit, and zero reserved
+         * bytes.
          *
          * This is purely diagnostic — no modifications.
          */
         printf("\n=============================================\n");
-        printf("  Phase 8: IDT + TSS Reconnaissance\n");
+        printf("  Phase 8: IDT Reconnaissance (kdata scan)\n");
         printf("=============================================\n\n");
+        fflush(stdout);
 
-        /* Step 1: Get IDTR via sidt (non-privileged instruction) */
-        struct {
-            uint16_t limit;
-            uint64_t base;
-        } __attribute__((packed)) idtr;
-        __asm__ volatile("sidt %0" : "=m"(idtr));
+        /*
+         * AMD64 IDT gate descriptor (16 bytes):
+         *   [0-1]   offset[15:0]
+         *   [2-3]   segment selector (kernel CS, typically 0x0020)
+         *   [4]     IST (bits 0-2), reserved (bits 3-7)
+         *   [5]     type/attr: P(7) DPL(6:5) 0(4) Type(3:0)
+         *           0x8E = present interrupt gate DPL=0
+         *           0x8F = present trap gate DPL=0
+         *           0xEE = present interrupt gate DPL=3
+         *   [6-7]   offset[31:16]
+         *   [8-11]  offset[63:32]
+         *   [12-15] reserved (MUST be 0)
+         *
+         * Scan strategy: read kdata 4KB at a time, check for runs
+         * of 20+ entries with consistent selector, valid type, and
+         * zeroed reserved field.
+         */
+        uint64_t idt_kva = 0;
+        uint64_t idt_pa_found = 0;
+        uint64_t scan_base = g_kdata_base;
+        uint64_t scan_size = 0x1000000; /* 16MB of kdata */
 
-        printf("[*] IDTR: base=0x%lx  limit=%u  entries=%d\n",
-               (unsigned long)idtr.base, idtr.limit,
-               (idtr.limit + 1) / 16);
+        printf("[*] Scanning kdata for IDT pattern (16MB from 0x%lx)...\n",
+               (unsigned long)scan_base);
+        fflush(stdout);
 
-        uint64_t idt_pa = va_to_pa_quiet(idtr.base);
-        if (!idt_pa) {
-            printf("[-] IDT VA→PA failed.\n");
+        uint8_t page[0x1000];
+        int pages_scanned = 0;
+
+        for (uint64_t off = 0; off < scan_size && !idt_kva;
+             off += 0x1000) {
+            uint64_t page_va = scan_base + off;
+            uint64_t page_pa = va_to_pa_quiet(page_va);
+            if (!page_pa) continue;
+
+            if (kernel_copyout(g_dmap_base + page_pa, page, 0x1000) != 0)
+                continue;
+            pages_scanned++;
+
+            /* Check each 16-byte aligned position in this page */
+            for (int pos = 0;
+                 pos <= (int)sizeof(page) - 20 * 16;
+                 pos += 16) {
+                uint8_t *f = &page[pos];
+
+                /* Quick reject: first entry must have reserved=0 */
+                if (f[12] | f[13] | f[14] | f[15]) continue;
+                /* Must be present gate (interrupt or trap) */
+                uint8_t attr = f[5];
+                if (!(attr & 0x80)) continue;            /* P=0 */
+                uint8_t type = attr & 0x0F;
+                if (type != 0x0E && type != 0x0F) continue;
+
+                /* Remember selector from first entry */
+                uint16_t expected_sel = f[2] | (f[3] << 8);
+                if (expected_sel == 0) continue;
+
+                /* Validate first 20 consecutive entries */
+                int valid = 0;
+                for (int i = 0; i < 20; i++) {
+                    int eoff = pos + i * 16;
+                    if (eoff + 16 > (int)sizeof(page)) break;
+                    uint8_t *ent = &page[eoff];
+
+                    /* Reserved bytes must be 0 */
+                    if (ent[12] | ent[13] | ent[14] | ent[15])
+                        continue;
+                    /* Must be present */
+                    if (!(ent[5] & 0x80)) continue;
+                    /* Type must be interrupt or trap gate */
+                    uint8_t t = ent[5] & 0x0F;
+                    if (t != 0x0E && t != 0x0F) continue;
+                    /* Selector must match */
+                    uint16_t s = ent[2] | (ent[3] << 8);
+                    if (s != expected_sel) continue;
+
+                    /* Handler address should be in kernel range */
+                    uint64_t h =
+                        (uint64_t)(ent[0] | (ent[1] << 8)) |
+                        ((uint64_t)(ent[6] | (ent[7] << 8)) << 16) |
+                        ((uint64_t)(ent[8] | (ent[9] << 8) |
+                                    (ent[10] << 16) |
+                                    (ent[11] << 24))
+                         << 32);
+                    if (h >= 0xFFFFFFFF80000000ULL)
+                        valid++;
+                }
+
+                if (valid >= 16) {
+                    idt_kva = page_va + pos;
+                    idt_pa_found = page_pa + pos;
+                    printf("[+] IDT found! KVA=0x%lx  PA=0x%lx  "
+                           "(%d/20 valid)  sel=0x%04x\n",
+                           (unsigned long)idt_kva,
+                           (unsigned long)idt_pa_found,
+                           valid, expected_sel);
+                    printf("    (scanned %d pages)\n", pages_scanned);
+                    break;
+                }
+            }
+        }
+
+        if (!idt_kva) {
+            printf("[-] IDT not found in kdata scan (%d pages).\n",
+                   pages_scanned);
         } else {
-            printf("[*] IDT PA: 0x%lx\n\n", (unsigned long)idt_pa);
+            /* Read all 256 entries (4096 bytes).
+             * If IDT spans a page boundary, read in two parts. */
+            uint8_t idt_buf[256 * 16];
+            int idt_offset_in_page = (int)(idt_kva & 0xFFF);
+            int first_part = 0x1000 - idt_offset_in_page;
+            if (first_part > (int)sizeof(idt_buf))
+                first_part = sizeof(idt_buf);
 
-            int n_idt = (idtr.limit + 1) / 16;
-            if (n_idt > 256) n_idt = 256;
+            kernel_copyout(g_dmap_base + idt_pa_found,
+                           idt_buf, first_part);
 
-            /* Interesting vectors to dump */
+            if (first_part < (int)sizeof(idt_buf)) {
+                /* Need second page */
+                uint64_t next_va = (idt_kva & ~0xFFFULL) + 0x1000;
+                uint64_t next_pa = va_to_pa_quiet(next_va);
+                if (next_pa) {
+                    kernel_copyout(g_dmap_base + next_pa,
+                                   &idt_buf[first_part],
+                                   sizeof(idt_buf) - first_part);
+                }
+            }
+
+            /* Parse and display interesting entries */
             struct { int vec; const char *name; } idt_names[] = {
                 {  0, "#DE div-by-zero"},
                 {  1, "#DB debug"},
@@ -5547,76 +5659,79 @@ static void campaign_flatz_setup(void) {
             };
             int n_names = sizeof(idt_names) / sizeof(idt_names[0]);
 
-            printf("[*] Selected IDT entries:\n");
-            printf("    %-4s  %-20s  %-18s  %-4s %-4s %-4s %s\n",
-                   "Vec", "Name", "Handler", "IST", "Type", "DPL", "ktext+offset");
-            printf("    ────────────────────────────────────────"
-                   "─────────────────────────────────────\n");
+            printf("\n[*] Selected IDT entries:\n");
+            printf("    %-4s  %-20s  %-18s  %-4s %-4s %-4s  %s\n",
+                   "Vec", "Name", "Handler",
+                   "IST", "Type", "DPL", "ktext+offset");
+            printf("    ─────────────────────────────────"
+                   "──────────────────────────────────────\n");
 
-            /* Also collect all unique ktext handler addresses */
-            uint64_t gp_handler = 0;         /* int 13 */
-            uint64_t xinvtlb_handler = 0;    /* int 244 */
+            uint64_t gp_handler = 0;
+            uint64_t xinvtlb_handler = 0;
             uint8_t  gp_ist = 0;
 
             for (int idx = 0; idx < n_names; idx++) {
                 int vec = idt_names[idx].vec;
-                if (vec >= n_idt) continue;
+                if (vec >= 256) continue;
+                uint8_t *e = &idt_buf[vec * 16];
 
-                uint8_t e[16];
-                kernel_copyout(g_dmap_base + idt_pa + vec * 16, e, 16);
-
-                uint64_t handler = (uint64_t)(e[0] | (e[1] << 8)) |
-                                   ((uint64_t)(e[6] | (e[7] << 8)) << 16) |
-                                   ((uint64_t)(e[8] | (e[9] << 8) |
-                                               (e[10] << 16) | (e[11] << 24))
-                                    << 32);
-                uint16_t sel = e[2] | (e[3] << 8);
+                uint64_t handler =
+                    (uint64_t)(e[0] | (e[1] << 8)) |
+                    ((uint64_t)(e[6] | (e[7] << 8)) << 16) |
+                    ((uint64_t)(e[8] | (e[9] << 8) |
+                                (e[10] << 16) | (e[11] << 24))
+                     << 32);
                 uint8_t ist  = e[4] & 0x7;
-                uint8_t type = e[5] & 0xF;
+                uint8_t tval = e[5] & 0xF;
                 uint8_t dpl  = (e[5] >> 5) & 0x3;
                 uint8_t pres = (e[5] >> 7) & 0x1;
 
                 int in_ktext = (handler >= g_ktext_base &&
                                 handler < g_ktext_base + 0x2000000);
-                (void)sel; (void)pres;
 
-                printf("    %3d   %-20s  0x%016lx  %d    0x%x  %d    ",
+                printf("    %3d   %-20s  0x%016lx  %d    ",
                        vec, idt_names[idx].name,
-                       (unsigned long)handler, ist, type, dpl);
-                if (in_ktext)
-                    printf("ktext+0x%lx\n",
-                           (unsigned long)(handler - g_ktext_base));
+                       (unsigned long)handler, ist);
+                if (pres)
+                    printf("0x%x   %d     ", tval, dpl);
                 else
-                    printf("(outside ktext)\n");
+                    printf("(not present)  ");
+                if (in_ktext)
+                    printf("ktext+0x%lx",
+                           (unsigned long)(handler - g_ktext_base));
+                else if (handler)
+                    printf("(outside ktext)");
+                printf("\n");
 
-                if (vec == 13) { gp_handler = handler; gp_ist = ist; }
-                if (vec == 244) xinvtlb_handler = handler;
+                if (vec == 13)  { gp_handler = handler; gp_ist = ist; }
+                if (vec == 244) { xinvtlb_handler = handler; }
             }
 
-            /* Dump ALL 256 handler addresses for completeness */
-            printf("\n[*] Full IDT handler dump (ktext offsets):\n");
-            int unique_handlers = 0;
-            uint64_t first_handler = 0, last_handler = 0;
-            for (int vec = 0; vec < n_idt; vec++) {
-                uint8_t e[16];
-                kernel_copyout(g_dmap_base + idt_pa + vec * 16, e, 16);
-                uint64_t h = (uint64_t)(e[0] | (e[1] << 8)) |
-                             ((uint64_t)(e[6] | (e[7] << 8)) << 16) |
-                             ((uint64_t)(e[8] | (e[9] << 8) |
-                                         (e[10] << 16) | (e[11] << 24))
-                              << 32);
-                if (h >= g_ktext_base && h < g_ktext_base + 0x2000000) {
-                    unique_handlers++;
-                    if (!first_handler) first_handler = h;
-                    last_handler = h;
+            /* Count all ktext handlers */
+            int ktext_handlers = 0;
+            uint64_t first_h = 0, last_h = 0;
+            for (int vec = 0; vec < 256; vec++) {
+                uint8_t *e = &idt_buf[vec * 16];
+                uint64_t h =
+                    (uint64_t)(e[0] | (e[1] << 8)) |
+                    ((uint64_t)(e[6] | (e[7] << 8)) << 16) |
+                    ((uint64_t)(e[8] | (e[9] << 8) |
+                                (e[10] << 16) | (e[11] << 24))
+                     << 32);
+                if (h >= g_ktext_base &&
+                    h < g_ktext_base + 0x2000000) {
+                    ktext_handlers++;
+                    if (!first_h) first_h = h;
+                    last_h = h;
                 }
             }
-            printf("    %d of %d handlers are in ktext range\n",
-                   unique_handlers, n_idt);
-            if (first_handler)
+
+            printf("\n[*] %d of 256 handlers point into ktext\n",
+                   ktext_handlers);
+            if (first_h)
                 printf("    Range: ktext+0x%lx .. ktext+0x%lx\n",
-                       (unsigned long)(first_handler - g_ktext_base),
-                       (unsigned long)(last_handler - g_ktext_base));
+                       (unsigned long)(first_h - g_ktext_base),
+                       (unsigned long)(last_h - g_ktext_base));
 
             printf("\n[*] Key addresses for flatz method:\n");
             printf("    #GP handler (int 13):  0x%016lx",
@@ -5625,6 +5740,7 @@ static void campaign_flatz_setup(void) {
                 printf("  (ktext+0x%lx)",
                        (unsigned long)(gp_handler - g_ktext_base));
             printf("  IST=%d\n", gp_ist);
+
             printf("    Xinvtlb (int 244):     0x%016lx",
                    (unsigned long)xinvtlb_handler);
             if (xinvtlb_handler >= g_ktext_base)
@@ -5632,108 +5748,9 @@ static void campaign_flatz_setup(void) {
                        (unsigned long)(xinvtlb_handler - g_ktext_base));
             printf("\n");
 
-            /* Step 2: Read TSS via GDT
-             *
-             * The TSS selector is loaded in TR. We can get it with str.
-             * Then find the TSS base from the GDT entry.
-             */
-            printf("\n[*] Step 2: TSS via GDT...\n");
-
-            struct {
-                uint16_t limit;
-                uint64_t base;
-            } __attribute__((packed)) gdtr;
-            __asm__ volatile("sgdt %0" : "=m"(gdtr));
-
-            uint16_t tr_sel = 0;
-            __asm__ volatile("str %0" : "=r"(tr_sel));
-
-            printf("    GDTR: base=0x%lx  limit=%u\n",
-                   (unsigned long)gdtr.base, gdtr.limit);
-            printf("    TR selector: 0x%04x (index=%d)\n",
-                   tr_sel, tr_sel >> 3);
-
-            uint64_t gdt_pa = va_to_pa_quiet(gdtr.base);
-            if (!gdt_pa) {
-                printf("[-] GDT VA→PA failed.\n");
-            } else {
-                /* TSS descriptor in long mode is 16 bytes (system segment) */
-                int gdt_idx = (tr_sel >> 3);
-                uint8_t tss_desc[16];
-                kernel_copyout(g_dmap_base + gdt_pa + gdt_idx * 8,
-                               tss_desc, 16);
-
-                uint64_t tss_base =
-                    (uint64_t)(tss_desc[2] | (tss_desc[3] << 8) |
-                               (tss_desc[4] << 16)) |
-                    ((uint64_t)tss_desc[7] << 24) |
-                    ((uint64_t)(tss_desc[8] | (tss_desc[9] << 8) |
-                                (tss_desc[10] << 16) |
-                                (tss_desc[11] << 24)) << 32);
-                uint32_t tss_limit =
-                    (tss_desc[0] | (tss_desc[1] << 8)) |
-                    ((tss_desc[6] & 0x0F) << 16);
-
-                printf("    TSS base:  0x%016lx\n", (unsigned long)tss_base);
-                printf("    TSS limit: 0x%x (%u bytes)\n",
-                       tss_limit, tss_limit + 1);
-
-                /* Read TSS to get IST entries
-                 * TSS layout (AMD64):
-                 *   0x00: reserved (4)
-                 *   0x04: RSP0 (8)  — ring 0 stack
-                 *   0x0C: RSP1 (8)
-                 *   0x14: RSP2 (8)
-                 *   0x1C: reserved (8)
-                 *   0x24: IST1 (8)
-                 *   0x2C: IST2 (8)
-                 *   0x34: IST3 (8)
-                 *   0x3C: IST4 (8)
-                 *   0x44: IST5 (8)
-                 *   0x4C: IST6 (8)
-                 *   0x54: IST7 (8)
-                 */
-                uint64_t tss_pa = va_to_pa_quiet(tss_base);
-                if (!tss_pa) {
-                    printf("[-] TSS VA→PA failed.\n");
-                } else {
-                    uint8_t tss_data[0x68];
-                    kernel_copyout(g_dmap_base + tss_pa, tss_data,
-                                   sizeof(tss_data));
-
-                    uint64_t rsp0 = 0;
-                    memcpy(&rsp0, &tss_data[0x04], 8);
-                    printf("    RSP0 (ring-0 stack): 0x%016lx\n",
-                           (unsigned long)rsp0);
-
-                    printf("\n    IST entries:\n");
-                    for (int ist = 1; ist <= 7; ist++) {
-                        uint64_t ist_val = 0;
-                        memcpy(&ist_val,
-                               &tss_data[0x24 + (ist - 1) * 8], 8);
-                        printf("      IST%d: 0x%016lx%s\n",
-                               ist, (unsigned long)ist_val,
-                               ist_val ? "" : " (unused)");
-                    }
-
-                    /* Report which IST the #GP handler uses */
-                    if (gp_ist > 0) {
-                        uint64_t gp_stack = 0;
-                        memcpy(&gp_stack,
-                               &tss_data[0x24 + (gp_ist - 1) * 8], 8);
-                        printf("\n    #GP uses IST%d: stack at 0x%016lx\n",
-                               gp_ist, (unsigned long)gp_stack);
-                    } else {
-                        printf("\n    #GP uses IST0 (RSP0): stack at 0x%016lx\n",
-                               (unsigned long)rsp0);
-                    }
-
-                    printf("\n[+] IDT + TSS recon complete.\n");
-                    printf("[+] We have %d ktext handler addresses from IDT.\n",
-                           unique_handlers);
-                    printf("[+] Next step: doreti_iret finding via #GP + IST trick.\n");
-                }
-            }
+            printf("\n[+] IDT recon complete.\n");
+            printf("[+] sidt/sgdt/str hang on PS5 — TSS discovery\n");
+            printf("[+] will need sysent-hijack approach in a future phase.\n");
         }
 
         printf("\n");
