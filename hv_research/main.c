@@ -5206,12 +5206,11 @@ static void campaign_flatz_setup(void) {
          *   0x00: magic ("FLATZHOO")
          *   0x08: original xapic_mode
          *   0x10: ktext_base (KASLR verify)
-         *   0x18: hook target (0 = marker-only, nonzero = hooked)
+         *   0x18: reserved (zero)
          */
         #define PHASE7_MARKER 0x42EFCDABUL
         #define P7_CAVE_MAGIC    0x464C41545A484F4FULL  /* "FLATZHOO" */
         #define P7_MARKER_SIZE   32
-        #define P7_SENTINEL_MAGIC 0xDEAD7E57CAFE4F50ULL
 
         int p7_is_post_resume = 0;
         uint64_t p7_hook_addr = ops[2];
@@ -5244,80 +5243,77 @@ static void campaign_flatz_setup(void) {
             /* ─── Post-resume: check results ─── */
             printf("\n[+] *** POST-RESUME / MARKERS DETECTED ***\n\n");
 
-            /* Recover original xapic_mode from QA flags bytes 8-15.
-             * Note: QA flags are reinitialized on resume (FW >= 3.00),
-             * so orig_xapic may be 0 after a real resume cycle. */
+            /* Check apic_ops[2] current value */
+            uint64_t xapic_now = ops[2];
+
+            /* Recover original xapic_mode from cave marker (offset 0x08)
+             * and from QA flags bytes 8-15 (may be 0 if QA reinitialised). */
             uint64_t orig_xapic = 0;
             memcpy(&orig_xapic, &p7_qa[8], 8);
 
-            /* Check apic_ops[2] */
-            uint64_t xapic_now = ops[2];
+            int cave_persisted = (cave_marker_val == P7_CAVE_MAGIC);
+            int qa_persisted   = (p7_qa[0] == 0xFF && p7_qa[1] == 0xFF);
 
-            printf("[*] Checking apic_ops[2] (xapic_mode):\n");
-            printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
-            if (orig_xapic)
-                printf("    Original saved: 0x%016lx (from QA flags)\n",
-                       (unsigned long)orig_xapic);
-            else
-                printf("    Original saved: (unavailable — QA flags were reinitialized)\n");
-
-            /* Recover sentinel_orig from cave marker (offset 0x18) */
-            uint64_t saved_sentinel_orig = 0;
-            {
-                uint64_t cp = va_to_pa_quiet(g_kdata_base);
-                if (cp) {
-                    uint8_t cd[P7_MARKER_SIZE];
-                    kernel_copyout(g_dmap_base + cp, cd, P7_MARKER_SIZE);
-                    memcpy(&saved_sentinel_orig, &cd[0x18], 8);
+            /* Read full cave marker data */
+            uint64_t saved_xapic = 0, saved_ktext = 0;
+            if (cave_persisted) {
+                uint64_t cave_pa = va_to_pa_quiet(g_kdata_base);
+                if (cave_pa) {
+                    uint8_t cave_data[P7_MARKER_SIZE];
+                    kernel_copyout(g_dmap_base + cave_pa, cave_data,
+                                   P7_MARKER_SIZE);
+                    memcpy(&saved_xapic, &cave_data[0x08], 8);
+                    memcpy(&saved_ktext, &cave_data[0x10], 8);
                 }
             }
 
-            /*
-             * Check sentinel marker (ops[n_ops], right after table).
-             * We wrote P7_SENTINEL_MAGIC there pre-suspend.
-             */
-            int sentinel_offset = n_ops * 8;
-            uint64_t sentinel_now = 0;
-            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
-                           &sentinel_now, 8);
+            /* Prefer cave-marker original if QA flags lost it */
+            if (!orig_xapic && saved_xapic)
+                orig_xapic = saved_xapic;
 
-            printf("\n[*] Sentinel check (ops[%d], after table):\n", n_ops);
-            printf("    Current:        0x%016lx\n",
-                   (unsigned long)sentinel_now);
-            printf("    Expected magic: 0x%016lx\n",
-                   (unsigned long)P7_SENTINEL_MAGIC);
-            printf("    Pre-suspend original: 0x%016lx\n",
-                   (unsigned long)saved_sentinel_orig);
-
-            int sentinel_survived = (sentinel_now == P7_SENTINEL_MAGIC);
-            int sentinel_restored = (sentinel_now == saved_sentinel_orig &&
-                                     saved_sentinel_orig != P7_SENTINEL_MAGIC);
-
-            if (sentinel_survived) {
-                printf("    → SENTINEL SURVIVED RESUME!\n");
-            } else if (sentinel_restored) {
-                printf("    → Sentinel restored to original (region reinitialized).\n");
+            /* ── Cave marker details ── */
+            printf("[*] Cave marker (kdata_base):\n");
+            if (cave_persisted) {
+                printf("    Magic:       0x%016lx — PERSISTED!\n",
+                       (unsigned long)cave_marker_val);
+                printf("    Saved xapic: 0x%016lx\n",
+                       (unsigned long)saved_xapic);
+                printf("    Saved ktext: 0x%016lx\n",
+                       (unsigned long)saved_ktext);
+                if (saved_ktext == g_ktext_base)
+                    printf("    KASLR: same slide (ktext_base matches)\n");
+                else
+                    printf("    KASLR: DIFFERENT slide! (0x%lx vs 0x%lx)\n",
+                           (unsigned long)saved_ktext,
+                           (unsigned long)g_ktext_base);
             } else {
-                printf("    → Sentinel has unexpected value.\n");
+                printf("    Magic: 0x%016lx — not found.\n",
+                       (unsigned long)cave_marker_val);
             }
 
-            /* Check apic_ops[2] — did it change? */
-            printf("\n[*] apic_ops[2] persistence check:\n");
-            printf("    apic_ops[2] now:      0x%016lx\n",
-                   (unsigned long)xapic_now);
+            /* ── QA flags ── */
+            printf("\n[*] QA flags:\n");
+            printf("    Bytes 0-1: %02x %02x", p7_qa[0], p7_qa[1]);
+            if (qa_persisted)
+                printf(" — PERSISTED!\n");
+            else
+                printf(" — reinitialized.\n");
+
+            /* ── apic_ops[2] persistence check ── */
+            printf("\n[*] apic_ops[2] (xapic_mode):\n");
+            printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
             if (orig_xapic) {
-                printf("    Original (pre-suspend): 0x%016lx\n",
+                printf("    Original saved: 0x%016lx\n",
                        (unsigned long)orig_xapic);
                 if (xapic_now == orig_xapic)
                     printf("    → MATCH — apic_ops[2] retained its value.\n");
                 else
                     printf("    → CHANGED — kernel reinitialized apic_ops[2]!\n");
+            } else {
+                printf("    Original saved: (unavailable)\n");
             }
 
-            /* Summary */
-            int cave_persisted = (cave_marker_val == P7_CAVE_MAGIC);
-            int qa_persisted = (p7_qa[0] == 0xFF && p7_qa[1] == 0xFF);
-
+            /* ── Summary ── */
             printf("\n[+] ============================================\n");
             printf("[+]  PERSISTENCE TEST RESULTS\n");
             printf("[+] ============================================\n");
@@ -5325,75 +5321,21 @@ static void campaign_flatz_setup(void) {
                    cave_persisted ? "PERSISTED" : "LOST");
             printf("[+]   QA flags:      %s\n",
                    qa_persisted ? "PERSISTED" : "reinitialized");
-            printf("[+]   Sentinel:      %s\n",
-                   sentinel_survived ? "PERSISTED" :
-                   sentinel_restored ? "RESTORED (region reinit)" : "UNEXPECTED");
             printf("[+]   apic_ops[2]:   %s\n",
                    orig_xapic ?
                    (xapic_now == orig_xapic ? "UNCHANGED (good for hook)"
                                             : "CHANGED (kernel reinits)")
                    : "(cannot compare — no saved original)");
 
-            if (sentinel_survived && orig_xapic && xapic_now == orig_xapic) {
+            if (orig_xapic && xapic_now == orig_xapic) {
                 printf("[+]\n");
-                printf("[+] KEY FINDING: apic_ops region survives resume AND\n");
-                printf("[+] apic_ops[2] is NOT reinitialized by kernel!\n");
-                printf("[+] → The flatz method (hook apic_ops[2]) IS viable.\n");
+                printf("[+] KEY FINDING: apic_ops[2] retains its value across\n");
+                printf("[+] resume! The flatz method (hook apic_ops[2]) IS viable.\n");
                 printf("[+] → Next: find a safe ktext gadget to hook with.\n");
-            } else if (!sentinel_survived) {
+            } else if (orig_xapic && xapic_now != orig_xapic) {
                 printf("[+]\n");
-                printf("[-] The apic_ops memory region does not survive resume.\n");
-                printf("    This means hooking apic_ops[2] won't persist.\n");
-                printf("    The flatz method may need a different approach.\n");
-            }
-
-            /* QA flags persistence check */
-            printf("\n[*] QA flags after resume:\n");
-            printf("    Bytes 0-1: %02x %02x", p7_qa[0], p7_qa[1]);
-            if (p7_qa[0] == 0xFF && p7_qa[1] == 0xFF)
-                printf(" — PERSISTED!\n");
-            else
-                printf(" — reinitialized by secure loader.\n");
-
-            /* Cave marker persistence check */
-            printf("\n[*] Cave marker after resume:\n");
-            if (cave_marker_val == P7_CAVE_MAGIC) {
-                printf("    Magic: 0x%016lx — PERSISTED!\n",
-                       (unsigned long)cave_marker_val);
-                /* Read full marker data */
-                uint64_t cave_pa = va_to_pa_quiet(g_kdata_base);
-                if (cave_pa) {
-                    uint8_t cave_data[32];
-                    kernel_copyout(g_dmap_base + cave_pa, cave_data, 32);
-                    uint64_t saved_xapic = 0, saved_ktext = 0;
-                    memcpy(&saved_xapic, &cave_data[0x08], 8);
-                    memcpy(&saved_ktext, &cave_data[0x10], 8);
-                    printf("    Saved xapic_mode: 0x%016lx\n",
-                           (unsigned long)saved_xapic);
-                    printf("    Saved ktext_base: 0x%016lx\n",
-                           (unsigned long)saved_ktext);
-                    if (saved_ktext == g_ktext_base)
-                        printf("    KASLR: same slide (ktext_base matches)\n");
-                    else
-                        printf("    KASLR: DIFFERENT slide! (0x%lx vs 0x%lx)\n",
-                               (unsigned long)saved_ktext,
-                               (unsigned long)g_ktext_base);
-                    /* Use saved xapic if QA flags lost it */
-                    if (!orig_xapic && saved_xapic &&
-                        saved_ktext == g_ktext_base)
-                        orig_xapic = saved_xapic;
-                }
-            } else {
-                printf("    Magic: 0x%016lx — not found (cleared or changed)\n",
-                       (unsigned long)cave_marker_val);
-            }
-
-            /* Restore sentinel to original value */
-            if (sentinel_survived && saved_sentinel_orig != P7_SENTINEL_MAGIC) {
-                printf("\n[*] Restoring sentinel (ops[%d]) → 0x%016lx\n",
-                       n_ops, (unsigned long)saved_sentinel_orig);
-                kernel_copyin(&saved_sentinel_orig,
-                              g_dmap_base + ops_pa + sentinel_offset, 8);
+                printf("[-] apic_ops[2] was reinitialized by the kernel.\n");
+                printf("    Hooking it pre-suspend won't persist across resume.\n");
             }
 
             /* Clear QA marker */
@@ -5404,43 +5346,29 @@ static void campaign_flatz_setup(void) {
             notify("[HV Research] Phase 7: Post-resume check complete!");
 
         } else {
-            /* ─── Pre-suspend: safe persistence test on apic_ops ─── */
-            printf("\n[*] Phase 7: Safe apic_ops persistence test\n\n");
+            /* ─── Pre-suspend: safe persistence test ─── */
+            printf("\n[*] Phase 7: Safe persistence test (cave marker + QA only)\n\n");
 
             /*
-             * APPROACH: Test if apic_ops data survives resume WITHOUT
-             * corrupting any function pointer that gets called.
+             * SAFE APPROACH — NO writes to apic_ops region at all.
              *
-             * LESSON LEARNED: Hooking apic_ops[2] (xapic_mode) to a
-             * different ktext function (apic_create) caused system
-             * instability after resume — the wrong function corrupts
-             * APIC state, making the console unstable/frozen.
+             * LESSONS LEARNED:
+             *   - Hooking apic_ops[2] → different function: system instability
+             *   - Writing to ops[28] (past table end): overwrites a valid ktext
+             *     pointer, prevents rest mode (suspend hangs)
              *
-             * SAFE APPROACH:
-             *   1. Write a marker value to a SAFE location near apic_ops
-             *      (8 bytes right after the table: ops[28], which is beyond
-             *      the 28-entry table and just leftover kdata).
-             *   2. Write persistence marker to kdata cave as before.
-             *   3. Do NOT modify any apic_ops function pointer.
-             *   4. On post-resume: check if ops[28] marker and cave marker
-             *      survived, AND check if apic_ops[2] still has its
-             *      original value (tells us if kernel reinits the table).
+             * We ONLY write to:
+             *   1. kdata cave (32 bytes at kdata_base) — known safe
+             *   2. QA flags — known safe
              *
-             * This answers the key question without any crash risk.
+             * Post-resume compares apic_ops[2] to the saved original
+             * to determine if the kernel reinitialises the table.
              */
 
             uint64_t original_xapic = ops[2];
             printf("    apic_ops[2] (xapic_mode): 0x%016lx\n",
                    (unsigned long)original_xapic);
             printf("    apic_ops entries: %d\n", n_ops);
-
-            /* Read the 8 bytes right after the table (ops[28]) */
-            uint64_t sentinel_offset = n_ops * 8;  /* byte offset past last entry */
-            uint64_t sentinel_orig = 0;
-            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
-                           &sentinel_orig, 8);
-            printf("    Sentinel (ops[%d]) original: 0x%016lx\n",
-                   n_ops, (unsigned long)sentinel_orig);
 
             /* ── Step 1: Write persistence marker to kdata cave ── */
             printf("\n[*] Step 1: Writing persistence marker to kdata cave...\n");
@@ -5456,9 +5384,9 @@ static void campaign_flatz_setup(void) {
             /*
              * Marker layout (32 bytes at kdata_base):
              *   0x00: 8 bytes — magic  ("FLATZHOO")
-             *   0x08: 8 bytes — original_xapic address
+             *   0x08: 8 bytes — original_xapic value
              *   0x10: 8 bytes — ktext_base (for KASLR verification)
-             *   0x18: 8 bytes — sentinel_orig (original ops[28] value)
+             *   0x18: 8 bytes — reserved (zero)
              */
             uint8_t marker_data[P7_MARKER_SIZE];
             memset(marker_data, 0, sizeof(marker_data));
@@ -5466,7 +5394,7 @@ static void campaign_flatz_setup(void) {
             memcpy(&marker_data[0x00], &cave_magic, 8);
             memcpy(&marker_data[0x08], &original_xapic, 8);
             memcpy(&marker_data[0x10], &g_ktext_base, 8);
-            memcpy(&marker_data[0x18], &sentinel_orig, 8);
+            /* 0x18 left as zero */
 
             /* Save original cave content */
             uint8_t cave_backup[P7_MARKER_SIZE];
@@ -5509,23 +5437,8 @@ static void campaign_flatz_setup(void) {
             printf("    QA marker: 0x%08x [%s]\n", mv,
                    mv == PHASE7_MARKER ? "OK" : "FAIL");
 
-            /* ── Step 3: Write sentinel marker to ops[28] ── */
-            printf("\n[*] Step 3: Writing sentinel to ops[%d]...\n", n_ops);
-
-            uint64_t sentinel_val = P7_SENTINEL_MAGIC;
-            kernel_copyin(&sentinel_val,
-                          g_dmap_base + ops_pa + sentinel_offset, 8);
-
-            uint64_t sentinel_verify = 0;
-            kernel_copyout(g_dmap_base + ops_pa + sentinel_offset,
-                           &sentinel_verify, 8);
-            printf("    Wrote:    0x%016lx\n", (unsigned long)sentinel_val);
-            printf("    Readback: 0x%016lx [%s]\n",
-                   (unsigned long)sentinel_verify,
-                   sentinel_verify == sentinel_val ? "OK" : "MISMATCH");
-
-            /* ── Step 4: Dump kdata PTE for reference ── */
-            printf("\n[*] Step 4: kdata PTE diagnostics...\n");
+            /* ── Step 3: kdata PTE diagnostics ── */
+            printf("\n[*] Step 3: kdata PTE diagnostics...\n");
 
             uint64_t w_e;
             uint64_t w_pa;
@@ -5557,27 +5470,24 @@ static void campaign_flatz_setup(void) {
             }
 
             printf("\n[+] ============================================\n");
-            printf("[+]  SAFE PERSISTENCE TEST ARMED\n");
+            printf("[+]  PERSISTENCE TEST ARMED\n");
             printf("[+] ============================================\n");
             printf("[+]\n");
             printf("[+] What was set:\n");
             printf("[+]   Cave marker (kdata_base):  FLATZHOO magic\n");
-            printf("[+]   Sentinel (ops[%d]):        0x%016lx\n",
-                   n_ops, (unsigned long)sentinel_val);
             printf("[+]   QA flags:                  Phase 7 marker\n");
-            printf("[+]   apic_ops[2]:               NOT MODIFIED (safe)\n");
+            printf("[+]   apic_ops region:           NOT MODIFIED (safe)\n");
             printf("[+]\n");
             printf("[+] WHAT THIS TESTS:\n");
-            printf("[+]   1. Does kdata survive resume? (cave marker)\n");
-            printf("[+]   2. Does the apic_ops region survive? (sentinel)\n");
-            printf("[+]   3. Does apic_ops[2] retain its value? (compare)\n");
-            printf("[+]   4. Is KASLR stable? (ktext_base compare)\n");
+            printf("[+]   1. Does kdata cave survive resume? (marker)\n");
+            printf("[+]   2. Does apic_ops[2] retain its value? (compare)\n");
+            printf("[+]   3. Is KASLR stable? (ktext_base compare)\n");
             printf("[+]\n");
             printf("[+] NEXT STEPS:\n");
             printf("[+]   1. Enter REST MODE now\n");
             printf("[+]   2. Wake PS5 and re-run exploit\n");
             printf("[+]   3. Post-resume will check all markers\n");
-            printf("[+]   4. NO system instability — no func ptrs modified\n");
+            printf("[+]   4. NO system instability — nothing modified\n");
 
             notify("[HV Research] Phase 7: Safe test armed. Enter REST MODE!");
         }
