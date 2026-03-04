@@ -625,9 +625,13 @@ void gp_handler(void) {
         "mov $16, %%ecx\n"
         "rep movsb\n"
 
-        /* 2. Restore IST3 (before apic_ops so rax ends up valid) */
+        /* 2. Restore IST3 on CPU 0 (before apic_ops so rax ends up valid).
+         *    Arming patches IST3 on ALL 16 CPUs — this only restores CPU 0.
+         *    Other CPUs keep cave_stack in IST3, but that's harmless: once
+         *    IDT[13] is restored (step 1), the original #GP handler uses
+         *    IST=0, so IST3 is never consulted for future #GP exceptions. */
         "movabs $0xDEAD000000000005, %%rax\n"   /* original IST3 VALUE */
-        "movabs $0xDEAD000000000006, %%rdi\n"   /* IST3 (DMAP) */
+        "movabs $0xDEAD000000000006, %%rdi\n"   /* IST3 CPU 0 (DMAP) */
         "mov %%rax, (%%rdi)\n"
 
         /* 3. Restore apic_ops[2] LAST — leaves rax = valid xapic_mode ptr.

