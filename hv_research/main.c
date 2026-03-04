@@ -168,6 +168,7 @@ static int      g_apic_ops_count = 0;  /* Number of entries (typically 28) */
 static uint64_t g_kmod_trampoline_func = 0;    /* KVA of trampoline_xapic_mode() in kmod .text */
 static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in kmod .data */
 static uint64_t g_kmod_gp_handler = 0;         /* KVA of gp_handler() in kmod .text */
+static uint64_t g_scan_idt_kva = 0;            /* IDT KVA from DMAP scan (for Phase 8 cross-validation) */
 static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
 
@@ -2094,9 +2095,6 @@ ring3_fallback:
         printf("    CR3 (phys)  = 0x%lx\n", (unsigned long)g_cr3_phys);
         fflush(stdout);
 
-        /* Hoisted for Phase 8 cross-validation */
-        uint64_t scan_idt_kva = 0;
-
         /* 4d-3: IDT handler addresses
          * SIDT is intercepted by PS5 HV (VMCB intercept bit) and kills
          * the process.  Find IDT by scanning kdata via DMAP instead.
@@ -2220,7 +2218,7 @@ ring3_fallback:
             }
 
             if (idt_kva) {
-                scan_idt_kva = idt_kva;
+                g_scan_idt_kva = idt_kva;
                 printf("[+] IDT found at kdata+0x%lx (KVA 0x%lx), kernel CS=0x%x\n",
                        (unsigned long)(idt_kva - g_kdata_base),
                        (unsigned long)idt_kva, idt_sel);
@@ -5134,8 +5132,8 @@ static void campaign_flatz_setup(void) {
         fflush(stdout);
 
         /* ── Cross-validate scan IDT vs kstuff IDT ── */
-        if (scan_idt_kva) {
-            uint64_t scan_off = scan_idt_kva - g_kdata_base;
+        if (g_scan_idt_kva) {
+            uint64_t scan_off = g_scan_idt_kva - g_kdata_base;
             if (scan_off == KSTUFF_IDT_OFF) {
                 printf("\n[+] IDT scan matches kstuff offset: "
                        "kdata+0x%lx ✓\n", (unsigned long)scan_off);
