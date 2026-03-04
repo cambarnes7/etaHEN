@@ -6757,8 +6757,12 @@ int main(void) {
     /* Run research campaigns */
     campaign_kernel_recon();
 
-    /* Campaign 7: Kernel module via kldload (highest priority) */
-    campaign_kmod_kldload();
+    /* Campaign 7: Kernel module via kldload — DISABLED.
+     * PS5 kernel linker is gutted: kldload creates a kid but doesn't
+     * load module code/data.  Loading the kmod destabilizes the system
+     * (freeze/crash shortly after).  Phase 9 now builds the #GP handler
+     * inline — no kmod dependency.  */
+    /* campaign_kmod_kldload(); */
 
     /* Phase 6: Flatz suspend/resume setup (XOTEXT clear + gadget scan) */
     if (g_dmap_base) {
