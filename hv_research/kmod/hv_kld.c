@@ -589,12 +589,16 @@ void hv_idt_trampoline(void) {
  *   - #GP fires on call through poisoned pointer
  *   - Handler restores everything, iretq re-executes the call
  *
- * The handler restores THREE things:
+ * The handler restores THREE things (order matters!):
  *   1. IDT[13] — original #GP handler (from cave backup via DMAP)
- *   2. apic_ops[2] — original xapic_mode pointer (via DMAP)
- *   3. IST3 — original interrupt stack (via DMAP)
- * Then pops the error code and iretq back to the faulting call,
- * which now succeeds with the restored valid pointer.
+ *   2. IST3 — original interrupt stack (via DMAP)
+ *   3. apic_ops[2] — original xapic_mode pointer (via DMAP) — LAST
+ *
+ * apic_ops[2] restore is done LAST so rax ends up holding the valid
+ * xapic_mode pointer.  The faulting instruction is 'call rax' with
+ * the poisoned non-canonical value.  We skip 'pop rax' and instead
+ * add $16 to skip both saved rax and error code.  When IRETQ
+ * re-executes the faulting 'call rax', rax = valid pointer → success.
  *
  * NOTE: No ktext reads — ktext is XOM under NPT during normal
  * operation.  Reading ktext would cause #NPF → crash.  The ktext
@@ -621,21 +625,27 @@ void gp_handler(void) {
         "mov $16, %%ecx\n"
         "rep movsb\n"
 
-        /* 2. Restore apic_ops[2] */
-        "movabs $0xDEAD000000000003, %%rax\n"   /* original xapic_mode VALUE */
-        "movabs $0xDEAD000000000004, %%rdi\n"   /* apic_ops[2] (DMAP) */
-        "mov %%rax, (%%rdi)\n"
-
-        /* 3. Restore IST3 */
+        /* 2. Restore IST3 (before apic_ops so rax ends up valid) */
         "movabs $0xDEAD000000000005, %%rax\n"   /* original IST3 VALUE */
         "movabs $0xDEAD000000000006, %%rdi\n"   /* IST3 (DMAP) */
+        "mov %%rax, (%%rdi)\n"
+
+        /* 3. Restore apic_ops[2] LAST — leaves rax = valid xapic_mode ptr.
+         *    The faulting instruction is 'call rax' with the poisoned
+         *    non-canonical value.  After IRETQ resumes at the CALL,
+         *    rax must hold the valid pointer so the call succeeds.
+         *    If the call is 'call [mem]' instead, the re-read from
+         *    the restored apic_ops[2] also succeeds — rax is harmless. */
+        "movabs $0xDEAD000000000003, %%rax\n"   /* original xapic_mode VALUE */
+        "movabs $0xDEAD000000000004, %%rdi\n"   /* apic_ops[2] (DMAP) */
         "mov %%rax, (%%rdi)\n"
 
         "pop %%rdi\n"
         "pop %%rsi\n"
         "pop %%rcx\n"
-        "pop %%rax\n"
-        "add $8, %%rsp\n"       /* skip error code */
+        /* Skip pop rax — keep rax = valid xapic_mode pointer.
+         * The faulting 'call rax' re-executes with the correct value. */
+        "add $16, %%rsp\n"      /* skip saved rax (8) + error code (8) */
         "iretq\n"
         ::: "memory"
     );
