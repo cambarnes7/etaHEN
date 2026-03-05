@@ -582,14 +582,39 @@ static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
     g_kstuff_available = 1;
     printf("[+] kstuff is active!\n");
 
-    /* Verify kstuff isn't the unsupported variant:
-     * kmem_alloc should NOT return getppid() in low byte */
-    uint64_t test_alloc = kekcall_kmem_alloc(0x100);
-    if ((test_alloc & 0xFF) == (uint64_t)getppid()) {
-        printf("[-] kstuff variant is unsupported (kmem_alloc returned ppid)\n");
+    /* Test kmem_alloc: call with 0x100 and check result.
+     * If kstuff doesn't handle 0x600000027, the syscall falls through
+     * to getpid (syscall 0x27), returning our PID instead of a KVA.
+     * A real kmem_alloc result should be page-aligned (low bits = 0). */
+    uint64_t raw_ret;
+    __asm__ volatile(
+        "mov $0x600000027, %%rax\n"
+        "mov %1, %%rdi\n"
+        "syscall\n"
+        : "=a"(raw_ret)
+        : "r"((uint64_t)0x100)
+        : "rcx", "r11", "rdi", "memory"
+    );
+    uint64_t test_alloc = raw_ret | 0xffffff8000000000ULL;
+    pid_t my_pid = getpid();
+    pid_t my_ppid = getppid();
+    printf("[*] kmem_alloc(0x100) raw=0x%lx full=0x%lx\n",
+           (unsigned long)raw_ret, (unsigned long)test_alloc);
+    printf("    pid=%d ppid=%d\n", my_pid, my_ppid);
+
+    /* If raw return matches our PID, kstuff didn't intercept */
+    if ((int)raw_ret == my_pid || (int)raw_ret == my_ppid) {
+        printf("[-] kmem_alloc returned PID — kstuff kekcall not supported\n");
+        printf("    This kstuff build doesn't multiplex syscall 0x27\n");
         return -1;
     }
-    printf("[+] kmem_alloc test: 0x%016lx\n", (unsigned long)test_alloc);
+    /* Sanity: result should be page-aligned or at least > 0x1000 */
+    if (raw_ret < 0x1000) {
+        printf("[-] kmem_alloc returned suspicious value 0x%lx\n",
+               (unsigned long)raw_ret);
+        return -1;
+    }
+    printf("[+] kmem_alloc test OK: 0x%016lx\n", (unsigned long)test_alloc);
 
     /* Allocate RWX kernel memory for:
      * 1. Code (flat binary payload)
