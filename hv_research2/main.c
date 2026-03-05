@@ -339,6 +339,133 @@ struct kmod_result_buf {
     } msr_results[16];
 };
 
+/* ─── Load kmod via kstuff kekcall (direct, no r0gdb) ─── */
+
+static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
+    printf("\n[*] Trying kstuff kekcall approach (direct kmem_alloc + kproc_create)...\n");
+
+    /* Check if kstuff is active */
+    int kcheck = kekcall_kstuff_check();
+    if (kcheck != 0) {
+        printf("[-] kstuff not active (check returned %d)\n", kcheck);
+        return -1;
+    }
+    printf("[+] kstuff is active\n");
+
+    /* Allocate RWX kernel memory for our flat binary payload.
+     * kstuff's kmem_alloc hooks the kernel allocator to mark pages RWX,
+     * bypassing GMET (Guest Mode Execute Trap). This is the PS5_kldload
+     * technique — the key insight is that kstuff intercepts the allocation
+     * before GMET enforcement, so the pages come back executable. */
+    size_t payload_size = (size_t)KMOD_FLAT_SZ;
+    /* Round up to page boundary */
+    size_t alloc_size = (payload_size + 0x3FFF) & ~0x3FFFULL;
+
+    printf("[*] Allocating %zu bytes (%zu payload) of RWX kernel memory...\n",
+           alloc_size, payload_size);
+    fflush(stdout);
+
+    uint64_t exec_code = kekcall_kmem_alloc(alloc_size);
+    if (!exec_code || exec_code == (uint64_t)-1 ||
+        exec_code == 0xffffff8000000000ULL) {
+        printf("[-] kekcall_kmem_alloc(%zu) failed: 0x%lx\n",
+               alloc_size, (unsigned long)exec_code);
+        return -1;
+    }
+    printf("[+] RWX kernel allocation: 0x%lx (%zu bytes)\n",
+           (unsigned long)exec_code, alloc_size);
+
+    /* Allocate kernel memory for kthread name */
+    uint64_t kproc_name = kekcall_kmem_alloc(0x100);
+    if (!kproc_name || kproc_name == (uint64_t)-1 ||
+        kproc_name == 0xffffff8000000000ULL) {
+        printf("[-] kekcall_kmem_alloc(name) failed\n");
+        return -1;
+    }
+
+    /* Allocate kernel memory for kproc args */
+    uint64_t kthread_args = kekcall_kmem_alloc(sizeof(struct kmod_flat_args));
+    if (!kthread_args || kthread_args == (uint64_t)-1 ||
+        kthread_args == 0xffffff8000000000ULL) {
+        printf("[-] kekcall_kmem_alloc(args) failed\n");
+        return -1;
+    }
+
+    printf("[+] Kernel allocations:\n");
+    printf("    exec_code:    0x%lx\n", (unsigned long)exec_code);
+    printf("    kproc_name:   0x%lx\n", (unsigned long)kproc_name);
+    printf("    kthread_args: 0x%lx\n", (unsigned long)kthread_args);
+
+    /* Set up args for our flat binary payload */
+    struct kmod_flat_args flat_args;
+    flat_args.output_kva = result_kva;
+    flat_args.kdata_base = g_kdata_base;
+    flat_args.fw_ver = (uint32_t)(g_fw_version >> 16);
+    flat_args.pad = 0;
+
+    /* Write payload and args to kernel memory via kernel_copyin */
+    printf("[*] Writing payload to RWX kernel memory...\n");
+    kernel_copyin(KMOD_FLAT, exec_code, payload_size);
+
+    static const char kthread_name_str[] = "hv_research\0";
+    kernel_copyin(kthread_name_str, kproc_name, sizeof(kthread_name_str));
+    kernel_copyin(&flat_args, kthread_args, sizeof(flat_args));
+
+    /* Verify write */
+    uint8_t verify[16];
+    kernel_copyout(exec_code, verify, 16);
+    printf("[*] First 16 bytes at exec_code: ");
+    for (int i = 0; i < 16; i++) printf("%02x ", verify[i]);
+    printf("\n");
+
+    if (memcmp(verify, KMOD_FLAT, 16) == 0)
+        printf("[+] Payload write verified OK\n");
+    else {
+        printf("[!] Payload verification mismatch!\n");
+        printf("    Expected: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", KMOD_FLAT[i]);
+        printf("\n");
+        return -1;
+    }
+
+    /* Launch kernel thread to execute our payload.
+     * kstuff's kproc_create (syscall 0x700000027) creates a kernel thread
+     * that calls our function at exec_code with kthread_args as argument. */
+    printf("[*] Creating kernel thread at 0x%lx (args=0x%lx)...\n",
+           (unsigned long)exec_code, (unsigned long)kthread_args);
+    fflush(stdout);
+
+    uint64_t kproc_ret = kekcall_kproc_create(exec_code, kthread_args,
+                                                kproc_name);
+    printf("[+] kekcall_kproc_create returned: 0x%lx\n",
+           (unsigned long)kproc_ret);
+
+    /* Wait for kmod to complete */
+    printf("[*] Waiting for kmod completion...\n");
+    struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
+
+    for (int i = 0; i < 50; i++) {  /* 5 seconds max */
+        usleep(100000);  /* 100ms */
+        if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
+            printf("[+] Kmod completed! (magic OK, status=DONE after %dms)\n",
+                   (i + 1) * 100);
+            return 0;
+        }
+        if (results->magic == KMOD_MAGIC) {
+            printf("    magic OK, status=%u (waiting...)\n", results->status);
+        }
+    }
+
+    printf("[!] Kmod did not complete (magic=0x%lx status=%u)\n",
+           (unsigned long)results->magic, results->status);
+    /* Dump first 64 bytes of result buffer for debugging */
+    printf("[*] Result buffer dump: ");
+    uint8_t *rb = (uint8_t *)result_vaddr;
+    for (int i = 0; i < 64; i++) printf("%02x ", rb[i]);
+    printf("\n");
+    return -1;
+}
+
 /* ─── Load kmod via r0gdb (PS5_kldload approach) ─── */
 
 static int load_kmod_r0gdb(void *result_vaddr, uint64_t result_kva) {
@@ -2603,8 +2730,15 @@ int main(void) {
 
             int kmod_ok = -1;
 
-            /* Try r0gdb approach first (PS5_kldload: kmem_alloc + kproc_create) */
+            /* Try kstuff kekcall first (direct kmem_alloc RWX + kproc_create).
+             * This is the PS5_kldload technique: kstuff intercepts kmem_alloc
+             * to mark pages RWX, bypassing GMET enforcement. */
             if (kmod_result_kva) {
+                kmod_ok = load_kmod_kstuff(kmod_vaddr, kmod_result_kva);
+            }
+
+            /* Try r0gdb approach (PS5_kldload: r0gdb_kmem_alloc + kproc_create) */
+            if (kmod_ok != 0 && kmod_result_kva) {
                 kmod_ok = load_kmod_r0gdb(kmod_vaddr, kmod_result_kva);
             }
 
