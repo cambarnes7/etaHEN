@@ -1503,13 +1503,16 @@ int main(void) {
     /* Verify known offsets on 4.03 */
     verify_kstuff_offsets();
 
-    /* Phase 1: TF trace xapic_mode */
+    /* Phase 1: TF trace xapic_mode
+     *
+     * DISABLED: The TF trace writes shellcode to DMAP and tries to execute
+     * it.  PS5's hypervisor NPT has NX=1 on DMAP regions, so code execution
+     * from DMAP causes a nested page fault → hypervisor panic.
+     * Need to relocate shellcode into kmod .text pages (already executable
+     * in NPT) before this can work. */
+    printf("\n[*] Phase 1 (TF trace) SKIPPED — DMAP exec not safe under HV.\n");
     if (g_sysent_kva && g_apic_ops_addr) {
-        phase1_trace_xapic_mode();
-    } else {
-        printf("\n[-] Cannot run Phase 1: sysent=%s apic_ops=%s\n",
-               g_sysent_kva ? "OK" : "MISSING",
-               g_apic_ops_addr ? "OK" : "MISSING");
+        printf("    sysent=OK  apic_ops=OK  (ready when shellcode relocation is implemented)\n");
     }
 
     printf("\n==============================================\n");
