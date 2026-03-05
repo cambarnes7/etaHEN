@@ -111,17 +111,20 @@ struct kmod_result_buf {
     volatile uint32_t num_results;
     volatile uint32_t num_msr_results;
     volatile uint32_t pad;
+    /* Phase 7/9 addresses — placed before large arrays so they
+     * land within the first 4KB page of the DMAP output buffer.
+     * The kmod copies hv_results byte-by-byte to g_output_kva;
+     * if the second physical page has a stale DMAP mapping or
+     * the copy faults past 4KB, fields beyond offset 4096 stay 0. */
+    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
+    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
+    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
     struct {
         uint32_t msr_id;
         uint32_t valid;
         uint64_t value;
     } msr_results[32];
     struct vmmcall_result results[KMOD_MAX_RESULTS];
-    /* Phase 7: trampoline addresses (filled by kmod init) */
-    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
-    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
-    /* Phase 9: #GP handler (filled by kmod init) */
-    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
 };
 
 /* kldsym lookup structure (matches FreeBSD sys/kld.h) */
@@ -4408,6 +4411,26 @@ idt_skip: ;
                results->status == KMOD_STATUS_DONE ? "COMPLETE" :
                results->status == KMOD_STATUS_RUNNING ? "STILL RUNNING (crashed?)" :
                "UNKNOWN");
+        printf("[*] Result buffer trampoline fields (shared mapping):\n");
+        printf("    trampoline_func_kva  = 0x%016lx\n",
+               (unsigned long)results->trampoline_func_kva);
+        printf("    trampoline_target_kva = 0x%016lx\n",
+               (unsigned long)results->trampoline_target_kva);
+        printf("    gp_handler_kva       = 0x%016lx\n",
+               (unsigned long)results->gp_handler_kva);
+
+        /* Cross-check via kernel_copyout from DMAP */
+        {
+            struct kmod_result_buf dmap_check;
+            kernel_copyout(result_kva, &dmap_check, sizeof(dmap_check));
+            if (dmap_check.trampoline_func_kva != results->trampoline_func_kva) {
+                printf("[!] DMAP cross-check MISMATCH:\n");
+                printf("    DMAP trampoline_func  = 0x%016lx\n",
+                       (unsigned long)dmap_check.trampoline_func_kva);
+                printf("    DMAP trampoline_target = 0x%016lx\n",
+                       (unsigned long)dmap_check.trampoline_target_kva);
+            }
+        }
 
         /* Display MSR results */
         if (results->num_msr_results > 0) {

@@ -120,17 +120,17 @@ struct kmod_result_buf {
     volatile uint32_t num_results;
     volatile uint32_t num_msr_results;
     volatile uint32_t pad;
+    /* Phase 7/9 addresses — before large arrays to stay within
+     * the first 4KB page of the DMAP output buffer copy. */
+    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
+    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
+    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
     struct {
         uint32_t msr_id;
         uint32_t valid;
         uint64_t value;
     } msr_results[32];
     struct vmmcall_result results[KMOD_MAX_RESULTS];
-    /* Phase 7: trampoline addresses for apic_ops hook */
-    volatile uint64_t trampoline_func_kva;    /* KVA of trampoline_xapic_mode() */
-    volatile uint64_t trampoline_target_kva;  /* KVA of g_trampoline_target */
-    /* Phase 9: #GP handler for flatz method */
-    volatile uint64_t gp_handler_kva;         /* KVA of gp_handler() */
 };
 
 /* ============================================================
