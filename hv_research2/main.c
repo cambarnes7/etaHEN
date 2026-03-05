@@ -341,24 +341,130 @@ struct kmod_result_buf {
 
 /* ─── Load kmod via kstuff kekcall (direct, no r0gdb) ─── */
 
+/* Forward declarations */
+static uint64_t va_to_pa(uint64_t va);
+
+/* Known kstuff offsets needed for detection (defined again below for grouping) */
+#ifndef KSTUFF_DORETI_IRET_OFF
+#define KSTUFF_DORETI_IRET_OFF (-0x9cf84cLL)
+#endif
+
+/* Detect kstuff kekcall support by examining the syscall handler.
+ *
+ * etaHEN's kstuff build may NOT support the kekcall interface (the
+ * multiplexed syscall 0x27 with magic upper-32-bit prefixes). Calling
+ * kekcall on an unsupported build causes an instant kernel panic.
+ *
+ * Detection: kstuff patches the syscall handler (Xfast_syscall at LSTAR)
+ * to check upper bits of rax before normal dispatch. We can detect this
+ * by reading bytes at the syscall entry point and looking for kstuff's
+ * CMP/JMP patch prefix. If not found, kekcall is unsafe. */
+
+static int detect_kstuff_kekcall(void) {
+    /* The syscall entry is near doreti_iret. On FW 4.03:
+     *   doreti_iret = ktext+0x2307b4
+     *   Xfast_syscall is typically ~0x600 bytes before doreti_iret.
+     * kstuff patches the very first bytes of Xfast_syscall with a check:
+     *   bt rax, 32   (or similar) to test upper bits
+     *
+     * We scan backwards from doreti_iret looking for the SWAPGS+LFENCE
+     * sequence that starts Xfast_syscall, then check if subsequent bytes
+     * look like kstuff's patch (cmp/test on upper rax bits). */
+
+    if (!g_dmap_base || !g_kdata_base) return 0;
+
+    /* Read the first 64 bytes of the syscall handler area.
+     * The known Xfast_syscall start on FreeBSD begins with:
+     *   swapgs (0F 01 F8) ; lfence (0F AE E8) ; mov %rsp, ... */
+    uint64_t doreti_iret_kva = g_kdata_base + KSTUFF_DORETI_IRET_OFF;
+
+    /* Scan backwards from doreti_iret to find the SWAPGS that starts
+     * Xfast_syscall. Typical distance is ~0x500-0x700 bytes. */
+    for (int off = 0x500; off < 0x800; off += 0x10) {
+        uint64_t candidate = doreti_iret_kva - off;
+        uint64_t pa = va_to_pa(candidate);
+        if (!pa) continue;
+
+        uint8_t buf[8];
+        if (kernel_copyout(g_dmap_base + pa, buf, 8) != 0) continue;
+
+        /* Check for SWAPGS (0F 01 F8) */
+        if (buf[0] == 0x0F && buf[1] == 0x01 && buf[2] == 0xF8) {
+            printf("[*] Found Xfast_syscall at ktext+0x%lx\n",
+                   (unsigned long)(candidate - g_ktext_base));
+
+            /* Read 128 bytes to check for kstuff patch */
+            uint8_t handler[128];
+            if (kernel_copyout(g_dmap_base + pa, handler, 128) != 0)
+                return 0;
+
+            /* kstuff inserts a check early in the handler. Look for
+             * instructions that reference the upper 32 bits of rax:
+             *   shr rax, 32  (48 C1 E8 20)
+             *   bt rax, 32   (48 0F BA E0 20)
+             *   test upper bits pattern
+             * Scan for any of these in the first 128 bytes */
+            for (int i = 0; i < 120; i++) {
+                /* shr rax, 32 */
+                if (handler[i] == 0x48 && handler[i+1] == 0xC1 &&
+                    handler[i+2] == 0xE8 && handler[i+3] == 0x20) {
+                    printf("[+] kstuff kekcall patch detected at handler+%d (shr rax, 32)\n", i);
+                    return 1;
+                }
+                /* bt rax, 32 */
+                if (handler[i] == 0x48 && handler[i+1] == 0x0F &&
+                    handler[i+2] == 0xBA && handler[i+3] == 0xE0 &&
+                    handler[i+4] == 0x20) {
+                    printf("[+] kstuff kekcall patch detected at handler+%d (bt rax, 32)\n", i);
+                    return 1;
+                }
+                /* mov rax pattern with 0x27 immediate check:
+                 * cmp eax, 0x27 (3D 27 00 00 00) preceded by upper-bit check */
+                if (handler[i] == 0x48 && handler[i+1] == 0xC1 &&
+                    (handler[i+2] == 0xE0 || handler[i+2] == 0xE8)) {
+                    /* shift rax left or right — kstuff-style */
+                    printf("[+] kstuff kekcall patch detected at handler+%d (shift rax)\n", i);
+                    return 1;
+                }
+            }
+
+            printf("[*] Xfast_syscall found but no kekcall patch detected\n");
+            printf("    First 32 bytes: ");
+            for (int i = 0; i < 32; i++) printf("%02x ", handler[i]);
+            printf("\n");
+            return 0;
+        }
+    }
+
+    printf("[*] Could not locate Xfast_syscall — kekcall detection inconclusive\n");
+    return 0;
+}
+
 static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
     printf("\n[*] Trying kstuff kekcall approach (direct kmem_alloc + kproc_create)...\n");
 
-    /* Check if kstuff is active */
+    /* SAFETY: Detect kekcall support before calling any kekcall functions.
+     * Calling kekcall on a kstuff build that doesn't support it causes
+     * an instant kernel panic. */
+    if (!detect_kstuff_kekcall()) {
+        printf("[-] kstuff kekcall not detected — skipping (would panic)\n");
+        return -1;
+    }
+
+    /* Verify kstuff is responsive via kekcall_kstuff_check() */
+    printf("[*] Calling kekcall_kstuff_check()...\n");
+    fflush(stdout);
     int kcheck = kekcall_kstuff_check();
     if (kcheck != 0) {
         printf("[-] kstuff not active (check returned %d)\n", kcheck);
         return -1;
     }
-    printf("[+] kstuff is active\n");
+    printf("[+] kstuff kekcall confirmed active\n");
 
     /* Allocate RWX kernel memory for our flat binary payload.
      * kstuff's kmem_alloc hooks the kernel allocator to mark pages RWX,
-     * bypassing GMET (Guest Mode Execute Trap). This is the PS5_kldload
-     * technique — the key insight is that kstuff intercepts the allocation
-     * before GMET enforcement, so the pages come back executable. */
+     * bypassing GMET (Guest Mode Execute Trap). */
     size_t payload_size = (size_t)KMOD_FLAT_SZ;
-    /* Round up to page boundary */
     size_t alloc_size = (payload_size + 0x3FFF) & ~0x3FFFULL;
 
     printf("[*] Allocating %zu bytes (%zu payload) of RWX kernel memory...\n",
@@ -428,9 +534,7 @@ static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
         return -1;
     }
 
-    /* Launch kernel thread to execute our payload.
-     * kstuff's kproc_create (syscall 0x700000027) creates a kernel thread
-     * that calls our function at exec_code with kthread_args as argument. */
+    /* Launch kernel thread */
     printf("[*] Creating kernel thread at 0x%lx (args=0x%lx)...\n",
            (unsigned long)exec_code, (unsigned long)kthread_args);
     fflush(stdout);
@@ -444,8 +548,8 @@ static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
     printf("[*] Waiting for kmod completion...\n");
     struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
 
-    for (int i = 0; i < 50; i++) {  /* 5 seconds max */
-        usleep(100000);  /* 100ms */
+    for (int i = 0; i < 50; i++) {
+        usleep(100000);
         if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
             printf("[+] Kmod completed! (magic OK, status=DONE after %dms)\n",
                    (i + 1) * 100);
@@ -458,7 +562,6 @@ static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
 
     printf("[!] Kmod did not complete (magic=0x%lx status=%u)\n",
            (unsigned long)results->magic, results->status);
-    /* Dump first 64 bytes of result buffer for debugging */
     printf("[*] Result buffer dump: ");
     uint8_t *rb = (uint8_t *)result_vaddr;
     for (int i = 0; i < 64; i++) printf("%02x ", rb[i]);
