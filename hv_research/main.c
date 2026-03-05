@@ -3973,7 +3973,7 @@ ring3_fallback:
                             g_kmod_trampoline_target = results->trampoline_target_kva;
                             g_kld_text_trampoline = results->trampoline_func_kva;
                             g_kld_text_target = results->trampoline_target_kva;
-                            if (!g_kmod_kid) g_kmod_kid = kid;
+                            if (g_kmod_kid <= 0) g_kmod_kid = kid;
                             printf("[+] Late SYSINIT detected! Saved KLD trampoline KVAs before writeback:\n");
                             printf("    trampoline_xapic_mode() = 0x%016lx\n",
                                    (unsigned long)g_kld_text_trampoline);
@@ -4667,10 +4667,19 @@ idt_skip: ;
         }
     }
 
-    /* Step 5: Unload the module (skip if Phase 7 needs it) */
-    if (g_kmod_kid > 0) {
+    /* Step 5: Unload the module (skip if Phase 7 needs the trampoline).
+     *
+     * g_kld_text_trampoline is the definitive check: if it's set, we have
+     * a valid trampoline KVA in kmod .text that Phase 7 will hook into
+     * apic_ops[2].  Unloading would free those pages → panic on call.
+     *
+     * Note: g_kmod_kid may still be -1 (init value) if the late SYSINIT
+     * path set the trampoline but didn't update g_kmod_kid (the
+     * !g_kmod_kid guard doesn't catch -1). */
+    if (g_kld_text_trampoline) {
         printf("\n[*] Step 5: Skipping kldunload — module needed for Phase 7 trampoline.\n");
         printf("    Module kid=%d remains loaded in kernel memory.\n", kid);
+        printf("    trampoline KVA = 0x%016lx\n", (unsigned long)g_kld_text_trampoline);
     } else {
         printf("\n[*] Step 5: Unloading kernel module...\n");
         ret = syscall(SYS_kldunload, kid);
