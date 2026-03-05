@@ -530,17 +530,7 @@ But:
    we could redirect LSTAR via MSR write (ring-0 shellcode before suspend)...
    However, MSR writes may be intercepted by the HV.
 
-**Next Steps:**
-1. **Test KLD trampoline during suspend with REAL hook** — Session 5 "KLD armed" test was
-   a no-op (trampoline KVA equaled original xapic_mode). Need to arm with an actual
-   different address in kmod .text to test whether kmod pages survive NPT during suspend.
-2. **Enumerate apic_ops slot usage** — Determine which slots are called during suspend vs
-   resume. If a resume-only slot exists, hook it with kdata code.
-3. **VMCB hunting** — Expand the NPT scan to look for VMCB signatures in physical memory.
-4. **Fix KLD trampoline resolution** — The kmod trampoline scanner returns the original
-   xapic_mode value as fallback when it can't find the real trampoline (NPT read-protected).
-   Need a mechanism to get the actual kmod .text KVA (e.g., kldsym, or have kmod write
-   its own function addresses to the shared buffer).
+**Next Steps:** (see Session 6 for updated list — KLD trampoline resolution FIXED)
 
 ---
 
@@ -661,12 +651,93 @@ failure). To properly test whether kmod .text pages survive NPT during suspend:
 
 ---
 
+## Session 6: KLD Trampoline Resolution Fix
+
+### Root Cause Analysis
+
+The "KLD armed" test in Sessions 4-5 was a no-op because `g_kld_text_trampoline` contained
+the original `xapic_mode` address (e.g., `0xffffffff907e7908`) instead of the kmod's
+`trampoline_xapic_mode()` address.
+
+**Root cause:** The ring-0 `build_ring0_apic_writeback_shellcode()` writes test results to
+the shared result buffer at fixed byte offsets:
+- Offset 32: original apic_ops[2] value (the original xapic_mode pointer)
+- Offset 40: apic_ops[0] value
+- Offset 48: test1 readback value
+
+These offsets exactly overlay the `kmod_result_buf` struct fields:
+- Offset 32: `trampoline_func_kva`
+- Offset 40: `trampoline_target_kva`
+- Offset 48: `gp_handler_kva`
+
+After the writeback test, the post-campaign code reads these clobbered values, mistakes the
+original xapic_mode address for a genuine kmod trampoline address, and stores it in
+`g_kld_text_trampoline`. When Phase 7 arms `apic_ops[2]` with this "KLD trampoline", it
+writes back the original value — a no-op.
+
+Additionally, `gp_handler_kva` showed `0xffffffff907e7908` despite being set to 0 in kmod
+code — this was the test1 readback from the writeback shellcode, not a kmod address.
+
+### Fixes Applied
+
+1. **Buffer clobbering fix** (`main.c`): After parsing writeback test results, explicitly
+   zero out `trampoline_func_kva`, `trampoline_target_kva`, and `gp_handler_kva` in the
+   shared buffer. This prevents the post-campaign code from misinterpreting test data as
+   kmod addresses.
+
+2. **kldstat-based KLD .text resolution** (`main.c`): New resolution path computes the
+   trampoline address from the kldstat-reported module base + known `.text` layout offset
+   (`KMOD_XAPIC_OFFSET = 0x23`). This works even when:
+   - SYSINIT/MOD_LOAD don't fire (FW 4.03)
+   - Kmod pages are NPT read-protected (scanner can't find module in DMAP)
+   - The IDT invocation path can't be set up (requires scanner to find trampoline first)
+
+   Also attempts `kldsym("trampoline_xapic_mode")` and `kldsym("g_trampoline_target")` as
+   cross-checks / alternative resolution.
+
+3. **Suspend test safety improvements** (`main.c`):
+   - Added guard: rejects trampoline address if it equals `original_xapic` (catches any
+     remaining clobbering scenarios)
+   - Handles `g_kld_text_target == 0` (kldsym failed): kmod initializes
+     `g_trampoline_target = 0` at load time, so the trampoline safely returns 1
+     (APIC_MODE_XAPIC) without needing to zero it via DMAP
+   - No longer requires `g_kld_text_target != 0` to arm the suspend test
+
+4. **New global `g_kmod_base`**: Stores kldstat-reported module base address for use
+   outside `campaign_kmod_kldload()` scope.
+
+### Expected Behavior After Fix
+
+On FW 4.03:
+1. kldload succeeds, kldstat reports module base (e.g., `0xffffffff92xxxxxx`)
+2. SYSINIT/MOD_LOAD don't fire → buffer stays empty
+3. Ring-0 writeback test runs → clobbered fields are now cleared afterward
+4. Post-campaign code finds buffer trampoline fields = 0
+5. New kldstat-based resolution computes: `g_kld_text_trampoline = kmod_base + 0x23`
+6. Phase 7 suspend test arms `apic_ops[2]` with genuine kmod .text address
+7. The address differs from original xapic_mode → this is a REAL test
+8. On suspend: cpususpend_handler calls xapic_mode → trampoline_xapic_mode() → returns 1
+9. If kmod .text pages survive NPT during suspend: no panic, clean resume
+10. If kmod .text pages are NX during suspend: kernel panic (same as kdata)
+
+**Next Steps:**
+1. **Run the fixed tool** — First genuine KLD .text suspend test
+2. **If kmod .text survives suspend**: We have a viable code execution path during
+   cpususpend_handler that bypasses NPT NX enforcement on kdata
+3. **If kmod .text panics**: kmod pages are also NX during suspend. Need to find
+   a different code region (e.g., kernel .text itself) or exploit the VMCB directly.
+4. **Enumerate apic_ops slot usage** — Determine which slots are called during suspend vs
+   resume. If a resume-only slot exists, hook it with kdata code.
+5. **VMCB hunting** — Expand the NPT scan to look for VMCB signatures in physical memory.
+
+---
+
 ## File Structure
 
 ```
 hv_research/
   Makefile              - Build orchestrator (builds kmod first, then embeds in .elf)
-  main.c                - Userland research driver (~6400 lines)
+  main.c                - Userland research driver (~6800 lines)
   hv_research.elf       - Compiled payload (deployed to PS5)
   kmod/
     Makefile            - Kernel module build rules (ET_REL via clang -c)
