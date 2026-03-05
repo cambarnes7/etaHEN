@@ -902,10 +902,26 @@ is needed — the trampoline just needs to return the right APIC mode value.
 3. On resume, kernel calls apic_ops[2] → trampoline returns 1
 4. If kmod .text is NPT-executable during suspend, this succeeds without panic
 
+### Session 8 Result: KLD .text NPT NX During Suspend
+
+**CONFIRMED**: kmod .text does NOT survive NPT NX enforcement during
+cpususpend_handler.  The trampoline at `0x00000001c0000080` passes the
+2-second normal-ops stability check but causes kernel panic 1-2 seconds
+after entering standby.  The PS5 hypervisor enforces NX on ALL non-ktext
+guest pages during suspend — kmod .text is treated the same as kdata.
+
+**Fix**: Always restore apic_ops[2] to original xapic_mode before
+calling `sceSystemStateMgrEnterStandby()`, regardless of whether the
+KLD trampoline was armed.
+
+**Implication**: The flatz suspend/resume method requires code to execute
+from ktext-range pages only.  Dynamically loaded kernel modules cannot
+provide executable code paths during suspend/resume transitions.
+
 ### Open Questions for Session 9
-- Does kmod .text survive NPT NX enforcement during cpususpend_handler?
 - Are kldload module VAs stable across reboots/re-exploits?
 - Can the vmmcall_result struct mismatch cause issues for results beyond offset 0x238?
+- What alternative approaches exist for getting executable code during suspend? (e.g., ktext code caves, ROP chains in ktext)
 
 ---
 

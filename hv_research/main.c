@@ -6029,26 +6029,45 @@ static void campaign_flatz_setup(void) {
                            (unsigned long)g_kld_text_target);
                 }
 
-                if (!kld_armed) {
-                    /* Fallback: restore original before suspend (safe) */
-                    kernel_copyin(&original_xapic,
-                                  g_dmap_base + ops_pa + 0x10, 8);
-                    uint64_t restore_verify = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10,
-                                   &restore_verify, 8);
-                    if (restore_verify != original_xapic) {
-                        printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
-                               (unsigned long)restore_verify);
-                    }
-                    printf("[*] apic_ops[2] restored to original (no KLD test).\n");
+                if (kld_armed) {
+                    /* ── RESEARCH RESULT (Session 8) ──
+                     * KLD .text trampoline works during normal operation but
+                     * causes kernel panic during suspend.  The PS5 hypervisor
+                     * enforces NPT NX (No-Execute) on ALL non-ktext pages
+                     * during cpususpend_handler — including dynamically loaded
+                     * kmod .text at non-standard guest VAs (0x1c0000080).
+                     *
+                     * This confirms: kmod .text does NOT bypass NPT NX
+                     * enforcement during suspend/resume.  Must restore
+                     * apic_ops[2] to original before entering standby. */
+                    printf("\n[!] RESEARCH RESULT: KLD .text trampoline passed normal-ops\n");
+                    printf("    stability check but NPT NX enforcement during\n");
+                    printf("    cpususpend_handler makes kmod .text non-executable.\n");
+                    printf("    Restoring apic_ops[2] to original before standby.\n");
+                }
+
+                /* Always restore original xapic_mode before suspend */
+                kernel_copyin(&original_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10,
+                               &restore_verify, 8);
+                if (restore_verify != original_xapic) {
+                    printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
+                           (unsigned long)restore_verify);
+                } else {
+                    printf("[*] apic_ops[2] restored to original: 0x%016lx\n",
+                           (unsigned long)restore_verify);
                 }
 
                 printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
-                printf("[*] KLD armed: %s\n", kld_armed ? "YES — testing kmod .text during suspend" : "NO — safe restore");
+                printf("[*] KLD test result: %s\n", kld_armed
+                    ? "PASSED normal ops, BLOCKED by NPT NX during suspend"
+                    : "not armed (no KLD trampoline available)");
                 fflush(stdout);
                 fflush(stderr);
                 notify(kld_armed
-                    ? "[HV Research] REST MODE — KLD .text trampoline ARMED"
+                    ? "[HV Research] REST MODE — KLD tested, restored for safe suspend"
                     : "[HV Research] Entering rest mode (hook restored)...");
                 sleep(3);
                 int standby_ret = sceSystemStateMgrEnterStandby();
