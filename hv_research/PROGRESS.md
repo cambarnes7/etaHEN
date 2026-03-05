@@ -426,47 +426,117 @@ other sysent hooks in the codebase.
 6. **PTE Accessed bit**: post-resume PTE shows A=1 (was A=0 pre-suspend), confirming the
    CPU accessed the page table entry. This is normal — the kernel touched kdata pages.
 
+## Test Results: Run 7 (Fresh Boot, Gadget Armed) — Session 4
+
+### Run 7 — Fresh Boot (Minimal Gadget Armed During Suspend)
+- Same build as Session 3, but with apic_ops[2] → minimal gadget LEFT ARMED during suspend
+- Test 4a PASSED, Test 4b PASSED (3s stability confirmed)
+- apic_ops[2] set to kdata+0x150 (`mov eax, 1; ret`)
+- Notification displayed: "REST MODE — minimal gadget ARMED!"
+- **KERNEL PANIC** during `cpususpend_handler` — system never entered rest mode
+- Panic occurred immediately after the 3-second countdown
+- The minimal gadget has NO memory references, NO stack operations — just `mov eax, 1; ret`
+
+### Key Finding: HV Enforces NPT NX on kdata During Suspend
+
+**CONFIRMED: kdata code execution causes kernel panic during the suspend path.**
+
+This proves that the PS5 hypervisor enforces NPT No-Execute (NX) on kdata pages during
+`cpususpend_handler`, even though:
+- kdata execution works perfectly during normal operation (Test 4b: 3s stability)
+- The gadget has zero memory references (no DMAP writes, no stack ops)
+- Guest PTE NX is cleared (NX=0) on the kdata page
+- NPT allows execution on kdata during normal ring-0 operation
+
+The HV must be doing one of:
+1. **Tightening NPT permissions before suspend**: Before calling LAPIC suspend functions,
+   the HV modifies NPT entries to make kdata pages NX. This prevents any code in kdata
+   from executing during the critical suspend/resume window.
+2. **Intercepting execution faults during suspend**: The HV's #VMEXIT handler for NPT
+   violations may treat kdata execution as a security violation during suspend, killing
+   the guest instead of emulating/allowing it.
+
+**Impact on the flatz method:**
+- kdata-based hooks (cave trampoline, minimal gadget) CANNOT be used for apic_ops[2]
+  during suspend/resume
+- ktext-based hooks are required — the hook target must be in ktext (always executable)
+- Since ktext is XOM (execute-only via NPT), we cannot place custom code there
+- We need to find existing ktext gadgets or use a different approach entirely
+
 ---
 
 ## Current State of the Flatz Method
 
 The flatz suspend/resume method requires running code during early resume, before the HV sets up NPT protections. The key findings so far:
 
-**Proven (across 3 independent boot sessions):**
+**Proven (across 4 independent boot sessions):**
 - apic_ops[2] (xapic_mode) is called during LAPIC suspend/resume
 - We can hook it (KLD trampoline, kdata cave trampoline, or ktext gadget)
 - Cave markers, QA flags, and apic_ops values survive suspend/resume
 - Guest PTE NX-clear survives suspend/resume
 - KASLR slide is stable across resume
 - DMAP base is stable across resume (changes between boots)
-- Guest PTE NX-clear works for code execution in kdata
-- NPT allows execution on kdata pages (confirmed via ring-0 shellcode)
+- Guest PTE NX-clear works for code execution in kdata (normal ops only)
+- NPT allows execution on kdata pages during normal operation
 - kdata gadget (`mov eax, 1; ret`) survives 3s as apic_ops[2] during normal operation
 - kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
 - ktext remains XOM after resume on FW 4.03 (no free readability)
 - Rest mode is safe with: apic_ops[2] restored to original before suspend
 - Minimal gadget code and cave trampoline code persist in kdata across resume
 
-**Learned:**
-- DMAP writes during LAPIC suspend cause kernel panic (proof marker write crashed)
-- The HV likely restricts DMAP write permissions during the suspend path
-- kdata execution during normal ops is safe (Test 4b proves it) — suspend panic is
-  suspend-path specific
-- Test 4a failure was a code bug (wrong stride + PA arithmetic), not an execution issue
+**Confirmed Blockers:**
+- **kdata execution PANICS during suspend** — HV enforces NPT NX on kdata during
+  cpususpend_handler. Even `mov eax, 1; ret` (no memory refs) panics.
+- **DMAP writes during suspend PANIC** — proof marker write crashed (Session 1)
+- **ktext is XOM** — cannot read or write ktext via DMAP, cannot place custom code
+- **kmod pages are NPT read-protected** — can't find KLD trampoline via DMAP scan
 
-**Not Yet Tested (THIS BUILD):**
-- Leaving apic_ops[2] hooked to **minimal gadget** (`mov eax, 1; ret`) during suspend
-  - The minimal gadget is the safest possible hook: no memory refs, no stack ops
-  - If this works: kdata execution during suspend is safe (HV doesn't intercept)
-  - If this panics: HV restricts kdata execution during suspend → need ktext gadget
+**The Core Problem:**
+The flatz method needs `apic_ops[2]` to point to custom code that:
+1. Survives suspend (must be executable during cpususpend_handler)
+2. Does useful work during resume (before HV reinitializes NPT)
+3. Returns 1 (xAPIC mode) so the kernel doesn't crash
+
+But:
+- kdata code is blocked during suspend (NPT NX enforced)
+- ktext is execute-only (can't inject custom code)
+- kmod pages are NPT read-protected (can't find/verify trampoline)
+
+**Possible Approaches:**
+1. **Find existing ktext gadgets** — Use known kstuff offsets to construct a ROP-style
+   chain. The challenge: apic_ops[2] is a function pointer (call, not jmp), so we get
+   exactly one instruction sequence. We need a ktext address that does `mov eax, 1; ret`
+   — but that's just the original xapic_mode (no-op hook).
+
+2. **Hook a different apic_ops slot** — If a different slot is called ONLY during resume
+   (not suspend), we could hook it with kdata code. Need to identify which slots are
+   called when.
+
+3. **Two-phase approach** — Keep original xapic_mode for suspend. After resume, the
+   tool re-exploits and can set up hooks for the NEXT suspend/resume cycle. But this
+   doesn't help with the current resume.
+
+4. **VMCB discovery** — If we can find the HV's VMCB (Virtual Machine Control Block) in
+   physical memory and modify it, we might be able to disable NPT entirely. The NPT
+   scan found 52-87 PT pages with kdata/ktext refs, but no VMCB candidates yet.
+
+5. **kmod text execution during suspend** — The kmod .text section might be in a
+   different NPT region than kdata. If kmod pages are NPT-executable during suspend
+   (they work during normal ops via IDT trampoline), the KLD trampoline could work.
+   The previous concern was "secondary CPU" issues, but the real test hasn't been done.
+
+6. **Use LSTAR/IDT hooks** — Instead of apic_ops, hook the syscall entry point (LSTAR)
+   or an IDT handler that runs during resume. These point to ktext addresses, but if
+   we could redirect LSTAR via MSR write (ring-0 shellcode before suspend)...
+   However, MSR writes may be intercepted by the HV.
 
 **Next Steps:**
-1. **Leave minimal gadget armed during suspend** — modify Phase 7 to hook apic_ops[2] →
-   kdata+0x150 (`mov eax, 1; ret`) and NOT restore before suspend
-2. Enter rest mode → wake → re-exploit → check if apic_ops[2] still points to minimal gadget
-3. If rest mode works: kdata execution during suspend is confirmed safe!
-4. Then test cave trampoline (with call-through to original) during suspend
-5. Then add useful work to the trampoline (e.g., disable HV NPT protections)
+1. **Test KLD trampoline during suspend** — The kmod .text section is separate from kdata.
+   If its NPT permissions differ, the KLD trampoline might survive suspend. This requires
+   re-testing with the KLD trampoline armed (not the cave trampoline).
+2. **Enumerate apic_ops slot usage** — Determine which slots are called during suspend vs
+   resume. If a resume-only slot exists, hook it with kdata code.
+3. **VMCB hunting** — Expand the NPT scan to look for VMCB signatures in physical memory.
 
 ---
 
