@@ -99,6 +99,7 @@ static volatile int g_signal_received = 0;
 static int discover_dmap_base(void) {
     uint64_t proc, vmspace, pmap_addr;
     uint64_t pm_pml4;
+    uint64_t candidate_cr3;
 
     proc = kernel_get_proc(getpid());
     if (!proc) {
@@ -106,14 +107,21 @@ static int discover_dmap_base(void) {
         return -1;
     }
 
-    vmspace = kernel_getlong(proc + OFFSET_PROC_P_VMSPACE);
+    kernel_copyout(proc + OFFSET_PROC_P_VMSPACE, &vmspace, sizeof(vmspace));
     if (!vmspace) {
         printf("[-] Failed to get vmspace\n");
         return -1;
     }
 
-    pmap_addr = vmspace + 0xC0;
-    pm_pml4 = kernel_getlong(pmap_addr + OFFSET_PMAP_PM_PML4);
+    /* On PS5, vm_pmap is a pointer at offset 0x1D0 in vmspace */
+    kernel_copyout(vmspace + 0x1D0, &pmap_addr, sizeof(pmap_addr));
+    if (!pmap_addr) {
+        printf("[-] Failed to get pmap\n");
+        return -1;
+    }
+
+    /* Read pm_pml4 at pmap + 0x20 */
+    kernel_copyout(pmap_addr + OFFSET_PMAP_PM_PML4, &pm_pml4, sizeof(pm_pml4));
 
     if (!pm_pml4) {
         printf("[-] Failed to get pml4\n");
@@ -121,33 +129,45 @@ static int discover_dmap_base(void) {
     }
     printf("[*] pm_pml4 = 0x%lx\n", pm_pml4);
 
-    /* Try known CR3 offsets to derive DMAP base */
-    for (uint64_t cr3_off = 0x1000000; cr3_off < 0x40000000; cr3_off += 0x200000) {
-        /* Validate: DMAP base should be page-aligned, in upper canonical range */
-        uint64_t dmap = pm_pml4 - cr3_off;
-        if ((dmap & 0xFFF) != 0) continue;
-        if (dmap < 0xFFFF800000000000ULL) continue;
+    /* Try candidate offsets for pm_cr3 in the pmap structure */
+    static const int cr3_offsets[] = {0x28, 0x30, 0x38, 0x40, 0x48};
+    for (int i = 0; i < 5; i++) {
+        kernel_copyout(pmap_addr + cr3_offsets[i], &candidate_cr3, sizeof(candidate_cr3));
 
-        /* Try reading a known MMIO register via this DMAP candidate */
-        uint64_t test_val;
-        if (kernel_copyout(dmap + 0xE0500000, &test_val, 8) == 0) {
-            g_dmap_base = dmap;
-            g_cr3_phys = cr3_off;
-            printf("[+] DMAP base discovered: 0x%lx (cr3_offset=0x%lx)\n",
-                   g_dmap_base, g_cr3_phys);
-            return 0;
+        /* CR3 should be a reasonable physical address (< 32GB, non-zero, page-aligned) */
+        if (candidate_cr3 == 0 || candidate_cr3 > 0x800000000ULL)
+            continue;
+        if (candidate_cr3 & 0xFFF)
+            continue;
+
+        uint64_t candidate_dmap = pm_pml4 - candidate_cr3;
+
+        /* DMAP base should be in the high canonical half */
+        if ((candidate_dmap >> 47) != 0 && candidate_dmap > 0xFFFF800000000000ULL) {
+            /* Validate: read through DMAP without crashing */
+            uint64_t verify;
+            if (kernel_copyout(candidate_dmap + candidate_cr3 + OFFSET_PMAP_PM_PML4,
+                              &verify, sizeof(verify)) == 0) {
+                g_dmap_base = candidate_dmap;
+                g_cr3_phys = candidate_cr3;
+                printf("[+] DMAP base discovered: 0x%lx (cr3_offset=0x%x, cr3=0x%lx)\n",
+                       g_dmap_base, cr3_offsets[i], candidate_cr3);
+                return 0;
+            }
         }
     }
 
     /* Fallback: try common PS5 DMAP bases */
     printf("[!] Could not discover DMAP via pmap, trying common bases...\n");
     static const uint64_t common_dmaps[] = {
-        0xFFFF800000000000ULL, 0xFFFFE00000000000ULL,
-        0xFFFFE2C000000000ULL, 0xFFFF801800000000ULL,
+        0xFFFFFF0000000000ULL,  /* DMPML4I=0x1FE, DMPDPI=0 */
+        0xFFFFFE8000000000ULL,  /* DMPML4I=0x1FD, DMPDPI=0 */
+        0xFFFF808000000000ULL,  /* DMPML4I=0x101, DMPDPI=2 */
+        0xFFFF800000000000ULL,  /* DMPML4I=0x100, DMPDPI=0 */
     };
     for (unsigned i = 0; i < sizeof(common_dmaps)/sizeof(common_dmaps[0]); i++) {
-        uint64_t test_val;
-        if (kernel_copyout(common_dmaps[i] + 0xE0500000, &test_val, 8) == 0) {
+        uint32_t test_val;
+        if (kernel_copyout(common_dmaps[i] + 0xE0500000ULL, &test_val, sizeof(test_val)) == 0) {
             g_dmap_base = common_dmaps[i];
             printf("[+] DMAP base found via fallback: 0x%lx\n", g_dmap_base);
             return 0;
