@@ -1024,22 +1024,26 @@ static int check_nx_clear(uint64_t kva) {
  *  Phase 1: Generic TF Single-Step Trace
  *
  *  Traces an arbitrary kernel function by:
- *  1. Writing a #DB handler to kdata (NX-cleared)
- *  2. Hooking IDT[1] to point to our handler
- *  3. Writing a launcher to kdata that sets TF and calls the target
- *  4. Hooking a sysent entry to point to the launcher
- *  5. Calling the hooked syscall from userland
- *  6. Reading the trace buffer
+ *  1. Allocating a separate direct memory buffer for shellcode
+ *  2. Clearing NX on its guest PDE so code can execute
+ *  3. Writing #DB handler + launcher shellcode to the buffer
+ *  4. Hooking IDT[1] to the #DB handler
+ *  5. Hooking sysent[253] to the launcher
+ *  6. Calling syscall(253) from userland
+ *  7. Reading the trace buffer (RIP, RAX per instruction)
  *
- *  The trace records (RIP, RAX) for each instruction executed.
- *  On 4.03 we verify against known kstuff offsets.
+ *  IMPORTANT: We do NOT use kdata for shellcode — those offsets
+ *  contain active kernel data and overwriting them causes panics.
+ *  Instead we allocate fresh physically-contiguous memory.
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define TF_MAX_TRACE    256
 #define TF_TEST_SYSCALL 253   /* nosys — safe to hook */
-#define TF_DB_OFF       0x200 /* #DB handler in kdata page */
-#define TF_LAUNCHER_OFF 0x280 /* launcher in kdata page */
-#define TF_TRACE_OFF    0x400 /* trace buffer in kdata page */
+#define TF_DB_OFF       0x000 /* #DB handler at start of buffer */
+#define TF_LAUNCHER_OFF 0x100 /* launcher at +256 */
+#define TF_TRACE_OFF    0x200 /* trace buffer at +512 */
+/* Buffer size: 0x200 + 256*16 = 0x1200, allocate 0x4000 (16KB) */
+#define TF_BUF_SIZE     0x4000
 
 struct tf_trace_entry {
     uint64_t rip;
@@ -1066,35 +1070,64 @@ static int tf_trace_function(uint64_t target_func, struct tf_trace_result *out) 
         return -1;
     }
 
-    uint64_t kdata_pa = va_to_pa(g_kdata_base);
-    if (!kdata_pa) {
-        printf("[-] kdata VA->PA failed\n");
+    /* Allocate a dedicated buffer for shellcode + trace data.
+     * This avoids overwriting active kernel data in kdata. */
+    off_t tf_phys = 0;
+    void *tf_vaddr = NULL;
+
+    int ret = sceKernelAllocateDirectMemory(0, 0x180000000ULL,
+        TF_BUF_SIZE, 0x4000, SCE_KERNEL_WB_ONION, &tf_phys);
+    if (ret != 0) {
+        printf("[-] AllocateDirectMemory for TF buffer failed: 0x%x\n", ret);
+        return -1;
+    }
+    ret = sceKernelMapDirectMemory(&tf_vaddr, TF_BUF_SIZE,
+        SCE_KERNEL_PROT_CPU_RW, 0, tf_phys, 0x4000);
+    if (ret != 0) {
+        printf("[-] MapDirectMemory for TF buffer failed: 0x%x\n", ret);
+        return -1;
+    }
+    memset(tf_vaddr, 0, TF_BUF_SIZE);
+
+    /* Get CPU PA via page table walk */
+    uint64_t tf_cpu_pa = va_to_cpu_pa((uint64_t)tf_vaddr);
+    if (!tf_cpu_pa) {
+        printf("[-] Page table walk failed for TF buffer\n");
         return -1;
     }
 
-    /* Check/clear NX on kdata */
-    if (!check_nx_clear(g_kdata_base)) {
-        printf("[*] Clearing NX on kdata page...\n");
-        if (!clear_pte_nx(g_kdata_base)) {
-            printf("[-] Failed to clear NX\n");
+    uint64_t tf_kva = g_dmap_base + tf_cpu_pa;
+    printf("[+] TF buffer: VA=0x%lx PA=0x%lx DMAP=0x%lx\n",
+           (unsigned long)tf_vaddr, (unsigned long)tf_cpu_pa,
+           (unsigned long)tf_kva);
+
+    /* DMAP verify */
+    volatile uint64_t *tp = (volatile uint64_t *)tf_vaddr;
+    *tp = 0xDEADFACE11111111ULL;
+    uint64_t vfy;
+    kernel_copyout(tf_kva, &vfy, 8);
+    if (vfy != 0xDEADFACE11111111ULL) {
+        printf("[-] TF buffer DMAP verify failed!\n");
+        return -1;
+    }
+    *tp = 0;
+
+    /* Clear NX on the PDE covering our DMAP buffer address */
+    if (!check_nx_clear(tf_kva)) {
+        printf("[*] Clearing NX on TF buffer PDE...\n");
+        if (!clear_pte_nx(tf_kva)) {
+            printf("[-] Failed to clear NX on TF buffer\n");
             return -1;
         }
     }
-    printf("[+] kdata NX=0 (code execution enabled)\n");
+    printf("[+] TF buffer NX=0 (code execution enabled)\n");
 
-    /* Compute addresses */
-    uint64_t db_handler_kva  = g_kdata_base + TF_DB_OFF;
-    uint64_t launcher_kva    = g_kdata_base + TF_LAUNCHER_OFF;
-    uint64_t trace_buf_kva __attribute__((unused)) = g_kdata_base + TF_TRACE_OFF;
-    uint64_t db_handler_dmap = g_dmap_base + kdata_pa + TF_DB_OFF;
-    uint64_t launcher_dmap   = g_dmap_base + kdata_pa + TF_LAUNCHER_OFF;
-    uint64_t trace_buf_dmap  = g_dmap_base + kdata_pa + TF_TRACE_OFF;
-
-    /* Save original kdata content for restoration */
-    uint8_t backup_db[128], backup_launcher[128], backup_trace[16];
-    kernel_copyout(db_handler_dmap, backup_db, sizeof(backup_db));
-    kernel_copyout(launcher_dmap, backup_launcher, sizeof(backup_launcher));
-    kernel_copyout(trace_buf_dmap, backup_trace, sizeof(backup_trace));
+    /* Compute DMAP addresses for shellcode/trace regions */
+    uint64_t db_handler_kva  = tf_kva + TF_DB_OFF;
+    uint64_t launcher_kva    = tf_kva + TF_LAUNCHER_OFF;
+    uint64_t db_handler_dmap = tf_kva + TF_DB_OFF;
+    uint64_t launcher_dmap   = tf_kva + TF_LAUNCHER_OFF;
+    uint64_t trace_buf_dmap  = tf_kva + TF_TRACE_OFF;
 
     /* ── Build #DB handler shellcode ──
      *
@@ -1373,10 +1406,7 @@ static int tf_trace_function(uint64_t target_func, struct tf_trace_result *out) 
     printf("\n    ktext entries: %d / %d total\n", ktext_count, nread);
 
 restore:
-    /* Restore kdata */
-    kernel_copyin(backup_db, db_handler_dmap, sizeof(backup_db));
-    kernel_copyin(backup_launcher, launcher_dmap, sizeof(backup_launcher));
-    kernel_copyin(backup_trace, trace_buf_dmap, sizeof(backup_trace));
+    /* No kdata to restore — we used a dedicated buffer */
     return (out->count > 0) ? 0 : -1;
 }
 
