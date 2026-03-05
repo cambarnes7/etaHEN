@@ -18,8 +18,28 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <elf.h>
+
+#include <machine/sysarch.h>
 
 #include <ps5/kernel.h>
+#include <ps5/payload.h>
+
+/* ─── Global state ─── */
+
+static uint64_t g_dmap_base = 0;
+static uint64_t g_kdata_base = 0;
+static uint64_t g_ktext_base = 0;
+static uint64_t g_fw_version = 0;
+static uint64_t g_cr3_phys = 0;
+
+/* Sysent discovery */
+static uint64_t g_sysent_kva = 0;
+#define SYSENT_STRIDE 0x30  /* 48 bytes per sysent entry on PS5 */
+
+/* apic_ops discovery */
+static uint64_t g_apic_ops_addr = 0;
 
 /* ─── Notification helper ─── */
 
@@ -137,6 +157,160 @@ static int kekcall_kstuff_check(void) {
     return (int)ret;
 }
 
+/* ─── r0gdb / prosper0gdb loading (from PS5_kldload) ─── */
+
+/* Embedded prosper0gdb binary (provides kernel function call capabilities) */
+#include "payload_bin.c"
+
+typedef struct __r0gdb_functions {
+    int (*r0gdb_init_ptr)(void *ds, int a, int b, uintptr_t c, uintptr_t d);
+    uint64_t (*r0gdb_kmalloc)(size_t sz);
+    uint64_t (*r0gdb_kmem_alloc)(size_t sz);
+    uint64_t (*r0gdb_kfncall)(uint64_t fn, ...);
+    uint64_t (*r0gdb_kproc_create)(uint64_t kfn, uint64_t kthread_args,
+                                    uint64_t kproc_name);
+} __attribute__((__packed__)) r0gdb_functions;
+
+static r0gdb_functions g_r0gdb;
+static int g_r0gdb_loaded = 0;
+
+#define R0GDB_ROUND_PG(x) (((x) + (0x4000 - 1)) & ~(0x4000 - 1))
+#define R0GDB_TRUNC_PG(x) ((x) & ~(0x4000 - 1))
+#define R0GDB_PFLAGS(x) ((((x) & PF_R) ? PROT_READ  : 0) | \
+                          (((x) & PF_W) ? PROT_WRITE : 0) | \
+                          (((x) & PF_X) ? PROT_EXEC  : 0))
+
+static int load_r0gdb(void) {
+    printf("[*] Loading prosper0gdb (r0gdb)...\n");
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)payload_bin;
+    Elf64_Phdr *phdr = (Elf64_Phdr *)(payload_bin + ehdr->e_phoff);
+    void *base = (void *)0x0000000926100000ULL;
+
+    /* Compute virtual memory region size */
+    uintptr_t min_vaddr = (uintptr_t)-1;
+    uintptr_t max_vaddr = 0;
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_vaddr < min_vaddr)
+            min_vaddr = phdr[i].p_vaddr;
+        if (max_vaddr < phdr[i].p_vaddr + phdr[i].p_memsz)
+            max_vaddr = phdr[i].p_vaddr + phdr[i].p_memsz;
+    }
+    min_vaddr = R0GDB_TRUNC_PG(min_vaddr);
+    max_vaddr = R0GDB_ROUND_PG(max_vaddr);
+    size_t base_size = max_vaddr - min_vaddr;
+
+    /* Allocate memory */
+    base = mmap(base, base_size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        printf("[-] r0gdb mmap failed: %s\n", strerror(errno));
+        return -1;
+    }
+    printf("[+] r0gdb mapped at %p (%zu bytes)\n", base, base_size);
+
+    /* Load PT_LOAD segments */
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD && phdr[i].p_memsz && phdr[i].p_filesz) {
+            memcpy((uint8_t *)base + phdr[i].p_vaddr,
+                   payload_bin + phdr[i].p_offset,
+                   phdr[i].p_filesz);
+        }
+    }
+
+    /* Set protection bits */
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD || phdr[i].p_memsz == 0)
+            continue;
+        if (mprotect((uint8_t *)base + phdr[i].p_vaddr,
+                     R0GDB_ROUND_PG(phdr[i].p_memsz),
+                     R0GDB_PFLAGS(phdr[i].p_flags))) {
+            printf("[-] r0gdb mprotect failed: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    /* Step 1: Call r0gdb entry point to populate function pointers.
+     * The entry function receives payload_args + kernel_dynlib_dlsym ptr
+     * + r0gdb_functions struct ptr. It writes function pointers into g_r0gdb. */
+    void (*entry)(void *) = (void (*)(void *))(
+        (uint8_t *)base + ehdr->e_entry);
+
+    payload_args_t *args = payload_get_args();
+    if (!args) {
+        printf("[-] payload_get_args() returned NULL\n");
+        return -1;
+    }
+
+    printf("[*] payload_args: dlsym=%p rwpair=[%d,%d] kdata=0x%lx\n",
+           (void *)args->sys_dynlib_dlsym,
+           args->rwpair[0], args->rwpair[1],
+           (unsigned long)args->kdata_base_addr);
+
+    /* Build extended args matching prosper0gdb's expected format */
+    void *hacky_args = malloc(0x200);
+    if (!hacky_args) {
+        printf("[-] malloc failed\n");
+        return -1;
+    }
+    memset(hacky_args, 0, 0x200);
+    memcpy(hacky_args, args, sizeof(payload_args_t));
+    uintptr_t *hack = (uintptr_t *)((uint8_t *)hacky_args + sizeof(payload_args_t));
+    *hack = (uintptr_t)&kernel_dynlib_dlsym;
+    *(hack + 1) = (uintptr_t)&g_r0gdb;
+
+    printf("[*] Calling r0gdb entry at %p...\n", (void *)entry);
+    fflush(stdout);
+    entry(hacky_args);
+    printf("[+] r0gdb entry returned\n");
+
+    /* Step 2: Initialize r0gdb (separate call after entry populates ptrs) */
+    if (!g_r0gdb.r0gdb_init_ptr) {
+        printf("[-] r0gdb_init_ptr is NULL after entry()\n");
+        printf("    r0gdb struct dump: ");
+        uint8_t *p = (uint8_t *)&g_r0gdb;
+        for (size_t i = 0; i < sizeof(g_r0gdb); i++)
+            printf("%02x ", p[i]);
+        printf("\n");
+        free(hacky_args);
+        return -1;
+    }
+
+    printf("[*] Calling r0gdb_init_ptr...\n");
+    fflush(stdout);
+    int init_ret = g_r0gdb.r0gdb_init_ptr(
+        (void *)args->sys_dynlib_dlsym,
+        (int)args->rwpair[0], (int)args->rwpair[1],
+        0, args->kdata_base_addr);
+
+    if (init_ret != 0) {
+        printf("[-] r0gdb init failed (ret=%d)\n", init_ret);
+        free(hacky_args);
+        return -1;
+    }
+
+    /* Report function pointers */
+    printf("[+] r0gdb initialized. Function pointers:\n");
+    printf("    init_ptr     = %p\n", (void *)(uintptr_t)g_r0gdb.r0gdb_init_ptr);
+    printf("    kmalloc      = %p\n", (void *)(uintptr_t)g_r0gdb.r0gdb_kmalloc);
+    printf("    kmem_alloc   = %p\n", (void *)(uintptr_t)g_r0gdb.r0gdb_kmem_alloc);
+    printf("    kfncall      = %p\n", (void *)(uintptr_t)g_r0gdb.r0gdb_kfncall);
+    printf("    kproc_create = %p\n", (void *)(uintptr_t)g_r0gdb.r0gdb_kproc_create);
+
+    if (!g_r0gdb.r0gdb_kmem_alloc || !g_r0gdb.r0gdb_kproc_create) {
+        printf("[-] r0gdb missing required function pointers\n");
+        free(hacky_args);
+        return -1;
+    }
+
+    g_r0gdb_loaded = 1;
+    printf("[+] r0gdb loaded and initialized successfully\n");
+
+    free(hacky_args);
+    return 0;
+}
+
 /* Args struct passed to flat binary module_start (must match hv_flat.c) */
 struct kmod_flat_args {
     uint64_t output_kva;
@@ -164,6 +338,104 @@ struct kmod_result_buf {
         uint64_t value;
     } msr_results[16];
 };
+
+/* ─── Load kmod via r0gdb (PS5_kldload approach) ─── */
+
+static int load_kmod_r0gdb(void *result_vaddr, uint64_t result_kva) {
+    printf("\n[*] Trying r0gdb approach (PS5_kldload)...\n");
+
+    /* Load r0gdb if not already loaded */
+    if (!g_r0gdb_loaded) {
+        if (load_r0gdb() != 0) {
+            printf("[-] Failed to load r0gdb\n");
+            return -1;
+        }
+    }
+
+    /* Allocate kernel memory for our flat binary payload */
+    size_t payload_size = (size_t)KMOD_FLAT_SZ;
+    uint64_t exec_code = g_r0gdb.r0gdb_kmem_alloc(payload_size);
+    if (!exec_code || exec_code == (uint64_t)-1) {
+        printf("[-] r0gdb_kmem_alloc(%zu) failed: 0x%lx\n",
+               payload_size, (unsigned long)exec_code);
+        return -1;
+    }
+    printf("[+] Kernel code allocation: 0x%lx (%zu bytes)\n",
+           (unsigned long)exec_code, payload_size);
+
+    /* Allocate kernel memory for kthread name */
+    uint64_t kproc_name = g_r0gdb.r0gdb_kmem_alloc(0x100);
+    if (!kproc_name || kproc_name == (uint64_t)-1) {
+        printf("[-] r0gdb_kmem_alloc(name) failed\n");
+        return -1;
+    }
+
+    /* Allocate kernel memory for kproc args */
+    uint64_t kthread_args = g_r0gdb.r0gdb_kmem_alloc(sizeof(struct kmod_flat_args));
+    if (!kthread_args || kthread_args == (uint64_t)-1) {
+        printf("[-] r0gdb_kmem_alloc(args) failed\n");
+        return -1;
+    }
+
+    printf("[+] Kernel allocations:\n");
+    printf("    exec_code:    0x%lx\n", (unsigned long)exec_code);
+    printf("    kproc_name:   0x%lx\n", (unsigned long)kproc_name);
+    printf("    kthread_args: 0x%lx\n", (unsigned long)kthread_args);
+
+    /* Set up args for our flat binary payload */
+    struct kmod_flat_args flat_args;
+    flat_args.output_kva = result_kva;
+    flat_args.kdata_base = g_kdata_base;
+    flat_args.fw_ver = (uint32_t)(g_fw_version >> 16);
+    flat_args.pad = 0;
+
+    /* Write payload and args to kernel memory */
+    printf("[*] Writing payload to kernel memory...\n");
+    kernel_copyin(KMOD_FLAT, exec_code, payload_size);
+
+    static const char kthread_name[] = "hv_research\0";
+    kernel_copyin(kthread_name, kproc_name, sizeof(kthread_name));
+    kernel_copyin(&flat_args, kthread_args, sizeof(flat_args));
+
+    /* Verify write */
+    uint8_t verify[16];
+    kernel_copyout(exec_code, verify, 16);
+    printf("[*] First 16 bytes at exec_code: ");
+    for (int i = 0; i < 16; i++) printf("%02x ", verify[i]);
+    printf("\n");
+
+    if (memcmp(verify, KMOD_FLAT, 16) == 0)
+        printf("[+] Payload write verified OK\n");
+    else
+        printf("[!] Payload verification mismatch (may still work)\n");
+
+    /* Launch kernel thread to execute our payload */
+    printf("[*] Creating kernel thread at 0x%lx...\n", (unsigned long)exec_code);
+    fflush(stdout);
+
+    uint64_t kproc_ret = g_r0gdb.r0gdb_kproc_create(exec_code, kthread_args,
+                                                       kproc_name);
+    printf("[+] kproc_create returned: 0x%lx\n", (unsigned long)kproc_ret);
+
+    /* Wait for kmod to complete */
+    printf("[*] Waiting for kmod completion...\n");
+    struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
+
+    for (int i = 0; i < 50; i++) {  /* 5 seconds max */
+        usleep(100000);  /* 100ms */
+        if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
+            printf("[+] Kmod completed (magic OK, status=DONE)\n");
+            return 0;
+        }
+        if (results->magic == KMOD_MAGIC) {
+            printf("    magic OK, status=%u (waiting...)\n", results->status);
+        }
+    }
+
+    printf("[!] Kmod did not complete (magic=0x%lx status=%u)\n",
+           (unsigned long)results->magic, results->status);
+    return -1;
+}
 
 /* kld syscall numbers */
 #define SYS_kldload     304
@@ -199,20 +471,7 @@ struct kld_file_stat {
 #define KSTUFF_MALLOC_OFF      (-0xa9b00LL)
 #define KSTUFF_KERNEL_PMAP_STORE_OFF 0x3257a78ULL
 
-/* ─── Global state ─── */
-
-static uint64_t g_dmap_base = 0;
-static uint64_t g_kdata_base = 0;
-static uint64_t g_ktext_base = 0;
-static uint64_t g_fw_version = 0;
-static uint64_t g_cr3_phys = 0;
-
-/* Sysent discovery */
-static uint64_t g_sysent_kva = 0;
-#define SYSENT_STRIDE 0x30  /* 48 bytes per sysent entry on PS5 */
-
-/* apic_ops discovery */
-static uint64_t g_apic_ops_addr = 0;
+/* (Global state declared earlier) */
 static int      g_apic_ops_count = 0;
 
 /* Kmod info */
@@ -568,6 +827,277 @@ typedef struct {
 } Elf64_Sym_t;
 
 #define SHT_SYMTAB 2
+
+/* ─── ktext gadget scanner ───
+ *
+ * Scans ktext for useful instruction sequences. Since we CAN read ktext
+ * via DMAP (kernel_copyout works for small reads) but CANNOT write to it
+ * (HV NPT enforces read-only on ktext physical pages), we need to find
+ * existing code gadgets to construct calling mechanisms.
+ *
+ * Key gadgets:
+ *   RDMSR (0F 32)       - read MSR, needs ECX set first
+ *   WRMSR (0F 30)       - write MSR
+ *   JMP [RSI] (FF 26)   - jump to [rsi], used by Byepervisor kexec
+ *   MOV CR0 (0F 20 C0)  - read CR0 into RAX
+ *   POP RCX; RET (59 C3) - set ECX from stack
+ */
+
+/* Gadget definitions for scanning */
+struct gadget_pattern {
+    const char *name;
+    const uint8_t *bytes;
+    size_t len;
+};
+
+static const uint8_t PAT_RDMSR[]    = {0x0F, 0x32};
+static const uint8_t PAT_WRMSR[]    = {0x0F, 0x30};
+static const uint8_t PAT_JMP_RSI[]  = {0xFF, 0x26};
+static const uint8_t PAT_POP_RCX[]  = {0x59, 0xC3};
+static const uint8_t PAT_MOV_CR0[]  = {0x0F, 0x20, 0xC0};
+static const uint8_t PAT_MOV_CR3[]  = {0x0F, 0x20, 0xD8};
+static const uint8_t PAT_MOV_CR4[]  = {0x0F, 0x20, 0xE0};
+/* PAT_IRETQ removed - not scanned */
+
+/* Results */
+#define MAX_GADGETS 32
+struct gadget_result {
+    uint64_t kva;           /* kernel virtual address */
+    const char *name;
+    uint8_t context[16];    /* bytes around the gadget for analysis */
+};
+
+static struct gadget_result g_gadgets[MAX_GADGETS];
+static int g_num_gadgets = 0;
+
+/* Search for a byte pattern in a buffer */
+static int find_pattern(const uint8_t *buf, size_t buflen,
+                        const uint8_t *pat, size_t patlen,
+                        size_t *offsets, int max_matches) {
+    int count = 0;
+    for (size_t i = 0; i + patlen <= buflen && count < max_matches; i++) {
+        int match = 1;
+        for (size_t j = 0; j < patlen; j++) {
+            if (buf[i+j] != pat[j]) { match = 0; break; }
+        }
+        if (match) offsets[count++] = i;
+    }
+    return count;
+}
+
+static void scan_ktext_gadgets(void) {
+    printf("\n[*] Scanning ktext for gadgets...\n");
+
+    if (!g_ktext_base || !g_kdata_base || !g_dmap_base) {
+        printf("[-] Missing base addresses\n");
+        return;
+    }
+
+    static const struct gadget_pattern patterns[] = {
+        {"RDMSR",       PAT_RDMSR,   2},
+        {"WRMSR",       PAT_WRMSR,   2},
+        {"JMP_RSI",     PAT_JMP_RSI, 2},
+        {"POP_RCX_RET", PAT_POP_RCX, 2},
+        {"MOV_CR0",     PAT_MOV_CR0, 3},
+        {"MOV_CR3",     PAT_MOV_CR3, 3},
+        {"MOV_CR4",     PAT_MOV_CR4, 3},
+    };
+    int num_patterns = sizeof(patterns) / sizeof(patterns[0]);
+
+    /* Track counts per pattern */
+    int pattern_counts[7] = {0};
+    uint64_t first_match[7] = {0};
+
+    /* Scan ktext in 256-byte chunks.
+     * ktext is ~12MB so this is ~49152 reads. We sample every 8th page
+     * for speed (covers 1 page per 2MB region minimum), then do a fine
+     * scan around interesting hits. */
+    uint64_t ktext_size = g_kdata_base - g_ktext_base;
+    uint64_t scan_step = 0x1000;  /* scan every page */
+    uint64_t chunk_size = 256;
+    uint64_t pages_read = 0;
+    (void)0; /* pages_failed removed */
+
+    printf("[*] ktext range: 0x%lx - 0x%lx (%lu KB)\n",
+           (unsigned long)g_ktext_base, (unsigned long)g_kdata_base,
+           (unsigned long)(ktext_size / 1024));
+
+    for (uint64_t va = g_ktext_base; va < g_kdata_base; va += scan_step) {
+        uint64_t pa = va_to_pa(va);
+        if (!pa) continue;
+
+        /* Read page in 256-byte chunks */
+        for (uint64_t off = 0; off < 0x1000 && va + off < g_kdata_base; off += chunk_size) {
+            uint8_t buf[256];
+            if (kernel_copyout(g_dmap_base + pa + off, buf, chunk_size) != 0)
+                continue;
+
+            /* Search for each pattern */
+            for (int p = 0; p < num_patterns; p++) {
+                size_t offsets[8];
+                int n = find_pattern(buf, chunk_size,
+                                     patterns[p].bytes, patterns[p].len,
+                                     offsets, 8);
+                for (int i = 0; i < n; i++) {
+                    uint64_t gadget_kva = va + off + offsets[i];
+                    pattern_counts[p]++;
+
+                    /* Store first few of each type */
+                    if (pattern_counts[p] <= 3 && g_num_gadgets < MAX_GADGETS) {
+                        struct gadget_result *g = &g_gadgets[g_num_gadgets++];
+                        g->kva = gadget_kva;
+                        g->name = patterns[p].name;
+                        /* Copy context (up to 16 bytes from match point) */
+                        size_t ctx_avail = chunk_size - offsets[i];
+                        if (ctx_avail > 16) ctx_avail = 16;
+                        memcpy(g->context, buf + offsets[i], ctx_avail);
+                        if (ctx_avail < 16) memset(g->context + ctx_avail, 0, 16 - ctx_avail);
+                    }
+                    if (pattern_counts[p] == 1)
+                        first_match[p] = gadget_kva;
+                }
+            }
+        }
+        pages_read++;
+
+        /* Progress every 1000 pages */
+        if (pages_read % 2000 == 0) {
+            printf("    Scanned %lu pages...\r", (unsigned long)pages_read);
+            fflush(stdout);
+        }
+    }
+
+    printf("[+] Scanned %lu ktext pages                    \n", (unsigned long)pages_read);
+
+    /* Report results */
+    for (int p = 0; p < num_patterns; p++) {
+        if (pattern_counts[p] > 0) {
+            printf("    %-12s: %d found, first at ktext+0x%lx\n",
+                   patterns[p].name, pattern_counts[p],
+                   (unsigned long)(first_match[p] - g_ktext_base));
+        } else {
+            printf("    %-12s: not found\n", patterns[p].name);
+        }
+    }
+
+    /* Dump context for first few gadgets of interest */
+    printf("\n[*] Gadget details:\n");
+    for (int i = 0; i < g_num_gadgets; i++) {
+        struct gadget_result *g = &g_gadgets[i];
+        printf("    %s @ 0x%lx (ktext+0x%lx): ",
+               g->name, (unsigned long)g->kva,
+               (unsigned long)(g->kva - g_ktext_base));
+        for (int j = 0; j < 16; j++)
+            printf("%02x ", g->context[j]);
+        printf("\n");
+    }
+
+    /* Check for usable RDMSR gadget: look for "pop rcx; rdmsr" or
+     * "mov ecx, ...; rdmsr; ret" near RDMSR locations */
+    for (int i = 0; i < g_num_gadgets; i++) {
+        if (strcmp(g_gadgets[i].name, "RDMSR") == 0) {
+            /* Check if preceded by pop rcx (59) - would be at kva-1 */
+            uint64_t pre_pa = va_to_pa(g_gadgets[i].kva - 4);
+            if (pre_pa) {
+                uint8_t pre[4];
+                if (kernel_copyout(g_dmap_base + pre_pa, pre, 4) == 0) {
+                    printf("    RDMSR@0x%lx pre-context: %02x %02x %02x %02x\n",
+                           (unsigned long)(g_gadgets[i].kva - g_ktext_base),
+                           pre[0], pre[1], pre[2], pre[3]);
+                    /* Check for "pop rcx; rdmsr" */
+                    if (pre[2] == 0x59 && pre[3] == 0x0F) {
+                        printf("    *** FOUND: pop rcx; rdmsr sequence! ***\n");
+                    }
+                    /* Check for ret after rdmsr (context[2]) */
+                    if (g_gadgets[i].context[2] == 0xC3) {
+                        printf("    *** FOUND: rdmsr; ret sequence! ***\n");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ─── Read MSR/CR values from kernel data structures ───
+ *
+ * Extract MSR/CR values directly from kernel memory without ring 0.
+ * Many values are stored in per-CPU or thread structures. */
+
+static void read_msr_from_kernel_data(void) {
+    printf("\n[*] Reading MSR/CR values from kernel data structures...\n");
+
+    /* CR3: already known from pmap */
+    printf("    CR3            = 0x%016lx (from pmap)\n", (unsigned long)g_cr3_phys);
+
+    /* Try sysarch() for FS_BASE and GS_BASE (ring 3 values) */
+    {
+        uint64_t fsbase = 0, gsbase = 0;
+        if (sysarch(AMD64_GET_FSBASE, (void *)&fsbase) == 0)
+            printf("    FS_BASE (r3)   = 0x%016lx (via sysarch)\n", (unsigned long)fsbase);
+        else
+            printf("    FS_BASE (r3)   = sysarch failed (errno=%d)\n", errno);
+
+        if (sysarch(AMD64_GET_GSBASE, (void *)&gsbase) == 0)
+            printf("    GS_BASE (r3)   = 0x%016lx (via sysarch)\n", (unsigned long)gsbase);
+        else
+            printf("    GS_BASE (r3)   = sysarch failed (errno=%d)\n", errno);
+    }
+
+    /* Read kernel GS_BASE from PCPU structure.
+     * The kernel's GS_BASE MSR points to the per-CPU (PCPU) struct.
+     * PCPU is at a known offset in kdata. */
+    {
+        uint64_t pcpu_addr = g_kdata_base + KSTUFF_PCPU_OFF;
+        uint64_t pcpu_pa = va_to_pa(pcpu_addr);
+        if (pcpu_pa) {
+            /* PCPU struct: first few fields include curthread, etc.
+             * On FreeBSD, PCPU is accessed via gs:[offset].
+             * The GS_BASE value IS the PCPU address. */
+            printf("    KGS_BASE       = 0x%016lx (PCPU at kdata+0x%lx)\n",
+                   (unsigned long)pcpu_addr, (unsigned long)KSTUFF_PCPU_OFF);
+
+            /* Read curthread from PCPU[0x18] (pc_curthread on FreeBSD) */
+            uint64_t curthread = 0;
+            kernel_copyout(g_dmap_base + pcpu_pa + 0x18, &curthread, 8);
+            if (curthread)
+                printf("    curthread      = 0x%016lx\n", (unsigned long)curthread);
+        }
+    }
+
+    /* Read kernel pmap (for kernel CR3 if different from process CR3) */
+    {
+        uint64_t kpmap_addr = g_kdata_base + KSTUFF_KERNEL_PMAP_STORE_OFF;
+        uint64_t kpmap_pa = va_to_pa(kpmap_addr);
+        if (kpmap_pa) {
+            uint64_t kpmap_val = 0;
+            kernel_copyout(g_dmap_base + kpmap_pa, &kpmap_val, 8);
+            if (kpmap_val) {
+                uint64_t kcr3 = 0;
+                uint64_t kcr3_pa = va_to_pa(kpmap_val + 0x28);
+                if (kcr3_pa) {
+                    kernel_copyout(g_dmap_base + kcr3_pa, &kcr3, 8);
+                    printf("    Kernel CR3     = 0x%016lx (from kernel_pmap)\n",
+                           (unsigned long)kcr3);
+                }
+            }
+        }
+    }
+
+    /* LSTAR can be inferred: it points to the syscall entry in ktext.
+     * On FreeBSD, LSTAR = Xfast_syscall. We can find it by looking at
+     * the known doreti_iret offset (which is in the same area). */
+    {
+        (void)KSTUFF_DORETI_IRET_OFF;
+        /* doreti_iret is a few instructions after Xfast_syscall's iretq.
+         * The actual LSTAR is earlier. We can scan backward for the
+         * swapgs; lfence sequence that starts Xfast_syscall.
+         * But for now, just report what we know. */
+        printf("    LSTAR (est)    ~ ktext+0x2307xx area (near doreti_iret)\n");
+    }
+
+    printf("[*] Note: Ring 0 readings require gadget-based execution.\n");
+    printf("    Run gadget scan to find usable RDMSR sequences.\n");
+}
 
 /* ─── Direct sysent-based kernel function calling ───
  *
@@ -2072,18 +2602,23 @@ int main(void) {
             }
 
             int kmod_ok = -1;
+
+            /* Try r0gdb approach first (PS5_kldload: kmem_alloc + kproc_create) */
             if (kmod_result_kva) {
-                /* Try direct sysent approach first (uses known FW 4.03 offsets) */
+                kmod_ok = load_kmod_r0gdb(kmod_vaddr, kmod_result_kva);
+            }
+
+            if (kmod_ok != 0 && kmod_result_kva) {
+                /* Try direct sysent approach (write to ktext via DMAP) */
                 kmod_ok = load_kmod_direct(kmod_vaddr, kmod_result_kva);
             }
 
             if (kmod_ok != 0) {
-                /* Try code cave approach (write to ktext padding) */
-                kmod_ok = load_kmod_codecave(kmod_vaddr, kmod_result_kva);
-            }
-
-            if (kmod_ok != 0) {
-                printf("\n[*] All approaches failed — falling back to kldload\n");
+                printf("\n[*] All kmod approaches failed.\n");
+                printf("[*] Running gadget scanner and data-based MSR reader...\n");
+                scan_ktext_gadgets();
+                read_msr_from_kernel_data();
+                printf("\n[*] Falling back to kldload...\n");
                 load_kmod();
             } else {
                 /* Print kstuff results */
