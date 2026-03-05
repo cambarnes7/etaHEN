@@ -194,6 +194,10 @@ struct kld_file_stat {
 #define KSTUFF_XINVTLB_OFF     (-0x96be70LL)
 #define KSTUFF_COPYIN_OFF      (-0x9908e0LL)
 #define KSTUFF_COPYOUT_OFF     (-0x990990LL)
+#define KSTUFF_KMEM_ALLOC_OFF  (-0xc1ed0LL)
+#define KSTUFF_KPROC_CREATE_OFF (-0x35ebf0LL)
+#define KSTUFF_MALLOC_OFF      (-0xa9b00LL)
+#define KSTUFF_KERNEL_PMAP_STORE_OFF 0x3257a78ULL
 
 /* ─── Global state ─── */
 
@@ -694,10 +698,19 @@ static int load_kmod_codecave(void *result_vaddr, uint64_t result_kva) {
     uint64_t ktext_end = g_kdata_base; /* ktext ends where kdata begins */
     uint64_t scan_start = g_ktext_base;
 
+    /* Diagnostic: check what va_to_pa returns for first ktext page */
+    {
+        uint64_t test_pa = va_to_pa(scan_start);
+        printf("[*] va_to_pa(ktext_start) = 0x%lx (MAX_SAFE_PA=0x%lx)\n",
+               (unsigned long)test_pa, (unsigned long)MAX_SAFE_PA);
+    }
+
     printf("[*] Scanning ktext (0x%lx - 0x%lx) for %zu-byte code cave...\n",
            (unsigned long)scan_start, (unsigned long)ktext_end, cave_needed);
 
-    /* Scan in 4KB pages */
+    /* Scan in 4KB pages.
+     * Note: no MAX_SAFE_PA check here — ktext pages may be mapped at
+     * high physical addresses but DMAP still handles them correctly. */
     uint64_t best_run_start = 0;
     size_t best_run_len = 0;
     size_t current_run = 0;
@@ -706,7 +719,7 @@ static int load_kmod_codecave(void *result_vaddr, uint64_t result_kva) {
 
     for (uint64_t va = scan_start; va < ktext_end && !cave_kva; va += 0x1000) {
         uint64_t pa = va_to_pa(va);
-        if (!pa || pa >= MAX_SAFE_PA) {
+        if (!pa) {
             current_run = 0;
             continue;
         }
