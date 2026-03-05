@@ -255,7 +255,7 @@ The following speculative/fallback code was removed to keep only confirmed-worki
 
 ---
 
-## Test Results: Run 1 (Fresh Boot) + Run 2 (Post-Resume)
+## Test Results: Run 1 (Fresh Boot) + Run 2 (Post-Resume) — Session 1
 
 ### Run 1 — Fresh Boot
 - All phases completed successfully
@@ -283,44 +283,134 @@ The following speculative/fallback code was removed to keep only confirmed-worki
 - ktext readability via DMAP: **STILL XOM** (all zeros through DMAP)
 - NPT allows execution on kdata: confirmed again (ring-0 shellcode works)
 
-### Key Findings
+### Key Findings (Session 1)
 1. Everything persists across suspend/resume: cave markers, QA flags, PTE NX-clear, KASLR slide, apic_ops values
 2. ktext does NOT become readable after resume on FW 4.03 (DMAP reads return zeros)
 3. The hook was never armed during suspend — this was the bug (now fixed)
 4. CR3 changes across resume (new page tables) but DMAP base and KASLR stay the same
 
+---
+
+## Test Results: Run 3 (Fresh Boot) + Run 4 (Post-Resume) — Session 2
+
+### Run 3 — Fresh Boot (Pre-Suspend)
+- All phases completed successfully
+- DMAP base: 0xffffe0b700000000 (different from Session 1 — DMAP randomized per boot)
+- CR3: 0x16d7b000, ktext: 0xffffffff8eb60000, kdata: 0xffffffff8f760000
+- LSTAR: 0xffffffff8edf4218
+- IDT: 0xffffffff95c2dc80 (kdata+0x64cdc80 — matches kstuff offset)
+- Sysent: kdata+0x1709c0 (matches kstuff offset)
+- apic_ops: kdata+0x1656b0, 28 entries, slot[2] = 0xffffffff8edf7908
+- Ring-0 code execution via sysent hook: confirmed (magic value written to kdata)
+- Cave trampoline installed at kdata+0x100 (56 bytes, PTE NX cleared)
+- Minimal gadget at kdata+0x150: `mov eax, 1; ret` (6 bytes)
+- Guest PTE NX-clear on kdata_base page: PTE = 0x000000000f760003 (NX=0)
+- Persistence markers set (cave "FLATZHOO" + QA flags with Phase 7 marker 0xabcdef42)
+- **Test 4a FAILED:** sysent[253] → minimal gadget returned `ret=0, errno=14 (EFAULT)`
+  - Earlier ring-0 shellcode at kdata+0x0 worked fine (same page, NX already cleared)
+  - Earlier sysent hook to ktext getpid worked fine
+  - See "New Finding: Test 4a Failure" below
+- Test 4b: SKIPPED (due to Test 4a failure)
+- apic_ops[2] restored to original before suspend (safe path)
+- Rest mode entered successfully via `sceSystemStateMgrEnterStandby()`
+
+### Run 4 — Post-Resume
+- Re-exploited successfully, re-ran tool
+- DMAP base: 0xffffe0b700000000 (same — DMAP stable across resume)
+- CR3: 0x16fee000 (changed — expected, new page tables on resume)
+- ktext: 0xffffffff8eb60000, kdata: 0xffffffff8f760000 (same — **KASLR stable**)
+- Cave marker "FLATZHOO" (0x464c41545a484f4f): **PERSISTED**
+- Saved ktext from cave: matches current ktext — **KASLR stable**
+- QA flags (bytes 0-1 = 0xFF): **PERSISTED**
+- Phase 7 marker (0xabcdef42) in QA flags: **PERSISTED**
+- Saved original xapic in QA flags: **PERSISTED**
+- Guest PTE NX-clear on kdata_base page: **PERSISTED** (PTE still 0x000000000f760003)
+- apic_ops[2]: retained value across resume (original value — hook was not armed)
+- Minimal gadget code at kdata+0x150: **INTACT** after resume
+- ktext readability via DMAP: **STILL XOM** (all 0xCC through DMAP)
+- NPT allows execution on kdata: confirmed again (ring-0 shellcode works)
+- Ring-0 code execution via sysent hook: confirmed again
+
+### Key Findings (Session 2)
+1. **Rest mode is safe** with cave trampoline proof-write disabled and apic_ops[2] restored
+2. **Full persistence confirmed** (second independent session): cave markers, QA flags, PTE NX-clear, KASLR slide, DMAP base, minimal gadget code
+3. **DMAP base changes between boots** (0xffffe2c000000000 → 0xffffe0b700000000) but is stable within a boot+resume cycle
+4. **Test 4a failure is a new puzzle**: sysent[253] → kdata minimal gadget returns EFAULT, despite same-page shellcode working earlier
+5. CR3 changes across resume (new page tables) but everything else persists
+
+### Bug Fix: Test 4a Failure (Sysent → kdata Gadget Returns EFAULT)
+
+**Symptom:** `syscall(253)` hooked to minimal gadget at kdata+0x150 (`mov eax, 1; ret`)
+returned `ret=0, errno=14 (EFAULT)` instead of expected `ret=1, errno=0`.
+
+**Root cause:** Two bugs in the Test 4a sysent hook code:
+
+1. **Wrong sysent stride** — used `253 * 16` instead of `253 * SYSENT_STRIDE` (0x30 = 48).
+   Each sysent entry is 48 bytes (n_arg, pad, sy_call, sy_auevent, sy_systrace_args,
+   sy_entry, sy_return, sy_flags, sy_thrcnt). Using stride 16 computed the wrong offset:
+   `253 * 16 = 4048` vs correct `253 * 48 = 12144`.
+
+2. **PA arithmetic across page boundaries** — translated the sysent *base* VA to PA, then
+   added the entry offset in the physical domain (`sysent_pa + 253*16+8`). Since sysent[0]
+   starts at page offset 0x9c0 and sysent[253] is >12KB away, the entry is on a completely
+   different physical page. Physical pages are not contiguous, so the computed PA pointed to
+   unrelated kernel memory.
+
+**Effect:** The hook wrote the gadget address to the wrong physical memory (never modifying
+sysent[253] at all) and corrupted random kernel data, likely causing the EFAULT. The
+"restore" also wrote to the wrong PA, so the corruption persisted. The actual syscall(253)
+still ran the original issetugid handler.
+
+**Fix:** Compute sysent[253] VA first, then translate to PA (matching the working code in
+Phase 4's ring-0 shellcode execution test):
+```c
+uint64_t s253_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+uint64_t s253_call_pa = va_to_pa_quiet(s253_kva + 8);  /* sy_call */
+uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);       /* n_arg  */
+```
+Also explicitly sets narg=0 and restores it afterward, matching the pattern used by all
+other sysent hooks in the codebase.
+
 ## Current State of the Flatz Method
 
 The flatz suspend/resume method requires running code during early resume, before the HV sets up NPT protections. The key findings so far:
 
-**Proven:**
+**Proven (across 2 independent boot sessions):**
 - apic_ops[2] (xapic_mode) is called during LAPIC suspend/resume
 - We can hook it (KLD trampoline, kdata cave trampoline, or ktext gadget)
 - Cave markers, QA flags, and apic_ops values survive suspend/resume
 - Guest PTE NX-clear survives suspend/resume
 - KASLR slide is stable across resume
+- DMAP base is stable across resume (changes between boots)
 - Guest PTE NX-clear works for code execution in kdata
 - NPT allows execution on kdata pages (confirmed via ring-0 shellcode)
 - kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
 - ktext remains XOM after resume on FW 4.03 (no free readability)
+- Rest mode is safe with: cave trampoline proof-write disabled + apic_ops[2] restored to original
+- Minimal gadget code and cave trampoline code persist in kdata across resume
 
 **Learned:**
 - DMAP writes during LAPIC suspend cause kernel panic (proof marker write crashed)
 - The HV likely restricts DMAP write permissions during the suspend path
+- Sysent hook to kdata minimal gadget returns EFAULT — likely due to syscall dispatch
+  argument handling, not execution permissions (see Test 4a failure analysis)
 
-**Unknown (needs testing with this build):**
-- Whether the cave trampoline (proof write DISABLED) survives LAPIC suspend
-- Whether apic_ops[2] still points to cave trampoline KVA after resume
-- Whether the trampoline actually executes (call-through to original xapic_mode)
+**Not Yet Tested:**
+- Leaving apic_ops[2] hooked to cave trampoline (proof-write disabled) during suspend
+  - Current code always restores to original before suspend for safety
+  - This is THE critical test for the flatz method
+- Whether the cave trampoline actually fires during LAPIC resume (call-through to original)
 
 **Next Steps:**
-1. Test this build (cave trampoline LEFT ARMED, proof write DISABLED)
-2. Enter rest mode → wake → re-exploit → re-run tool
-3. Check apic_ops[2] post-resume — if it still points to cave trampoline, hook survived
-4. If rest mode works: trampoline executed without panicking during suspend!
-5. Next: investigate safe ways to confirm execution (e.g., modify a register or flag)
-6. If guest killed: NPT doesn't allow execution on kdata during suspend → need ktext gadget
-7. If trampoline didn't fire: check if apic_ops[2] was restored by kernel
+1. **Investigate Test 4a failure** — understand why sysent→kdata gadget returns EFAULT
+   (likely sy_narg mismatch causing copyin fault before sy_call is reached)
+2. **Leave cave trampoline armed during suspend** — modify Phase 7 to NOT restore
+   apic_ops[2] when cave trampoline is the hook source (proof-write already disabled)
+3. Enter rest mode → wake → re-exploit → check if apic_ops[2] still points to cave trampoline
+4. If rest mode works: trampoline executed during suspend without panic!
+5. Add safe execution proof (e.g., write to a kdata marker via the trampoline, but only
+   during resume — not suspend — by checking an APIC register state)
+6. If guest killed: NPT doesn't allow kdata execution during suspend → need ktext gadget
 
 ---
 

