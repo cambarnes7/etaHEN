@@ -518,7 +518,7 @@ But:
 
 4. **VMCB discovery** — If we can find the HV's VMCB (Virtual Machine Control Block) in
    physical memory and modify it, we might be able to disable NPT entirely. The NPT
-   scan found 52-87 PT pages with kdata/ktext refs, but no VMCB candidates yet.
+   scan found 386-416 PT pages with kdata/ktext refs, but no VMCB candidates yet.
 
 5. **kmod text execution during suspend** — The kmod .text section might be in a
    different NPT region than kdata. If kmod pages are NPT-executable during suspend
@@ -531,12 +531,133 @@ But:
    However, MSR writes may be intercepted by the HV.
 
 **Next Steps:**
-1. **Test KLD trampoline during suspend** — The kmod .text section is separate from kdata.
-   If its NPT permissions differ, the KLD trampoline might survive suspend. This requires
-   re-testing with the KLD trampoline armed (not the cave trampoline).
+1. **Test KLD trampoline during suspend with REAL hook** — Session 5 "KLD armed" test was
+   a no-op (trampoline KVA equaled original xapic_mode). Need to arm with an actual
+   different address in kmod .text to test whether kmod pages survive NPT during suspend.
 2. **Enumerate apic_ops slot usage** — Determine which slots are called during suspend vs
    resume. If a resume-only slot exists, hook it with kdata code.
 3. **VMCB hunting** — Expand the NPT scan to look for VMCB signatures in physical memory.
+4. **Fix KLD trampoline resolution** — The kmod trampoline scanner returns the original
+   xapic_mode value as fallback when it can't find the real trampoline (NPT read-protected).
+   Need a mechanism to get the actual kmod .text KVA (e.g., kldsym, or have kmod write
+   its own function addresses to the shared buffer).
+
+---
+
+## Test Results: Run 1 (Fresh Boot) + Run 2 (Post-Resume) — Session 5
+
+### Run 1 — Fresh Boot (Pre-Suspend)
+- All phases completed successfully
+- DMAP base: 0xffff801800000000 (new — different from all previous sessions)
+- CR3: 0x18a1b000, ktext: 0xffffffff90550000, kdata: 0xffffffff91150000
+- LSTAR: 0xffffffff907e4218 (from MSR recon — MSR 0xc0000082)
+- IDT: 0xffffffff9761dc80 (kdata+0x64cdc80 — matches kstuff offset)
+- Sysent: kdata+0x1709c0 (724 entries, 12/12 narg cross-check — matches kstuff offset)
+- apic_ops: kdata+0x1656b0, 28 entries, slot[2] = 0xffffffff907e7908
+- Ring-0 code execution via sysent hook: confirmed (magic 0xdead000052494e47)
+- Cave trampoline installed at kdata+0x100 (72 bytes, PTE NX cleared)
+- Minimal gadget at kdata+0x150: `mov eax, 1; ret` (6 bytes)
+- Guest PTE NX-clear on kdata_base page: PTE went from 0x8000000011150103 (NX=1 G=1)
+  to 0x0000000011150003 (NX=0 G=0)
+- **Test 4a PASSED:** sysent[253] → minimal gadget returned `ret=1, errno=0`
+- **Test 4b PASSED:** apic_ops[2] → minimal gadget stable for 3 seconds
+  - Restored apic_ops[2] to original after test
+- MSR/CR recon: 12 entries read successfully
+  - EFER (0xc0000082): 0x907e4218 (LSTAR low bits)
+  - FS_BASE (0xc0000100): 0x00004701
+  - GS_BASE (0xc0000101): 0xff800080
+  - KernelGS (0xc0000102): 0x97622b80
+  - CR3 (0xffff0004): 0x18a1b000
+- Persistence markers set (cave "FLATZHOO" + QA flags with Phase 7 marker 0xabcdef42)
+- **KLD "trampoline" test:** KLD trampoline KVA = 0xffffffff907e7908, which EQUALS the
+  original xapic_mode value. This means the kmod trampoline scanner failed (NPT read
+  protection) and the code fell back to the original xapic_mode address. The "KLD armed"
+  test was therefore a **NO-OP** — apic_ops[2] pointed to its original target.
+- System entered rest mode successfully via `sceSystemStateMgrEnterStandby()` (returned 0)
+
+### NPT Discovery (Run 1)
+- Scanned PA 0x0 → 0x20000000 (512MB) + extended range
+- Pages scanned: 66896 OK, 64176 blocked
+- 2MB accessible regions: 131 (1 blocked at PA 0x10600000)
+- VMCB candidates: 0
+- PT pages with kdata/ktext refs: 386
+- Key NPT entries at PA 0x6a000: 512 present, 2MB pages for both ktext PA 0x10400000
+  and kdata PA 0x11000000 (RW User X) — guest identity mapping
+- Key NPT entries at PA 0x6e000: 512 present, 2MB pages for both ktext and kdata
+  (RW Kern X) — kernel identity mapping
+
+### Guest Page Table Walk (Run 1)
+- ktext PTE: 0x0400000010550101 — P=1 RW=0 NX=0 G=1 bit58=1 (XOTEXT)
+  - ktext is read-protected but executable (XOM enforced by NPT, not guest PTE)
+- kdata PTE (pre-clear): 0x8000000011150103 — P=1 RW=1 NX=1 G=1
+  - kdata is writable but not executable (NX=1)
+- kdata PTE (post-clear): 0x0000000011150003 — P=1 RW=1 NX=0 G=0
+  - NX and G bits cleared for ring-0 code execution
+
+### Phase 6a: ktext PTE Analysis (Run 1)
+- 32MB ktext region scanned: 14 2MB huge pages, 1200 4KB pages, 0 unmapped
+- XOTEXT bit set: 517 PTEs (unexpected on FW 4.03 — documented as FW 2.xx feature)
+- RW bit set: 269 PTEs
+- NX bit set: 696 PTEs
+- NOT clearing XOTEXT — HV integrity monitor detects and prevents rest mode
+
+### Run 2 — Post-Resume
+- Re-exploited successfully, re-ran tool
+- DMAP base: 0xffff801800000000 (same — **DMAP stable across resume**)
+- CR3: 0x18744000 (changed — expected, new page tables allocated on resume)
+- ktext: 0xffffffff90550000, kdata: 0xffffffff91150000 (same — **KASLR stable**)
+- Cave marker "FLATZHOO" (0x464c41545a484f4f): **PERSISTED**
+- Saved ktext from cave: matches current ktext — **KASLR stable**
+- QA flags: `ff ff 03 01 ab cd ef 42 08 79 7e 90 ff ff ff ff` — **PERSISTED**
+  - Bytes 0-1 = 0xFF: **PERSISTED**
+  - Phase 7 marker (0xabcdef42) at bytes 4-7: **PERSISTED**
+  - Original xapic bytes 8-11 (0x08797e90 = little-endian of 0x907e7908): **PERSISTED**
+- Guest PTE NX-clear on kdata_base page: **PERSISTED**
+  - PTE = 0x0000000011150023 (NX=0, G=0, A=1 — Accessed bit now set)
+  - kdata+0x1000 PTE unchanged: 0x8000000011151103 (NX=1, G=1 — NOT cleared, as expected)
+- apic_ops[2]: 0xffffffff907e7908 — **RETAINED** (original value, "KLD armed" was no-op)
+- apic_ops table: all 28 entries identical to Run 1 values
+- Minimal gadget code at kdata+0x150: **INTACT** after resume
+- ktext readability via DMAP: **STILL XOM** (all 0xCC through DMAP — NPT enforced)
+- NPT allows execution on kdata: confirmed again (ring-0 shellcode works)
+- Ring-0 code execution via sysent hook: confirmed again
+- Test 4a and 4b: PASSED again on post-resume run
+
+### NPT Discovery (Run 2)
+- PT pages with kdata/ktext refs: 416 (vs 386 in Run 1 — more allocations post-resume)
+- VMCB candidates: still 0
+- New PT entries appeared post-resume (dynamic kernel allocations)
+- Core NPT structure (PA 0x6a000, 0x6e000) unchanged
+
+### Key Findings (Session 5)
+1. **5th independent boot confirming full persistence** — cave markers, QA flags, PTE
+   NX-clear, KASLR slide, DMAP base all survive suspend/resume
+2. **"KLD armed" test was a no-op** — The kmod trampoline scanner returns the original
+   xapic_mode address as a fallback when NPT read-protection prevents finding the real
+   trampoline in kmod .text. So `apic_ops[2] = 0xffffffff907e7908` during suspend was
+   the original function, NOT a kmod trampoline. The real KLD .text suspend test has
+   NOT been performed yet.
+3. **MSR/CR recon consistent** — LSTAR, CR3, EFER values match expected PS5 FW 4.03 layout.
+   CR3 changed post-resume (0x18a1b000 → 0x18744000) as expected.
+4. **XOTEXT bit present on FW 4.03** — 517 guest PTEs have bit 58 set, typically associated
+   with FW 2.xx XOM enforcement. On FW 4.03, XOM is enforced purely via NPT (HV level),
+   so these guest PTE bits are vestigial. Clearing them triggers HV integrity monitoring
+   (prevents rest mode).
+5. **NPT scan grows post-resume** — 386 → 416 PT pages with kdata/ktext refs, indicating
+   the kernel made new allocations after waking from rest mode.
+6. **PTE Accessed bit**: kdata_base PTE shows A=1 post-resume (was A=0 pre-clear), confirming
+   CPU accessed the page during normal operation. This is expected behavior.
+7. **Sysent etaHEN interception confirmed again** — syscall(699) hook via DMAP write verified
+   OK but behavior unchanged (etaHEN intercepts high syscalls before sysent dispatch).
+   Standard syscalls (sysent[253] = issetugid) hook works correctly.
+
+### Critical Gap Identified
+The KLD .text trampoline has NEVER been tested during suspend with a real hook value.
+All previous "KLD armed" tests used the original xapic_mode address (fallback from scanner
+failure). To properly test whether kmod .text pages survive NPT during suspend:
+- The kmod needs to write its own trampoline_xapic_mode() KVA to the shared buffer
+- Or kldsym needs to resolve the symbol after kldload
+- The resolved KVA must differ from the original xapic_mode
 
 ---
 
