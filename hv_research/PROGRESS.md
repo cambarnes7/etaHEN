@@ -938,3 +938,89 @@ hv_research/
     hv_kmod.ko          - Compiled kernel module
     .gitignore          - Excludes *.o and *.elf
 ```
+
+---
+
+## hv_research2 - New Research Tool (March 2026)
+
+### Motivation
+
+After 8 sessions of testing with hv_research, the core blockers are clear:
+- **kdata execution PANICS during suspend** (HV enforces NPT NX)
+- **kmod .text execution PANICS during suspend** (same issue)
+- **ktext is XOM** (cannot inject custom code)
+- **Only original ktext functions survive suspend**
+
+hv_research2 is a clean-slate tool focused on **safe reconnaissance** to find
+new attack surfaces, rather than repeating the suspend/resume hook tests.
+
+### Architecture
+
+Same two-part system as hv_research:
+1. **hv_research2.elf** - Userland payload
+2. **hv_kmod2.ko** - Kernel module (embedded, loaded via kldload)
+
+Log output: `/data/etaHEN/hv_research2.log`
+
+### New Phases
+
+| Phase | Description | Safety |
+|-------|-------------|--------|
+| Phase 1 | Kernel recon (DMAP, PTEs, QA flags) | Safe (read-only) |
+| Phase 2 | kldload + kmod MSR/CR reading | Safe (proven in 8 sessions) |
+| Phase A | APIC ops vtable discovery + slot mapping | Safe (read-only) |
+| Phase B | NPT deep scan for VMCB discovery (2GB) | Safe (read-only DMAP) |
+| Phase C | ktext gadget catalog from kstuff offsets | Safe (address-only, no calls) |
+| Phase D | LAPIC MMIO register dump via DMAP | Safe (read-only MMIO) |
+| Phase E | apic_ops function size/signature analysis | Safe (address math only) |
+| Phase F | Suspend test with original xapic + markers | Safe (proven approach) |
+
+### Key Design Decisions
+
+1. **NO kdata/kmod code execution during suspend** - proven to panic
+2. **NO arbitrary apic_ops calls** - only ops[2] (lapic_mode) is safe
+3. **NO ktext PTE modification** - HV integrity monitor blocks rest mode
+4. **NO arbitrary ktext byte probing** - mid-instruction decode is dangerous
+5. **apic_ops[2] always restored to original before suspend** - known safe
+
+### VMCB Scanning Strategy
+
+The VMCB (Virtual Machine Control Block) scan in Phase B looks for AMD SVM
+VMCB signatures in the first 2GB of physical memory:
+- LSTAR value matching ktext range
+- CR3 matching known kernel CR3
+- Valid CR0 (PE=1, PG=1)
+- Valid STAR segment selectors
+- nCR3 (Nested CR3, offset 0xB0) = NPT root page table
+
+If found, the VMCB could allow:
+- Reading the NPT root CR3
+- Understanding HV intercept configuration
+- Finding the IOPM and MSRPM base addresses
+
+### APIC ops Slot Mapping
+
+Phase A documents all 28 apic_ops function pointers with their FreeBSD names:
+- ops[0] = lapic_init
+- ops[1] = lapic_disable
+- ops[2] = lapic_mode (ONLY safe function to call/hook)
+- ops[3] = lapic_read (MMIO, unsafe)
+- ops[4] = lapic_write (MMIO, unsafe)
+- ... (see source for full list)
+
+Phase E estimates function sizes from address gaps. Functions <= 16 bytes
+likely just return a constant (like xapic_mode).
+
+### File Structure
+
+```
+hv_research2/
+  Makefile              - Build orchestrator
+  main.c                - Userland research driver (~1760 lines)
+  hv_research2.elf      - Compiled payload
+  kmod/
+    Makefile            - Kernel module build rules
+    hv_kld2.c           - Kernel loadable module (~280 lines)
+    hv_kmod2.ko         - Compiled kernel module
+    .gitignore          - Excludes *.o and *.elf
+```
