@@ -1162,11 +1162,10 @@ int main(void) {
 #if 1
   char buz[100] = { 0 };
   // Load kstuff if needed
-  bool dont_load_kstuff = true; // Skip kstuff at boot - load it separately via ELF loader after etaHEN is running
-  //(if_exists("/mnt/usb0/no_kstuff") || if_exists("/data/etaHEN/no_kstuff"));
+  bool dont_load_kstuff = (if_exists("/mnt/usb0/no_kstuff") || if_exists("/data/etaHEN/no_kstuff"));
   if (dont_load_kstuff) {
-      notify("kstuff loading skipped at boot - send kstuff.elf via port 9027 after etaHEN is running");
-      klog_puts("kstuff loading skipped at boot");
+      notify("kstuff loading disabled via file, non-payload homebrew and PS4 FPKGs will be disabled");
+      klog_puts("kstuff loading disabled in config.ini or no_kstuff file found");
   }
   if (!dont_load_kstuff && sys_ver.version >= 0x3000000) {
       //notify("Loading kstuff ...");
