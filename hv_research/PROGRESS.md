@@ -732,6 +732,126 @@ On FW 4.03:
 
 ---
 
+## Test Results: Run 1 (Fresh Boot) — Session 7
+
+### Run 1 — Fresh Boot (Pre-Suspend)
+- All phases completed successfully
+- DMAP base: 0xffff86d200000000 (new — different from all previous sessions)
+- CR3: 0x1eb13000, ktext: 0xffffffff96940000, kdata: 0xffffffff97540000
+- LSTAR: 0xffffffff96bd4218 (from MSR recon — MSR 0xc0000082)
+- IDT: 0xffffffff9da0dc80 (kdata+0x64cdc80 — matches kstuff offset)
+- Sysent: kdata+0x1709c0 (724 entries, 12/12 narg cross-check — matches kstuff offset)
+- apic_ops: kdata+0x1656b0, 28 entries, slot[2] = 0xffffffff96bd7908
+- Ring-0 code execution via sysent hook: confirmed (magic 0xdead000052494e47)
+- Cave trampoline installed at kdata+0x100 (72 bytes, PTE NX cleared)
+- Minimal gadget at kdata+0x150: `mov eax, 1; ret` (6 bytes)
+- Guest PTE NX-clear on kdata_base page: PTE went from 0x8000000017540103 (NX=1 G=1)
+  to 0x0000000017540003 (NX=0 G=0)
+- **Test 4a PASSED:** sysent[253] → minimal gadget returned `ret=1, errno=0`
+- **Test 4b PASSED:** apic_ops[2] → minimal gadget stable for 3 seconds
+- MSR/CR recon: 12 entries read successfully
+- Persistence markers set (cave "FLATZHOO" + QA flags with Phase 7 marker 0xabcdef42)
+
+### NPT Discovery (Run 1)
+- Scanned PA 0x0 → 0x20000000 (512MB) + extended range
+- Pages scanned: 92480 OK, 38592 blocked
+- PT pages with kdata/ktext refs: 332
+- Key NPT entries at PA 0x6a000: 512 present, 2MB pages for both ktext PA 0x16800000
+  and kdata PA 0x17400000 (RW User X) — guest identity mapping
+- Key NPT entries at PA 0x6e000: 512 present, 2MB pages for both ktext and kdata
+  (RW Kern X) — kernel identity mapping
+- Found ktext NPT 4KB page tables at PA 0x11564000 (276 ktext refs) and PA 0x11565000
+  (192 ktext refs) — sequential 4KB page mappings covering the full ktext region
+  with bit 58 (XOTEXT) set and RO+X permissions
+- VMCB candidates: 0
+
+### Guest Page Table Walk (Run 1)
+- ktext PTE: 0x0400000016940101 — P=1 RW=0 NX=0 G=1 bit58=1 (XOTEXT)
+  - PTE at PA 0x1dc77a00 — writable via DMAP
+- kdata PTE (pre-clear): 0x8000000017540103 — P=1 RW=1 NX=1 G=1
+  - PTE at PA 0x1dc7da00 — writable via DMAP
+- kdata PTE (post-clear): 0x0000000017540003 — P=1 RW=1 NX=0 G=0
+
+### KMOD_MAGIC Status
+- **KMOD_MAGIC found** in shared buffer, kmod status COMPLETE
+- But trampoline fields all zero: `trampoline_func_kva = 0, trampoline_target_kva = 0`
+- **Root cause:** Late SYSINIT — see bug fix below
+- kldstat returned address=0x0 (Sony's kernel doesn't expose module base)
+- KLD .text trampoline NOT available: `g_kld_text_trampoline = 0`
+- apic_ops[2] restored to original before suspend (no KLD test)
+
+### Phase 6a: ktext PTE Analysis
+- 32MB ktext region scanned: 14 2MB huge pages, 1216 4KB pages, 0 unmapped
+- XOTEXT bit set: 517 PTEs
+- RW bit set: 285 PTEs
+- NX bit set: 712 PTEs
+
+### Phase 8: kstuff Offsets
+- IDT validated — all 256 handlers in ktext range
+- Xinvtlb cross-verification: MATCH (IDT[244] = kstuff offset)
+- TSS RSP0: 0xffffff809905fa40
+- IST entries: IST1=0xffffffff9da3a2f0, IST2=0xffffffff9da3e2e0, IST3=0xffffff8002bab050
+
+### Sysent Hook Verification
+- Live sysent hook test (syscall 699): DMAP write verified but behavior unchanged
+  - etaHEN intercepts high/custom syscalls before sysent dispatch
+- Standard syscall hook (sysent[253] = issetugid → getpid): **CONFIRMED**
+  - issetugid() returned 84 (pid) instead of 0 after hook
+  - Proves kernel dispatches real syscalls through sysent table
+  - etaHEN only intercepts high/custom syscalls
+
+### System State
+- QA flags set to 0xFF in first two bytes
+- System entered rest mode via sceSystemStateMgrEnterStandby() (returned 0)
+
+### Key Findings (Session 7)
+1. **Late SYSINIT fires on FW 4.03** — hv_init eventually runs via SYSINIT/MOD_LOAD,
+   but more than 2s after kldload. The buffer is populated with KMOD_MAGIC and valid
+   trampoline KVAs, but the writeback test clobbers them before they're saved. See bug fix.
+2. **NPT 4KB ktext pages discovered** — PA 0x11564000-0x11565000 contain the NPT's 4KB
+   page table entries for the entire ktext region. Each entry has bit 58 (XOTEXT) and RO+X.
+   This is the NPT structure that enforces XOM on ktext.
+3. **Guest PTE locations for ktext and kdata confirmed** — ktext PTE at PA 0x1dc77a00,
+   kdata PTE at PA 0x1dc7da00. Both writable via DMAP.
+4. **6th independent boot confirming full persistence pattern** — all markers, QA flags,
+   PTE NX-clear, KASLR slide, DMAP base behave identically to Sessions 1-6.
+
+---
+
+## Bug Fixes (This Commit)
+
+### Late SYSINIT Clobbers KLD Trampoline KVAs
+
+- **Bug:** `g_kld_text_trampoline` was always 0 on FW 4.03, preventing the KLD .text
+  suspend test from ever running. The KMOD_MAGIC was found (meaning hv_init ran), but
+  the trampoline address fields in the shared buffer were zero.
+
+- **Root cause:** Race condition between late SYSINIT and the writeback test:
+  1. kldload loads the module (kid=78)
+  2. Initial 2s poll: buffer empty (SYSINIT hasn't fired yet)
+  3. Scanner + IDT invocation runs (scanner fails due to NPT read protection)
+  4. Code falls through to ring-3 fallback (Step 4d)
+  5. Ring-0 code execution via PTE NX-clear works independently of kmod
+  6. **~15 seconds after kldload, SYSINIT fires asynchronously** — hv_init writes
+     valid trampoline KVAs (e.g., 0xffffffff97xxxxxx) to the shared buffer
+  7. Ring-0 writeback test runs — writes apic_ops values to byte offsets 32/40/48
+     of the shared buffer, **clobbering** trampoline_func_kva and trampoline_target_kva
+  8. Session 6's fix correctly zeroes the clobbered fields (preventing no-op test)
+  9. Post-campaign code finds buffer fields = 0, kldstat returns address=0
+  10. `g_kld_text_trampoline` stays 0 — KLD suspend test never runs
+
+- **Fix:** Before the writeback test shellcode runs (Phase 5), check if the shared
+  buffer now has KMOD_MAGIC (indicating late SYSINIT). If so, save the trampoline KVAs
+  to `g_kld_text_trampoline` and `g_kld_text_target` globals before the writeback test
+  overwrites them. The existing `!g_kld_text_trampoline` guards in the post-campaign
+  code prevent later fallback paths from overwriting the saved values.
+
+- **Impact:** With this fix, the genuine KLD .text trampoline address is preserved and
+  available for the Phase 7 suspend test. This enables the first real test of whether
+  kmod .text pages survive NPT NX enforcement during cpususpend_handler.
+
+---
+
 ## File Structure
 
 ```

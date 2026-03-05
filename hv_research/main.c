@@ -3951,6 +3951,37 @@ ring3_fallback:
                            (unsigned long)dmap_verify);
                     fflush(stdout);
 
+                    /* ── Save kmod trampoline KVAs before writeback clobbers them ──
+                     *
+                     * SYSINIT may have fired asynchronously since the initial 2s poll.
+                     * If hv_init ran (KMOD_MAGIC present), the result buffer now has
+                     * valid trampoline_func_kva and trampoline_target_kva.  The writeback
+                     * test shellcode writes to byte offsets 32/40/48 of the shared buffer,
+                     * which overlay these fields.  Save them to globals NOW before the
+                     * writeback test overwrites them.
+                     *
+                     * Bug found in Session 7: SYSINIT fired between the initial 2s poll
+                     * and the writeback test (~15s later).  hv_init wrote valid KVAs, but
+                     * the writeback test clobbered them.  The post-test zeroing (Session 6
+                     * fix) then erased them.  kldstat returns address=0 on PS5, so the
+                     * kldstat-based fallback also failed.  Result: g_kld_text_trampoline
+                     * stayed 0 and the KLD suspend test never ran. */
+                    if (!g_kld_text_trampoline && results->magic == KMOD_MAGIC) {
+                        if (results->trampoline_func_kva != 0 &&
+                            results->trampoline_target_kva != 0) {
+                            g_kmod_trampoline_func = results->trampoline_func_kva;
+                            g_kmod_trampoline_target = results->trampoline_target_kva;
+                            g_kld_text_trampoline = results->trampoline_func_kva;
+                            g_kld_text_target = results->trampoline_target_kva;
+                            if (!g_kmod_kid) g_kmod_kid = kid;
+                            printf("[+] Late SYSINIT detected! Saved KLD trampoline KVAs before writeback:\n");
+                            printf("    trampoline_xapic_mode() = 0x%016lx\n",
+                                   (unsigned long)g_kld_text_trampoline);
+                            printf("    g_trampoline_target     = 0x%016lx\n",
+                                   (unsigned long)g_kld_text_target);
+                        }
+                    }
+
                     /* Build writeback test shellcode */
                     uint8_t wb_sc[512];
                     int wb_sc_len = build_ring0_apic_writeback_shellcode(
