@@ -1691,7 +1691,8 @@ int main(void) {
                 SCE_KERNEL_PROT_CPU_RW, 0, kmod_phys, 0x4000);
         }
         if (kmod_ret != 0 || !kmod_vaddr) {
-            printf("[-] Failed to allocate kmod result buffer\n");
+            printf("[-] Failed to allocate kmod result buffer — falling back to kldload\n");
+            load_kmod();
         } else {
             memset(kmod_vaddr, 0, 0x4000);
 
