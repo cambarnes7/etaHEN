@@ -780,23 +780,27 @@ static void load_kmod(void) {
             /* Hook a free IDT vector and trigger INT to invoke hv_init */
             uint64_t idt_kva = g_kdata_base + KSTUFF_IDT_OFF;
 
-            /* Find a free IDT vector (try 0x42-0x4F, low-traffic) */
+            /* Find a free IDT vector in the high range (0xD0-0xEF).
+             * Low vectors (0x20-0x4F) are active device IRQs on PS5
+             * and overwriting them causes kernel panics. High vectors
+             * are typically unused or reserved for IPI/self-IPI. */
             int hook_vec = -1;
-            for (int v = 0x42; v <= 0x4F; v++) {
+            for (int v = 0xD0; v <= 0xEF; v++) {
                 uint64_t gate_pa = va_to_pa(idt_kva + v * 16);
                 if (!gate_pa) continue;
                 uint8_t gate[16];
                 kernel_copyout(g_dmap_base + gate_pa, gate, 16);
-                /* Check if P bit is clear (unused) or handler is Xjustreturn */
+                /* Check if P bit is clear (unused) */
                 if (!(gate[5] & 0x80)) {
                     hook_vec = v;
                     break;
                 }
             }
-            /* Fallback: use vector 0x42 anyway */
-            if (hook_vec < 0) hook_vec = 0x42;
+            if (hook_vec < 0) {
+                printf("[-] No free IDT vector found in 0xD0-0xEF, aborting IDT invoke\n");
+            }
 
-            uint64_t gate_pa = va_to_pa(idt_kva + hook_vec * 16);
+            uint64_t gate_pa = (hook_vec >= 0) ? va_to_pa(idt_kva + hook_vec * 16) : 0;
             if (gate_pa) {
                 /* Save original gate */
                 uint8_t orig_gate[16];
@@ -828,21 +832,39 @@ static void load_kmod(void) {
                 fflush(stdout);
 
                 switch (hook_vec) {
-                    case 0x42: __asm__ volatile("int $0x42" ::: "memory"); break;
-                    case 0x43: __asm__ volatile("int $0x43" ::: "memory"); break;
-                    case 0x44: __asm__ volatile("int $0x44" ::: "memory"); break;
-                    case 0x45: __asm__ volatile("int $0x45" ::: "memory"); break;
-                    case 0x46: __asm__ volatile("int $0x46" ::: "memory"); break;
-                    case 0x47: __asm__ volatile("int $0x47" ::: "memory"); break;
-                    case 0x48: __asm__ volatile("int $0x48" ::: "memory"); break;
-                    case 0x49: __asm__ volatile("int $0x49" ::: "memory"); break;
-                    case 0x4A: __asm__ volatile("int $0x4A" ::: "memory"); break;
-                    case 0x4B: __asm__ volatile("int $0x4B" ::: "memory"); break;
-                    case 0x4C: __asm__ volatile("int $0x4C" ::: "memory"); break;
-                    case 0x4D: __asm__ volatile("int $0x4D" ::: "memory"); break;
-                    case 0x4E: __asm__ volatile("int $0x4E" ::: "memory"); break;
-                    case 0x4F: __asm__ volatile("int $0x4F" ::: "memory"); break;
-                    default:   __asm__ volatile("int $0x42" ::: "memory"); break;
+                    case 0xD0: __asm__ volatile("int $0xD0" ::: "memory"); break;
+                    case 0xD1: __asm__ volatile("int $0xD1" ::: "memory"); break;
+                    case 0xD2: __asm__ volatile("int $0xD2" ::: "memory"); break;
+                    case 0xD3: __asm__ volatile("int $0xD3" ::: "memory"); break;
+                    case 0xD4: __asm__ volatile("int $0xD4" ::: "memory"); break;
+                    case 0xD5: __asm__ volatile("int $0xD5" ::: "memory"); break;
+                    case 0xD6: __asm__ volatile("int $0xD6" ::: "memory"); break;
+                    case 0xD7: __asm__ volatile("int $0xD7" ::: "memory"); break;
+                    case 0xD8: __asm__ volatile("int $0xD8" ::: "memory"); break;
+                    case 0xD9: __asm__ volatile("int $0xD9" ::: "memory"); break;
+                    case 0xDA: __asm__ volatile("int $0xDA" ::: "memory"); break;
+                    case 0xDB: __asm__ volatile("int $0xDB" ::: "memory"); break;
+                    case 0xDC: __asm__ volatile("int $0xDC" ::: "memory"); break;
+                    case 0xDD: __asm__ volatile("int $0xDD" ::: "memory"); break;
+                    case 0xDE: __asm__ volatile("int $0xDE" ::: "memory"); break;
+                    case 0xDF: __asm__ volatile("int $0xDF" ::: "memory"); break;
+                    case 0xE0: __asm__ volatile("int $0xE0" ::: "memory"); break;
+                    case 0xE1: __asm__ volatile("int $0xE1" ::: "memory"); break;
+                    case 0xE2: __asm__ volatile("int $0xE2" ::: "memory"); break;
+                    case 0xE3: __asm__ volatile("int $0xE3" ::: "memory"); break;
+                    case 0xE4: __asm__ volatile("int $0xE4" ::: "memory"); break;
+                    case 0xE5: __asm__ volatile("int $0xE5" ::: "memory"); break;
+                    case 0xE6: __asm__ volatile("int $0xE6" ::: "memory"); break;
+                    case 0xE7: __asm__ volatile("int $0xE7" ::: "memory"); break;
+                    case 0xE8: __asm__ volatile("int $0xE8" ::: "memory"); break;
+                    case 0xE9: __asm__ volatile("int $0xE9" ::: "memory"); break;
+                    case 0xEA: __asm__ volatile("int $0xEA" ::: "memory"); break;
+                    case 0xEB: __asm__ volatile("int $0xEB" ::: "memory"); break;
+                    case 0xEC: __asm__ volatile("int $0xEC" ::: "memory"); break;
+                    case 0xED: __asm__ volatile("int $0xED" ::: "memory"); break;
+                    case 0xEE: __asm__ volatile("int $0xEE" ::: "memory"); break;
+                    case 0xEF: __asm__ volatile("int $0xEF" ::: "memory"); break;
+                    default: break;
                 }
                 printf("[+] INT 0x%x returned to userland!\n", hook_vec);
 
