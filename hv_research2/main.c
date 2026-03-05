@@ -74,6 +74,77 @@ __asm__ (
 extern const unsigned char KMOD_KO[];
 extern const uint64_t KMOD_KO_SZ;
 
+/* ─── Embedded flat binary kernel payload ─── */
+
+__asm__ (
+    ".section .rodata\n"
+    ".global KMOD_FLAT\n"
+    ".type KMOD_FLAT, @object\n"
+    ".align 16\n"
+    "KMOD_FLAT:\n"
+    ".incbin \"kmod/hv_flat.bin\"\n"
+    "KMOD_FLAT_END:\n"
+    ".global KMOD_FLAT_SZ\n"
+    ".type KMOD_FLAT_SZ, @object\n"
+    ".align 16\n"
+    "KMOD_FLAT_SZ:\n"
+    ".quad KMOD_FLAT_END - KMOD_FLAT\n"
+);
+
+extern const unsigned char KMOD_FLAT[];
+extern const uint64_t KMOD_FLAT_SZ;
+
+/* ─── kstuff kekcall interface (PS5_kldload approach) ─── */
+
+/* kstuff multiplexes kernel operations through syscall 0x27 (getpid)
+ * with magic upper-32-bit prefixes in rax. */
+
+static uint64_t kekcall_kmem_alloc(uint64_t size) {
+    uint64_t ret;
+    __asm__ volatile(
+        "mov $0x600000027, %%rax\n"
+        "syscall\n"
+        : "=a"(ret)
+        : "D"(size)
+        : "rcx", "r11", "memory"
+    );
+    /* kmem_alloc returns lower bits; OR with kernel VA mask */
+    return ret | 0xffffff8000000000ULL;
+}
+
+static uint64_t kekcall_kproc_create(uint64_t func, uint64_t args, uint64_t name) {
+    uint64_t ret;
+    __asm__ volatile(
+        "mov $0x700000027, %%rax\n"
+        "syscall\n"
+        : "=a"(ret)
+        : "D"(func), "S"(args), "d"(name)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static int kekcall_kstuff_check(void) {
+    uint64_t ret;
+    __asm__ volatile(
+        "mov $0xffffffff00000027, %%rax\n"
+        "syscall\n"
+        : "=a"(ret)
+        :
+        : "rcx", "r11", "memory"
+    );
+    /* kstuff_check returns 0 if kstuff is active */
+    return (int)ret;
+}
+
+/* Args struct passed to flat binary module_start (must match hv_flat.c) */
+struct kmod_flat_args {
+    uint64_t output_kva;
+    uint64_t kdata_base;
+    uint32_t fw_ver;
+    uint32_t pad;
+};
+
 /* ─── Kmod shared data structures (must match kmod/hv_kld.c) ─── */
 
 #define KMOD_MAGIC          0xCAFEBABEDEAD1337ULL
@@ -493,6 +564,92 @@ typedef struct {
 } Elf64_Sym_t;
 
 #define SHT_SYMTAB 2
+
+/* ─── kstuff-based flat binary loading (PS5_kldload approach) ─── */
+
+static int g_kstuff_available = 0;
+
+static int load_kmod_kstuff(void *result_vaddr, uint64_t result_kva) {
+    printf("\n[*] Trying kstuff kekcall approach...\n");
+
+    /* Check if kstuff is active */
+    int kcheck = kekcall_kstuff_check();
+    printf("[*] kstuff_check() returned %d\n", kcheck);
+    if (kcheck != 0) {
+        printf("[-] kstuff not available (ret=%d)\n", kcheck);
+        return -1;
+    }
+    g_kstuff_available = 1;
+    printf("[+] kstuff is active!\n");
+
+    /* Verify kstuff isn't the unsupported variant:
+     * kmem_alloc should NOT return getppid() in low byte */
+    uint64_t test_alloc = kekcall_kmem_alloc(0x100);
+    if ((test_alloc & 0xFF) == (uint64_t)getppid()) {
+        printf("[-] kstuff variant is unsupported (kmem_alloc returned ppid)\n");
+        return -1;
+    }
+    printf("[+] kmem_alloc test: 0x%016lx\n", (unsigned long)test_alloc);
+
+    /* Allocate RWX kernel memory for:
+     * 1. Code (flat binary payload)
+     * 2. Args struct
+     * 3. Thread name */
+    size_t code_size = (size_t)KMOD_FLAT_SZ;
+    /* Round up to page boundary */
+    size_t alloc_size = (code_size + 0x3FFF) & ~0x3FFFULL;
+
+    uint64_t code_kva = kekcall_kmem_alloc(alloc_size);
+    uint64_t args_kva = kekcall_kmem_alloc(sizeof(struct kmod_flat_args));
+    uint64_t name_kva = kekcall_kmem_alloc(0x100);
+
+    printf("[+] Allocated kernel memory:\n");
+    printf("    code: 0x%016lx (%zu bytes, rounded to %zu)\n",
+           (unsigned long)code_kva, code_size, alloc_size);
+    printf("    args: 0x%016lx\n", (unsigned long)args_kva);
+    printf("    name: 0x%016lx\n", (unsigned long)name_kva);
+
+    /* Copy flat binary payload into kernel RWX memory */
+    kernel_copyin((void *)KMOD_FLAT, code_kva, code_size);
+    printf("[+] Copied %zu bytes of flat binary to kernel\n", code_size);
+
+    /* Set up args */
+    struct kmod_flat_args args;
+    args.output_kva = result_kva;
+    args.kdata_base = g_kdata_base;
+    args.fw_ver = (uint32_t)(g_fw_version >> 16);
+    args.pad = 0;
+    kernel_copyin(&args, args_kva, sizeof(args));
+
+    /* Copy thread name */
+    const char *tname = "hv_kmod\0";
+    kernel_copyin((void *)tname, name_kva, 8);
+
+    /* Launch kernel thread */
+    printf("[*] Creating kernel thread at 0x%lx...\n", (unsigned long)code_kva);
+    fflush(stdout);
+
+    kekcall_kproc_create(code_kva, args_kva, name_kva);
+    printf("[+] kproc_create returned\n");
+
+    /* Wait for results */
+    struct kmod_result_buf *results = (struct kmod_result_buf *)result_vaddr;
+    printf("[*] Waiting for kmod results...\n");
+    for (int poll = 0; poll < 100; poll++) {
+        usleep(10000);  /* 10ms */
+        if (results->magic == KMOD_MAGIC && results->status == KMOD_STATUS_DONE) {
+            printf("[+] Kmod completed after %dms!\n", (poll + 1) * 10);
+            return 0;
+        }
+        if (results->magic == KMOD_MAGIC) {
+            printf("[*] Kmod running (status=%u)...\n", results->status);
+        }
+    }
+
+    printf("[!] Kmod did not complete within 1s (magic=0x%lx status=%u)\n",
+           (unsigned long)results->magic, results->status);
+    return -1;
+}
 
 static void load_kmod(void) {
     printf("\n=============================================\n");
@@ -1520,8 +1677,77 @@ int main(void) {
     /* Discover sysent first — needed for kmod invocation */
     discover_sysent();
 
-    /* Load kernel module (MSR recon, IDT trampoline) */
-    load_kmod();
+    /* ── Load kernel module (MSR recon) ──
+     * Try kstuff kekcall first (PS5_kldload approach: kmem_alloc + flat binary).
+     * Fall back to kldload + trampoline scan if kstuff unavailable. */
+    {
+        /* Allocate result buffer (shared between kstuff and kldload paths) */
+        off_t kmod_phys = 0;
+        void *kmod_vaddr = NULL;
+        int kmod_ret = sceKernelAllocateDirectMemory(0, 0x180000000ULL,
+            0x4000, 0x4000, SCE_KERNEL_WB_ONION, &kmod_phys);
+        if (kmod_ret == 0) {
+            kmod_ret = sceKernelMapDirectMemory(&kmod_vaddr, 0x4000,
+                SCE_KERNEL_PROT_CPU_RW, 0, kmod_phys, 0x4000);
+        }
+        if (kmod_ret != 0 || !kmod_vaddr) {
+            printf("[-] Failed to allocate kmod result buffer\n");
+        } else {
+            memset(kmod_vaddr, 0, 0x4000);
+
+            /* Get DMAP address for the result buffer */
+            uint64_t kmod_cpu_pa = va_to_cpu_pa((uint64_t)kmod_vaddr);
+            uint64_t kmod_result_kva = 0;
+            if (kmod_cpu_pa) {
+                kmod_result_kva = g_dmap_base + kmod_cpu_pa;
+                printf("[+] Kmod result buffer: VA=0x%lx PA=0x%lx DMAP=0x%lx\n",
+                       (unsigned long)kmod_vaddr, (unsigned long)kmod_cpu_pa,
+                       (unsigned long)kmod_result_kva);
+            }
+
+            int kmod_ok = -1;
+            if (kmod_result_kva) {
+                /* Try kstuff first */
+                kmod_ok = load_kmod_kstuff(kmod_vaddr, kmod_result_kva);
+            }
+
+            if (kmod_ok != 0) {
+                printf("\n[*] kstuff approach failed — falling back to kldload\n");
+                load_kmod();
+            } else {
+                /* Print kstuff results */
+                struct kmod_result_buf *results =
+                    (struct kmod_result_buf *)kmod_vaddr;
+                printf("\n[+] Kmod init completed successfully (kstuff).\n");
+                printf("\n[*] MSR/CR values from ring 0:\n");
+                for (uint32_t i = 0; i < results->num_msr_results; i++) {
+                    if (!results->msr_results[i].valid) continue;
+                    uint32_t id = results->msr_results[i].msr_id;
+                    uint64_t val = results->msr_results[i].value;
+                    const char *name = "unknown";
+                    switch (id) {
+                        case 0xC0000080: name = "EFER"; break;
+                        case 0xC0000081: name = "STAR"; break;
+                        case 0xC0000082: name = "LSTAR"; break;
+                        case 0xC0000084: name = "SFMASK"; break;
+                        case 0xC0000100: name = "FS_BASE"; break;
+                        case 0xC0000101: name = "GS_BASE"; break;
+                        case 0xC0000102: name = "KGS_BASE"; break;
+                        case 0xC0000103: name = "TSC_AUX"; break;
+                        case 0xFFFF0000: name = "CR0"; break;
+                        case 0xFFFF0003: name = "CR3"; break;
+                        case 0xFFFF0004: name = "CR4"; break;
+                    }
+                    printf("    %-10s (0x%08x) = 0x%016lx\n",
+                           name, id, (unsigned long)val);
+                    if (id == 0xC0000082) {
+                        printf("    → LSTAR is ktext+0x%lx\n",
+                               (unsigned long)(val - g_ktext_base));
+                    }
+                }
+            }
+        }
+    }
 
     /* Discover apic_ops table */
     discover_apic_ops();
