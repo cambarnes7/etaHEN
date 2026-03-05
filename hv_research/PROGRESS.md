@@ -852,6 +852,63 @@ On FW 4.03:
 
 ---
 
+## Session 8 Results (March 2026)
+
+### Late SYSINIT Fix Verified
+The Session 7 fix (save KLD trampoline KVAs before writeback clobber) worked correctly:
+```
+[+] Late SYSINIT detected! Saved KLD trampoline KVAs before writeback:
+    trampoline_xapic_mode() = 0x00000001c0000080
+    g_trampoline_target     = 0x0000000000011d01
+```
+
+### Key Discovery: PS5 kldload Uses Non-Standard KVAs
+
+The trampoline KVAs from hv_init are **valid but unexpected**:
+- `trampoline_xapic_mode() = 0x00000001c0000080` — not in the kernel VA range (0xffffffff...)
+- `g_trampoline_target = 0x0000000000011d01` — in very low address space
+
+**Analysis**: PS5's kldload places module sections at guest virtual addresses outside the
+standard kernel range. The module .text is at ~7.5GB (0x1c0000000), .bss at ~0x11d01.
+These addresses ARE valid in the kernel's page tables (hv_init executes from .text and
+reads/writes .bss successfully), but they're NOT resolvable by userland's page table walk
+(which only covers the standard kernel VA ranges).
+
+**R_X86_64_PC32 relocations verified correct**: Extensive analysis of the kmod's compiled
+code confirmed that the compiler's struct layout and relocation addends are correct. The
+instruction-specific RIP offset (P+4 for MOV reg, P+8 for MOV $imm) is already accounted
+for in the addend. The trampoline_func_kva at relocation addend 0x1c targets struct
+offset 0x20 correctly.
+
+**vmmcall_result struct mismatch noted**: The kmod's `vmmcall_result` has both `_in` and
+`_out` fields (104 bytes/entry, total struct 7224 bytes), while main.c has only `_out`
+fields (56 bytes/entry, total struct 4152 bytes). This only affects the `results[]` array
+after offset 0x238 — the trampoline fields at offsets 0x20/0x28/0x30 are unaffected.
+
+### Phase 7 VA→PA Gate Fix
+
+**Bug**: Phase 7's KLD .text suspend test tried to VA→PA translate `g_kld_text_target`
+(`0x0000000000011d01`) to zero it via DMAP. The translation failed because the address
+is outside the kernel VA range that userland can walk.
+
+**Fix**: Don't block the arming path when VA→PA fails for kmod addresses. The kmod's
+`.bss` is zero-initialized, so `g_trampoline_target` is already 0. The trampoline's
+fallback (`return 1` = APIC_MODE_XAPIC) is correct for the suspend test. No call-through
+is needed — the trampoline just needs to return the right APIC mode value.
+
+**Result**: The KLD .text suspend test can now proceed:
+1. `trampoline_xapic_mode()` at `0x00000001c0000080` is written to apic_ops[2]
+2. `g_trampoline_target` stays 0 (no call-through, safe fallback)
+3. On resume, kernel calls apic_ops[2] → trampoline returns 1
+4. If kmod .text is NPT-executable during suspend, this succeeds without panic
+
+### Open Questions for Session 9
+- Does kmod .text survive NPT NX enforcement during cpususpend_handler?
+- Are kldload module VAs stable across reboots/re-exploits?
+- Can the vmmcall_result struct mismatch cause issues for results beyond offset 0x238?
+
+---
+
 ## File Structure
 
 ```
