@@ -371,11 +371,68 @@ uint64_t s253_narg_pa = va_to_pa_quiet(s253_kva);       /* n_arg  */
 Also explicitly sets narg=0 and restores it afterward, matching the pattern used by all
 other sysent hooks in the codebase.
 
+## Test Results: Run 5 (Fresh Boot) + Run 6 (Post-Resume) — Session 3
+
+### Run 5 — Fresh Boot (Pre-Suspend)
+- All phases completed successfully
+- DMAP base: 0xffffee8400000000 (different from Sessions 1 & 2)
+- CR3: 0x13fd6000, ktext: 0xffffffffcbcf0000, kdata: 0xffffffffcc8f0000
+- LSTAR: 0xffffffffcbf84218
+- IDT: 0xffffffffd2dbdc80 (kdata+0x64cdc80 — matches kstuff offset)
+- Sysent: kdata+0x1709c0 (matches kstuff offset)
+- apic_ops: kdata+0x1656b0, 28 entries, slot[2] = 0xffffffffcbf87908
+- Ring-0 code execution via sysent hook: confirmed
+- Cave trampoline installed at kdata+0x100 (72 bytes, PTE NX cleared)
+- Minimal gadget at kdata+0x150: `mov eax, 1; ret` (6 bytes)
+- Guest PTE NX-clear on kdata_base page: PTE = 0x000000000c8f0003 (NX=0)
+- **Test 4a PASSED:** sysent[253] → minimal gadget returned `ret=1, errno=0`
+  - Fix confirmed: correct stride (0x30) + VA-to-PA on entry (not base+offset)
+- **Test 4b PASSED:** apic_ops[2] → minimal gadget stable for 3 seconds
+  - kdata gadget works during normal kernel ops (timer interrupts, scheduler, etc.)
+  - No crash — proves kdata execution is safe during normal operation
+- **DIAGNOSTIC CONCLUSION:** "kdata gadget works during normal ops. The suspend panic is
+  suspend-path specific. HV likely changes NPT or intercepts kdata execution during
+  cpususpend_handler."
+- apic_ops[2] restored to original before suspend (safe path)
+- Rest mode entered successfully via `sceSystemStateMgrEnterStandby()`
+
+### Run 6 — Post-Resume
+- Re-exploited successfully, re-ran tool
+- DMAP base: 0xffffee8400000000 (same — DMAP stable across resume)
+- CR3: 0x13eb2000 (changed — expected)
+- ktext: 0xffffffffcbcf0000, kdata: 0xffffffffcc8f0000 (same — **KASLR stable**)
+- Cave marker "FLATZHOO" (0x464c41545a484f4f): **PERSISTED**
+- Saved ktext from cave: matches current ktext — **KASLR stable**
+- QA flags (bytes 0-1 = 0xFF, Phase 7 marker 0xabcdef42, saved xapic): **PERSISTED**
+- Guest PTE NX-clear on kdata_base page: **PERSISTED** (PTE = 0x000000000c8f0023, NX=0, A=1)
+  - Note: A (Accessed) bit now set — CPU accessed this PTE during operation
+- apic_ops[2]: 0xffffffffcbf87908 — retained original (hook was not armed during suspend)
+- Minimal gadget code at kdata+0x150: **INTACT** after resume
+- ktext readability via DMAP: **STILL XOM** (all 0xCC through DMAP)
+- NPT allows execution on kdata: confirmed again
+- Test 4a PASSED again on post-resume run
+- Test 4b PASSED again on post-resume run
+
+### Key Findings (Session 3)
+1. **Test 4a bug fix confirmed** — stride and PA calculation were the issue, not kdata execution
+2. **kdata gadget execution works during normal kernel operation** (Test 4b — 3s stability)
+3. **Suspend panic was NOT caused by kdata execution in general** — it was either:
+   - DMAP writes during suspend (proof marker), or
+   - Something specific to the suspend path (cpususpend_handler context)
+4. **The minimal gadget (`mov eax, 1; ret`) is the ideal candidate for armed-during-suspend test**
+   - No memory references, no stack operations, just sets return value and returns
+   - If this panics during suspend, the HV intercepts kdata execution during suspend
+5. **3rd independent boot confirms all persistence** — 3/3 sessions show identical behavior
+6. **PTE Accessed bit**: post-resume PTE shows A=1 (was A=0 pre-suspend), confirming the
+   CPU accessed the page table entry. This is normal — the kernel touched kdata pages.
+
+---
+
 ## Current State of the Flatz Method
 
 The flatz suspend/resume method requires running code during early resume, before the HV sets up NPT protections. The key findings so far:
 
-**Proven (across 2 independent boot sessions):**
+**Proven (across 3 independent boot sessions):**
 - apic_ops[2] (xapic_mode) is called during LAPIC suspend/resume
 - We can hook it (KLD trampoline, kdata cave trampoline, or ktext gadget)
 - Cave markers, QA flags, and apic_ops values survive suspend/resume
@@ -384,33 +441,32 @@ The flatz suspend/resume method requires running code during early resume, befor
 - DMAP base is stable across resume (changes between boots)
 - Guest PTE NX-clear works for code execution in kdata
 - NPT allows execution on kdata pages (confirmed via ring-0 shellcode)
+- kdata gadget (`mov eax, 1; ret`) survives 3s as apic_ops[2] during normal operation
 - kldload-allocated module pages are NPT read-protected (scanner can't find them via DMAP)
 - ktext remains XOM after resume on FW 4.03 (no free readability)
-- Rest mode is safe with: cave trampoline proof-write disabled + apic_ops[2] restored to original
+- Rest mode is safe with: apic_ops[2] restored to original before suspend
 - Minimal gadget code and cave trampoline code persist in kdata across resume
 
 **Learned:**
 - DMAP writes during LAPIC suspend cause kernel panic (proof marker write crashed)
 - The HV likely restricts DMAP write permissions during the suspend path
-- Sysent hook to kdata minimal gadget returns EFAULT — likely due to syscall dispatch
-  argument handling, not execution permissions (see Test 4a failure analysis)
+- kdata execution during normal ops is safe (Test 4b proves it) — suspend panic is
+  suspend-path specific
+- Test 4a failure was a code bug (wrong stride + PA arithmetic), not an execution issue
 
-**Not Yet Tested:**
-- Leaving apic_ops[2] hooked to cave trampoline (proof-write disabled) during suspend
-  - Current code always restores to original before suspend for safety
-  - This is THE critical test for the flatz method
-- Whether the cave trampoline actually fires during LAPIC resume (call-through to original)
+**Not Yet Tested (THIS BUILD):**
+- Leaving apic_ops[2] hooked to **minimal gadget** (`mov eax, 1; ret`) during suspend
+  - The minimal gadget is the safest possible hook: no memory refs, no stack ops
+  - If this works: kdata execution during suspend is safe (HV doesn't intercept)
+  - If this panics: HV restricts kdata execution during suspend → need ktext gadget
 
 **Next Steps:**
-1. **Investigate Test 4a failure** — understand why sysent→kdata gadget returns EFAULT
-   (likely sy_narg mismatch causing copyin fault before sy_call is reached)
-2. **Leave cave trampoline armed during suspend** — modify Phase 7 to NOT restore
-   apic_ops[2] when cave trampoline is the hook source (proof-write already disabled)
-3. Enter rest mode → wake → re-exploit → check if apic_ops[2] still points to cave trampoline
-4. If rest mode works: trampoline executed during suspend without panic!
-5. Add safe execution proof (e.g., write to a kdata marker via the trampoline, but only
-   during resume — not suspend — by checking an APIC register state)
-6. If guest killed: NPT doesn't allow kdata execution during suspend → need ktext gadget
+1. **Leave minimal gadget armed during suspend** — modify Phase 7 to hook apic_ops[2] →
+   kdata+0x150 (`mov eax, 1; ret`) and NOT restore before suspend
+2. Enter rest mode → wake → re-exploit → check if apic_ops[2] still points to minimal gadget
+3. If rest mode works: kdata execution during suspend is confirmed safe!
+4. Then test cave trampoline (with call-through to original) during suspend
+5. Then add useful work to the trampoline (e.g., disable HV NPT protections)
 
 ---
 
