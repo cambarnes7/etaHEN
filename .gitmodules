@@ -1,0 +1,3 @@
+[submodule "hv_research2/kstuff-no-fpkg-repo"]
+	path = hv_research2/kstuff-no-fpkg-repo
+	url = https://github.com/buzzer-re/playstation_research_utils.git
