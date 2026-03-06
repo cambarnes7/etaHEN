@@ -6,6 +6,41 @@ This documents what has been built, what works, and what has been confirmed thro
 
 ---
 
+## kdata Persistence Confirmed (Session 8+, kstuff payloads)
+
+Cross-reference: `playstation_research_utils/examples/suspend_probe/` (v5) and
+`playstation_research_utils/examples/reg_probe/`
+
+### Confirmed Facts
+1. **kdata fully persists through suspend/resume** — 16 marker qwords at kdata_base+0x100
+   all survived intact (pattern "PERSIST\x00"|idx, verified byte-for-byte after resume)
+2. **apic_ops[2] overwrites persist** — pointed to get_timer_freq (ktext+0x294320),
+   survived resume without panic. No CFI enforcement on apic_ops indirect calls
+3. **kdata code execution panics during suspend** — even `mov eax,1; ret` in kdata
+   panics during cpususpend_handler. HV enforces NPT NX on kdata during suspend
+4. **kmod .text also panics during suspend** — same NPT NX enforcement
+5. **Only ktext-range code survives NPT** during suspend path
+
+### Attack Plan (Next Steps)
+The goal: execute a ROP chain during LAPIC resume via apic_ops[2] hook.
+
+1. **Write ROP chain to kdata** (kdata_base+0x100 region, persists through suspend)
+2. **Find ktext stack pivot gadget** (xchg rsp,<reg>; ret or equivalent)
+3. **Point apic_ops[2] at the pivot** (redirects RSP to kdata chain buffer)
+4. **On resume**: LAPIC reinit calls apic_ops[2] → pivot fires → ROP chain runs
+   via ktext gadget addresses in kdata (readable) executing ktext code (executable)
+
+### New Recon Payloads (playstation_research_utils)
+- `ktext_verify`: Tests if ktext is directly readable from ring 0 (not DMAP).
+  If yes, smart_pivot_scan finds all pivot gadgets immediately
+- `pcpu_recon`: Dumps pcpu[0], idle/current thread stacks, PCB saved registers,
+  debug register values — reveals the resume stack location
+- `suspend_stackprobe`: Writes marker grid across idle thread stack, sets DR
+  sentinels, then readback after resume reveals which stack region the resume
+  code uses and whether debug registers persist
+
+---
+
 ## Architecture Overview
 
 The tool is a two-part system:
