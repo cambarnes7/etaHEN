@@ -960,6 +960,51 @@ provide executable code paths during suspend/resume transitions.
 
 ---
 
+## Session 11+: IDT/TSS Persistence & doreti_iret Bounce
+
+Cross-reference: `playstation_research_utils/examples/resume_chain/` (v6, v7)
+
+### IDT/TSS Persistence — CONFIRMED (resume_chain v6)
+
+**Test**: Modified IDT[3] IST field (0→1) and TSS[0] IST1 (wrote marker value), kept apic_ops[2] safe, entered rest mode, then read back after resume.
+
+**Result**: Both modifications **PERSISTED** through rest mode:
+- IDT[3] armed qword = IDT[3] current qword (identical)
+- TSS IST1 marker value survived
+- kdata sentinel survived (as expected)
+
+**Implication**: ACPI wakeup does NOT restore IDT/TSS from clean copies. The INT3+IST approach for hooking apic_ops[2] is viable.
+
+### doreti_iret Bounce Strategy (resume_chain v7)
+
+**Key insight**: Instead of a complex ROP chain, use the CPU's trap mechanism as a self-sustaining trampoline:
+
+1. Set IDT[3] handler = `doreti_iret` (just `iretq`)
+2. Set apic_ops[2] = `xapic_mode - 1` (CC byte = INT3 padding before function)
+3. On call: CC → INT3 → push trap frame → `iretq` → RIP=xapic_mode → `mov eax,1; ret` → clean
+
+**Advantages over v3 chain**:
+- No shared IST stack → no multi-CPU race condition
+- No unverifiable gadgets (just `iretq`)
+- Self-sustaining — no restoration needed
+- Single instruction handler → minimal failure surface
+
+**Status**: Testing in progress. Mode 0x1 (baseline: IDT change only) and mode 0x2 (full CC bounce) being validated incrementally.
+
+### Updated Persistence Table
+
+| Structure | Persists through rest mode? | Confirmed by |
+|-----------|---------------------------|--------------|
+| kdata markers | YES | 8+ sessions |
+| apic_ops[2] | YES | 8+ sessions |
+| Guest PTEs (NX) | YES | Phase 6 |
+| IDT entries | **YES** | v6 readback |
+| TSS IST | **YES** | v6 readback |
+| ktext PTEs | NO | HV blocks rest mode entry |
+| DR registers | NO | Not in suspend PCB |
+
+---
+
 ## File Structure
 
 ```
