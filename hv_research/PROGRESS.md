@@ -1002,6 +1002,12 @@ Called xapic_mode-1 from kproc with RAX sentinel `0xBAD0BAD0BAD0BAD0`:
 
 **Impact**: doreti_iret bounce cannot use xapic_mode directly. Need to find CC bytes near other functions, or use copyin-1 (confirmed CC) with a more complex IST+pop_all_iret chain that redirects to xapic_mode.
 
+### CC Byte Scanner (resume_chain v8)
+
+Automated scan of all 28 apic_ops entries at fn-1 for CC bytes. Uses same sentinel-in-RAX technique as v7b, with pcb_onfault fault recovery. Reports cc_bitmap and ret1_bitmap (entries where CC+1 returns 1 = golden for simple doreti_iret bounce). Also tests copyin-1, copyout-1, cpu_switch-1, malloc-1.
+
+**Status**: Built, awaiting deployment and results.
+
 ### Updated Persistence Table
 
 | Structure | Persists through rest mode? | Confirmed by |
