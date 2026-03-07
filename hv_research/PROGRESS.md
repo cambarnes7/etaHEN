@@ -989,7 +989,18 @@ Cross-reference: `playstation_research_utils/examples/resume_chain/` (v6, v7)
 - Self-sustaining — no restoration needed
 - Single instruction handler → minimal failure surface
 
-**Status**: Testing in progress. Mode 0x1 (baseline: IDT change only) and mode 0x2 (full CC bounce) being validated incrementally.
+**v7 Test Results**:
+- Mode 0x1 (SAFE_ARM): IDT[3]=doreti_iret, apic_ops[2]=original → **PASSED** (survived rest mode)
+- Mode 0x2 (BOUNCE_ARM): IDT[3]=doreti_iret, apic_ops[2]=xapic_mode-1 → **FAILED** (never boots back)
+
+**v7b Mode 0x4 — Byte Identification (CRITICAL FINDING)**:
+
+Called xapic_mode-1 from kproc with RAX sentinel `0xBAD0BAD0BAD0BAD0`:
+- EAX returned unchanged (sentinel) → **xapic_mode-1 = C3 (ret), NOT CC (INT3)**
+- xapic_mode-2 also returned sentinel → still in previous function's epilogue
+- No CC padding exists before xapic_mode
+
+**Impact**: doreti_iret bounce cannot use xapic_mode directly. Need to find CC bytes near other functions, or use copyin-1 (confirmed CC) with a more complex IST+pop_all_iret chain that redirects to xapic_mode.
 
 ### Updated Persistence Table
 
