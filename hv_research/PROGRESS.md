@@ -925,6 +925,117 @@ provide executable code paths during suspend/resume transitions.
 
 ---
 
+## Session 9 Results (March 2026)
+
+### Key Discoveries
+
+#### 1. xapic_mode Returns 14 (0x0E), NOT 1
+The original assumption that `apic_ops[2]` (xapic_mode) returns 1 (`APIC_MODE_XAPIC`) was
+**WRONG**. Actual return value via sysent hook probing: **14 (0x0E)**.
+
+**Impact:** All previous `mov eax, 1; ret` gadget work was targeting the wrong return value.
+Any hook replacing apic_ops[2] during suspend must return 14 to match the original behavior.
+This invalidated the entire "find a ktext address that returns 1" approach from Sessions 4-8.
+
+#### 2. Arbitrary apic_ops Probing Causes Kernel Panics
+Calling arbitrary apic_ops functions (slots 0-27) via sysent hook causes kernel panics.
+Most apic_ops entries are APIC hardware accessors (`xapic_read`, `xapic_write`,
+`xapic_send_ipi`, etc.) that access MMIO registers. When called via syscall(253) with
+wrong argument types (thread descriptor instead of register offset), they dereference
+invalid MMIO addresses → hardware fault → panic.
+
+Similarly, probing arbitrary ktext byte offsets is unsafe: mid-instruction decoding can
+execute partial code paths with destructive side effects that don't `#UD` but DO corrupt
+kernel state.
+
+**Safe approach identified:** Only `ops[2]` (xapic_mode) is safe to call — it returns a
+constant without accessing hardware. Known-safe kstuff entry points (e.g., `nop_ret`) can
+also be tested.
+
+#### 3. nop_ret Returns RAX (Not a Useful Hook)
+`nop_ret` at ktext+0x22DF36 (`nop; ret`) returns whatever RAX happens to contain — which
+is a random value from the sysent dispatch path. It does NOT return 14 (the required value),
+so it cannot replace xapic_mode directly.
+
+#### 4. Original xapic_mode is the Only Known "Returns 14" Target
+No kstuff offset was found that returns 14. The original `xapic_mode` (ops[2]) is itself
+in ktext and returns the correct value. Using it as the hook target is a no-op, but with
+a P9_ARMED_MAGIC marker (`"P9HOOKED"`) at cave+0x20, we can verify whether apic_ops[2]
+was reinitialized by the kernel during suspend/resume.
+
+### Core Problem Crystallized
+
+The suspend/resume exploit requires a ktext address for apic_ops[2] that:
+1. **Returns 14** (matching original xapic_mode)
+2. **Does useful work** (e.g., stack pivot → ROP chain)
+3. **Is in ktext** (NPT executable during suspend — kdata/kmod is NX)
+
+Since ktext is XOM (execute-only via NPT, DMAP reads return 0xCC), we cannot read ktext
+to find gadgets. The conventional byte-scanning approach (smart_pivot_scan, pivot_scan)
+fails completely on FW 4.03.
+
+### Available Kstuff Offsets (FW 4.03)
+
+Known ktext function offsets from kstuff (computed from `kdata_base - offset`):
+```
+nop_ret:               ktext+0x22DF36  (nop; ret)
+wrmsr_ret:             ktext+0x22DF34  (wrmsr; ret — UNSAFE)
+cpu_switch:            ktext+0x229080  (context switch — has RSP manipulation)
+doreti_iret:           ktext+0x2307B4  (interrupt return — needs trap frame)
+justreturn:            ktext+0x230670  (syscall return — hangs via sysent)
+pop_all_iret:          ktext+0x230755  (pop all regs; iretq)
+push_pop_all_iret:     ktext+0x294190  (push/pop all; iretq)
+rep_movsb_pop_rbp_ret: ktext+0x26FFD6  (rep movsb; pop rbp; ret)
+rdmsr_start:           ktext+0x22F306  (rdmsr sequence)
+mov_cr3_rax:           ktext+0x869062  (mov cr3, rax — page table switch)
+```
+
+**Promising targets for pivot:**
+- `cpu_switch` (ktext+0x229080) — FreeBSD context switch code contains `movq PCB_RSP(%r8), %rsp`
+  and register save/restore sequences. Likely contains usable pivots within its body.
+- `pop_all_iret` (ktext+0x230755) — Pops ALL registers from stack then `iretq`. If we
+  control the stack at this point, we control all registers including RIP.
+
+### Strategy Shift: Register State Capture (Phase 10)
+
+**Key insight:** Before choosing a pivot gadget type, we need to know the register state
+at the moment the kernel calls `apic_ops[2]`. If any register points to controllable kdata
+memory at the call site, we can use a matching pivot type.
+
+**Phase 10 implementation:**
+- Builds a register-capturing trampoline in the kdata cave (kdata+0x180)
+- Trampoline saves all 16 GPRs + RFLAGS + return address to a DMAP buffer (kdata+0x280)
+- Hooks apic_ops[2] → trampoline during normal operation (kdata is executable normally)
+- Waits for kernel to call xapic_mode (LAPIC code calls it periodically)
+- Reads back register dump and analyzes which registers point to kdata
+- Determines viable pivot types:
+  - RAX → kdata: `xchg rsp, rax; ret` (48 94 c3)
+  - RBP → kdata: `leave; ret` (c9 c3)
+  - RDI → kdata: `xchg rsp, rdi; ret` (48 87 e7 c3)
+  - etc.
+- Call site (return address) reveals the exact instruction in LAPIC code that called us
+
+### Next Steps (Session 10)
+
+1. **Run Phase 10** — Capture register state at apic_ops[2] call site
+2. **Analyze registers** — Identify which point to controllable kdata
+3. **Find matching pivot** — Based on register analysis:
+   - If register R points to kdata → find `xchg rsp, R; ret` in ktext
+   - Use FreeBSD source analysis of `cpu_switch` to identify offset within
+     that function where the pivot exists
+4. **Build ROP chain** — Using known kstuff gadgets (pop_all_iret, wrmsr_ret, etc.)
+   placed in kdata at the address the pivot register points to
+5. **Full suspend test** — Hook apic_ops[2] → ktext pivot, ROP chain in kdata
+
+### Open Questions for Session 10
+- What register state does the LAPIC code have when it calls apic_ops[2]?
+- Does any register naturally point to kdata (apic_ops table, LAPIC struct, etc.)?
+- Can we pre-fill kdata near the apic_ops table with ROP chain data?
+- What's the exact instruction layout within cpu_switch on PS5 FW 4.03?
+- Is kCFI (kernel Control Flow Integrity) active for apic_ops indirect calls?
+
+---
+
 ## File Structure
 
 ```

